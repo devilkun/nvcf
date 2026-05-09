@@ -6,7 +6,7 @@ For a fresh install, start with the [Quickstart](./quickstart.md). The quickstar
 
 For a full list of required artifacts, see [self-hosted-artifact-manifest](./manifest.md).
 
-![Self-hosted component overview](images/self-hosted-component-overview.png)
+![Self-hosted component overview](images/nvcf-high-level-stack.svg)
 
 <Tip>
 Want to try NVCF locally first? See [Local Development](./local-development.md) to create a k3d cluster, then use the [Quickstart](./quickstart.md) local k3d flow.

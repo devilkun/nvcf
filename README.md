@@ -11,7 +11,7 @@ examples, CLI code, agent skills, and validation tooling.
 
 ## Architecture
 
-![NVCF architecture](docs/user/images/self-hosted-component-overview.png)
+![NVCF architecture](docs/user/images/nvcf-high-level-stack.svg)
 
 NVCF runs as Kubernetes services that manage function lifecycle, invocation
 routing, GPU cluster integration, artifact access, secrets, observability, and
@@ -28,6 +28,11 @@ At a high level:
 - Function artifacts live in registries that the NVCF deployment can access.
 - Observability, dashboards, and runbooks help operators monitor health and
   debug workload behavior.
+
+The following diagram shows how self-managed NVCF can span regions and GPU
+clusters.
+
+<img src="docs/user/images/nvcf-multi-region-multi-cluster.svg" alt="NVCF multi-region and multi-cluster architecture" width="80%">
 
 ### Workload types
 

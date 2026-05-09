@@ -687,47 +687,47 @@ Manage container registry credentials for function images and Helm charts. For c
 
 | Command | Description |
 | --- | --- |
-| `registry-credentials add` | Add a new registry credential |
-| `registry-credentials list` | List all registry credentials |
-| `registry-credentials get` | Get details of a specific credential |
-| `registry-credentials update` | Update an existing credential |
-| `registry-credentials delete` | Delete a registry credential |
-| `registry-credentials list-recognized` | List all recognized registries |
+| `registry-credential add` | Add a new registry credential |
+| `registry-credential list` | List all registry credentials |
+| `registry-credential get` | Get details of a specific credential |
+| `registry-credential update` | Update an existing credential |
+| `registry-credential delete` | Delete a registry credential |
+| `registry-credential list-recognized` | List all recognized registries |
 
 ```bash
 # Add registry credentials using base64 secret
-./nvcf-cli registry-credentials add \
+./nvcf-cli registry-credential add \
   --hostname "nvcr.io" \
   --secret "<BASE64_ENCODED_USERNAME:PASSWORD>" \
   --artifact-type CONTAINER \
   --description "NGC Container Registry"
 
 # Add registry credentials using username/password
-./nvcf-cli registry-credentials add \
+./nvcf-cli registry-credential add \
   --hostname "nvcr.io" \
   --username "<USERNAME>" \
   --password "<PASSWORD>" \
   --artifact-type CONTAINER
 
 # List registry credentials (with optional filters)
-./nvcf-cli registry-credentials list
-./nvcf-cli registry-credentials list --artifact-type CONTAINER
-./nvcf-cli registry-credentials list --provisioned-by USER
+./nvcf-cli registry-credential list
+./nvcf-cli registry-credential list --artifact-type CONTAINER
+./nvcf-cli registry-credential list --provisioned-by USER
 
 # Get details for a specific credential
-./nvcf-cli registry-credentials get <credential-id>
+./nvcf-cli registry-credential get <credential-id>
 
 # Update a credential
-./nvcf-cli registry-credentials update <credential-id> \
+./nvcf-cli registry-credential update <credential-id> \
   --username "<NEW_USERNAME>" \
   --password "<NEW_PASSWORD>"
 
 # Delete registry credentials
-./nvcf-cli registry-credentials delete <credential-id>
-./nvcf-cli registry-credentials delete <credential-id> --force
+./nvcf-cli registry-credential delete <credential-id>
+./nvcf-cli registry-credential delete <credential-id> --force
 
 # List recognized registries
-./nvcf-cli registry-credentials list-recognized
+./nvcf-cli registry-credential list-recognized
 ```
 
 ## Troubleshooting

@@ -252,7 +252,7 @@ SECRET_ACCESS_KEY="<secret-access-key>"
 ECR_SECRET=$(echo -n "${ACCESS_KEY_ID}:${SECRET_ACCESS_KEY}" | base64 -w 0)
 
 # Add the registry credential for Private ECR
-./nvcf-cli registry-credentials add \
+./nvcf-cli registry-credential add \
   --hostname <account-id>.dkr.ecr.<region>.amazonaws.com \
   --secret "${ECR_SECRET}" \
   --artifact-type CONTAINER \
@@ -269,7 +269,7 @@ SECRET_ACCESS_KEY="<secret-access-key>"
 ECR_SECRET=$(echo -n "${ACCESS_KEY_ID}:${SECRET_ACCESS_KEY}" | base64 -w 0)
 
 # Add the registry credential for Public ECR
-./nvcf-cli registry-credentials add \
+./nvcf-cli registry-credential add \
   --hostname public.ecr.aws \
   --secret "${ECR_SECRET}" \
   --artifact-type CONTAINER \
@@ -325,14 +325,14 @@ NGC_API_KEY="<nvapi-xxxxxxxxxxxx>"
 NGC_SECRET=$(echo -n '$oauthtoken:'"${NGC_API_KEY}" | base64 -w 0)
 
 # Add the registry credential for containers
-./nvcf-cli registry-credentials add \
+./nvcf-cli registry-credential add \
   --hostname nvcr.io \
   --secret "${NGC_SECRET}" \
   --artifact-type CONTAINER \
   --description "NGC Container Registry"
 
 # Add the registry credential for Helm charts (if needed)
-./nvcf-cli registry-credentials add \
+./nvcf-cli registry-credential add \
   --hostname helm.ngc.nvidia.com \
   --secret "${NGC_SECRET}" \
   --artifact-type HELM \
@@ -360,7 +360,7 @@ REGISTRY_NAME="<registry-name>"
 VCR_SECRET=$(echo -n "${ACCESS_KEY_ID}:${SECRET_ACCESS_KEY}" | base64 -w 0)
 
 # Add the registry credential for containers and Helm charts
-./nvcf-cli registry-credentials add \
+./nvcf-cli registry-credential add \
   --hostname ${REGISTRY_NAME}.cr.volces.com \
   --secret "${VCR_SECRET}" \
   --artifact-type CONTAINER,HELM \
@@ -372,7 +372,7 @@ VCR_SECRET=$(echo -n "${ACCESS_KEY_ID}:${SECRET_ACCESS_KEY}" | base64 -w 0)
 To view all configured registry credentials:
 
 ```bash
-./nvcf-cli registry-credentials list
+./nvcf-cli registry-credential list
 ```
 
 ## Deleting Registry Credentials
@@ -381,7 +381,7 @@ To remove a registry credential:
 
 ```bash
 # Delete by credential ID
-./nvcf-cli registry-credentials delete <credential-id>
+./nvcf-cli registry-credential delete <credential-id>
 ```
 
 ## How NVCF Matches Registries to Images
@@ -470,7 +470,7 @@ No registry credential found for hostname: example.dkr.ecr.us-west-2.amazonaws.c
 
 **Solution:**
 
-1. List your credentials with `./nvcf-cli registry-credentials list`
+1. List your credentials with `./nvcf-cli registry-credential list`
 2. Verify the hostname matches exactly (no trailing slashes, no repository paths)
 3. Add the missing registry credential if needed
 
