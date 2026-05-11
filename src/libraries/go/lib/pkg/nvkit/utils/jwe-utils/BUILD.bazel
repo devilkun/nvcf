@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "jwe-utils_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/utils/jwe-utils",
+    visibility = ["//visibility:private"],
+    deps = ["//src/libraries/go/lib/pkg/nvkit/utils/jwe-utils/cli"],
+)
+
+go_binary(
+    name = "jwe-utils",
+    embed = [":jwe-utils_lib"],
+    visibility = ["//visibility:public"],
+)

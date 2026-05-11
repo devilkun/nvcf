@@ -1,0 +1,41 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "teardown",
+    srcs = [
+        "drain.go",
+        "helmfile_destroy.go",
+        "persistent.go",
+        "plan.go",
+        "render.go",
+        "unregister.go",
+    ],
+    importpath = "nvcf-cli/internal/selfhosted/teardown",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/selfhosted/progress",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//kubernetes",
+    ],
+)
+
+go_test(
+    name = "teardown_test",
+    srcs = [
+        "drain_test.go",
+        "helmfile_destroy_test.go",
+        "persistent_test.go",
+        "plan_test.go",
+        "render_test.go",
+        "unregister_test.go",
+    ],
+    embed = [":teardown"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/selfhosted/progress",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//kubernetes/fake",
+    ],
+)

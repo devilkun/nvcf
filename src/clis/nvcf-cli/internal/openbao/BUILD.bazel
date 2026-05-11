@@ -1,0 +1,12 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "openbao",
+    srcs = ["client.go"],
+    importpath = "nvcf-cli/internal/openbao",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/k8s",
+        "//src/clis/nvcf-cli/internal/logging",
+    ],
+)

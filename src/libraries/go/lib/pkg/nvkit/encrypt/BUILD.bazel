@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "encrypt",
+    srcs = ["jose.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/encrypt",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/nvkit/errors",
+        "@com_github_go_jose_go_jose_v4//:go-jose",
+    ],
+)
+
+go_test(
+    name = "encrypt_test",
+    srcs = ["jose_test.go"],
+    embed = [":encrypt"],
+    deps = [
+        "//src/libraries/go/lib/pkg/nvkit/errors",
+        "//src/libraries/go/lib/pkg/nvkit/test/mocks",
+        "@com_github_go_jose_go_jose_v4//:go-jose",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//mock",
+        "@com_github_stretchr_testify//require",
+    ],
+)

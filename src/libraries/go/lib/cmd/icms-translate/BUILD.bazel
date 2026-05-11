@@ -1,0 +1,30 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "icms-translate_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/cmd/icms-translate",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//src/libraries/go/lib/pkg/icms-translate/cmd",
+        "@com_github_urfave_cli_v2//:cli",
+    ],
+)
+
+go_binary(
+    name = "icms-translate",
+    embed = [":icms-translate_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "icms-translate_test",
+    srcs = ["main_test.go"],
+    embed = [":icms-translate_lib"],
+    deps = [
+        "//src/libraries/go/lib/pkg/icms-translate/cmd",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@com_github_urfave_cli_v2//:cli",
+    ],
+)

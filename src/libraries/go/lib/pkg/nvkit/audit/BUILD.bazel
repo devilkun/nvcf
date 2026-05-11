@@ -1,0 +1,27 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "audit",
+    srcs = [
+        "audit.go",
+        "log_auditor.go",
+        "noop_auditor.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/audit",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_uber_go_zap//:zap",
+        "@org_uber_go_zap//zapcore",
+    ],
+)
+
+go_test(
+    name = "audit_test",
+    srcs = ["audit_test.go"],
+    embed = [":audit"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@org_uber_go_zap//zapcore",
+    ],
+)

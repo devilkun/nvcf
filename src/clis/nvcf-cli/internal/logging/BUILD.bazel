@@ -1,0 +1,8 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "logging",
+    srcs = ["logger.go"],
+    importpath = "nvcf-cli/internal/logging",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+)

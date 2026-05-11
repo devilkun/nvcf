@@ -1,0 +1,39 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "translate",
+    srcs = ["translate.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/icms-translate/translate/common",
+        "//src/libraries/go/lib/pkg/icms-translate/translate/function",
+        "//src/libraries/go/lib/pkg/icms-translate/translate/task",
+    ],
+)
+
+go_test(
+    name = "translate_test",
+    srcs = ["translate_test.go"],
+    data = glob(["testdata/**"]),
+    embed = [":translate"],
+    embedsrcs = [
+        "testdata/1.function-queue-message.json",
+        "testdata/1.task-queue-message.json",
+        "testdata/2.function-queue-message.json",
+        "testdata/2.task-queue-message-telemetries.json",
+        "testdata/3.function-queue-message-container.json",
+        "testdata/3.task-queue-message-merge.json",
+        "testdata/4.function-queue-message-helm.json",
+        "testdata/4.task-queue-message-icms-action.json",
+        "testdata/5.function-queue-message-telemetries.json",
+        "testdata/6.function-queue-message-merge.json",
+        "testdata/7.function-queue-message-icms-action.json",
+    ],
+    deps = [
+        "//src/libraries/go/lib/pkg/icms-translate/translate/common",
+        "//src/libraries/go/lib/pkg/icms-translate/translate/function",
+        "//src/libraries/go/lib/pkg/icms-translate/translate/task",
+        "@com_github_stretchr_testify//assert",
+    ],
+)

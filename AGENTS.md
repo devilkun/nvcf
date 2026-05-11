@@ -9,6 +9,8 @@ This repo is an umbrella layout: upstream services appear as ordinary directorie
 Use `python3`, not `python`, when Python is needed. Use the nearest nested `AGENTS.md` for subtree-specific guidance.
 
 Useful pointers:
+- `BAZEL.md` for the contributor-facing Bazel build path (Phase 1: native
+  Go subtrees in `src/clis/nvcf-cli` and `src/libraries/go/lib`)
 - `tools/AGENTS.md` for repo tooling
 - `.cursor/skills/add-synthetic-import/SKILL.md` for synthetic imports
 - `.cursor/skills/documentation-style/SKILL.md` for docs style

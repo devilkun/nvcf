@@ -1,0 +1,31 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "tracer",
+    srcs = ["tracer.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/middleware/tracer",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/nvkit/api/errors/v1:errors",
+        "@com_github_go_kit_kit//endpoint",
+        "@com_github_grpc_ecosystem_grpc_gateway_v2//runtime",
+        "@io_opentelemetry_go_otel//attribute",
+        "@io_opentelemetry_go_otel//codes",
+        "@io_opentelemetry_go_otel_trace//:trace",
+        "@org_golang_google_grpc//status",
+    ],
+)
+
+go_test(
+    name = "tracer_test",
+    srcs = ["tracer_test.go"],
+    embed = [":tracer"],
+    deps = [
+        "//src/libraries/go/lib/pkg/nvkit/api/errors/v1:errors",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_opentelemetry_go_otel_trace//noop",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+    ],
+)

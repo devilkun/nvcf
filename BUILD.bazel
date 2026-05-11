@@ -1,0 +1,43 @@
+load("@gazelle//:def.bzl", "gazelle")
+
+# Phase 1 scope: only the two native Go subtrees are managed by Bazel.
+# Everything else is excluded so Gazelle does not descend into vendored
+# directories of synthetic-import subtrees (whose source is owned upstream
+# and whose changes here would be clobbered by `tools/scripts/sync_synthetic_imports`).
+#
+# When promoting an upstream to native (Phase B), remove the corresponding
+# exclude line below and add a per-subtree BUILD.bazel with the right prefix.
+# gazelle:exclude .bazel-cache
+# gazelle:exclude .cursor
+# gazelle:exclude .claude
+# gazelle:exclude .codex
+# gazelle:exclude ai-tooling
+# gazelle:exclude bazel-bin
+# gazelle:exclude bazel-nvcf
+# gazelle:exclude bazel-out
+# gazelle:exclude bazel-testlogs
+# gazelle:exclude ci
+# gazelle:exclude deploy
+# gazelle:exclude docs
+# gazelle:exclude examples
+# gazelle:exclude fern
+# gazelle:exclude infra
+# gazelle:exclude migrations
+# gazelle:exclude nvidia-internal
+# gazelle:exclude platforms
+# gazelle:exclude rules
+# gazelle:exclude src/compute-plane-services
+# gazelle:exclude src/control-plane-services
+# gazelle:exclude src/invocation-plane-services
+# gazelle:exclude src/libraries/python
+# gazelle:exclude src/libraries/ts
+# gazelle:exclude tools
+
+# Gazelle: auto-generate BUILD files for Go packages.
+# Usage:
+#   bazel run //:gazelle                     - generate or update BUILD files
+#   bazel run //:gazelle -- update-repos     - sync go.mod deps into MODULE.bazel
+gazelle(
+    name = "gazelle",
+    prefix = "github.com/NVIDIA/nvcf",
+)

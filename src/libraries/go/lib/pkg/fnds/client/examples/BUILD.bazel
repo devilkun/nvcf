@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "examples_lib",
+    srcs = ["go-client.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/fnds/client/examples",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//src/libraries/go/lib/pkg/fnds/client",
+        "//src/libraries/go/lib/pkg/fnds/common/core/types",
+        "@com_github_google_uuid//:uuid",
+    ],
+)
+
+go_binary(
+    name = "examples",
+    embed = [":examples_lib"],
+    visibility = ["//visibility:public"],
+)

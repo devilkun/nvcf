@@ -82,7 +82,7 @@ git commit -s -m "Your commit message"
 2. Create a feature branch (`git checkout -b feature/my-feature`)
 3. Make your changes
 4. Ensure all SPDX license headers are present in new files
-5. Run `make check` to verify tests and linting pass
+5. Run `bazel test //src/clis/nvcf-cli/...` to verify tests pass
 6. Commit your changes with DCO sign-off (`git commit -s`)
 7. Push to your branch (`git push origin feature/my-feature`)
 8. Open a Merge Request

@@ -1,0 +1,29 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "otel",
+    srcs = ["otel.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otel",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@io_opentelemetry_go_otel//attribute",
+        "@io_opentelemetry_go_otel//codes",
+        "@io_opentelemetry_go_otel_trace//:trace",
+    ],
+)
+
+go_test(
+    name = "otel_test",
+    srcs = ["otel_test.go"],
+    embed = [":otel"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_opentelemetry_go_otel//:otel",
+        "@io_opentelemetry_go_otel//attribute",
+        "@io_opentelemetry_go_otel//codes",
+        "@io_opentelemetry_go_otel_sdk//trace",
+        "@io_opentelemetry_go_otel_sdk//trace/tracetest",
+        "@io_opentelemetry_go_otel_trace//:trace",
+    ],
+)

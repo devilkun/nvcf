@@ -1,0 +1,42 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "config",
+    srcs = [
+        "autobind_env.go",
+        "config.go",
+        "doc.go",
+        "types.go",
+        "zz_generated.deepcopy.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_go_viper_mapstructure_v2//:mapstructure",
+        "@com_github_sirupsen_logrus//:logrus",
+        "@com_github_spf13_viper//:viper",
+        "@in_yaml_go_yaml_v3//:yaml",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/api/resource",
+    ],
+)
+
+go_test(
+    name = "config_test",
+    srcs = [
+        "autobind_env_test.go",
+        "config_test.go",
+        "deepcopy_test.go",
+        "types_additional_test.go",
+        "types_test.go",
+    ],
+    embed = [":config"],
+    deps = [
+        "@com_github_spf13_viper//:viper",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/api/resource",
+        "@io_k8s_sigs_yaml//:yaml",
+    ],
+)

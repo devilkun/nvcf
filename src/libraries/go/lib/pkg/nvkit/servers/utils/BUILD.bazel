@@ -1,0 +1,33 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "utils",
+    srcs = [
+        "header.go",
+        "util.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/servers/utils",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_go_kit_kit//transport/grpc",
+        "@com_github_google_uuid//:uuid",
+        "@com_github_openzipkin_zipkin_go//propagation/b3",
+        "@org_golang_google_grpc//metadata",
+    ],
+)
+
+go_test(
+    name = "utils_test",
+    srcs = [
+        "header_test.go",
+        "request_test.go",
+        "util_test.go",
+    ],
+    embed = [":utils"],
+    deps = [
+        "@com_github_openzipkin_zipkin_go//propagation/b3",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//metadata",
+    ],
+)

@@ -1,0 +1,27 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "backendconfig",
+    srcs = [
+        "embed_config.go",
+        "funcmap.go",
+        "sourceconfig.go",
+        "types.go",
+    ],
+    embedsrcs = [
+        "source-config.yaml",
+        "templates/config-k8s-container.yaml.tmpl",
+        "templates/config-k8s-helm.yaml.tmpl",
+        "templates/config-vm-container.yaml.tmpl",
+        "templates/config-vm-helm.yaml.tmpl",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otelconfig/backendconfig",
+    visibility = ["//visibility:public"],
+    deps = ["@in_gopkg_yaml_v3//:yaml_v3"],
+)
+
+go_test(
+    name = "backendconfig_test",
+    srcs = ["embed_config_test.go"],
+    embed = [":backendconfig"],
+)

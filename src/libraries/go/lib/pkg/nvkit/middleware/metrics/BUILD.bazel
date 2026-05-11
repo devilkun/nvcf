@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "metrics",
+    srcs = ["request.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/middleware/metrics",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_go_kit_kit//endpoint",
+        "@com_github_go_kit_kit//metrics",
+    ],
+)
+
+go_test(
+    name = "metrics_test",
+    srcs = ["request_test.go"],
+    embed = [":metrics"],
+    deps = [
+        "@com_github_go_kit_kit//endpoint",
+        "@com_github_go_kit_kit//metrics",
+        "@com_github_stretchr_testify//assert",
+    ],
+)

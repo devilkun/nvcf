@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "kubectx",
+    srcs = ["context.go"],
+    importpath = "nvcf-cli/internal/selfhosted/kubectx",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+)
+
+go_test(
+    name = "kubectx_test",
+    srcs = ["context_test.go"],
+    embed = [":kubectx"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

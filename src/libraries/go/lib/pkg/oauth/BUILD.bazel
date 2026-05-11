@@ -1,0 +1,34 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "oauth",
+    srcs = [
+        "jwks.go",
+        "jwtcache.go",
+        "types.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/oauth",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/core",
+        "@com_github_go_jose_go_jose_v4//:go-jose",
+        "@com_github_go_jose_go_jose_v4//jwt",
+    ],
+)
+
+go_test(
+    name = "oauth_test",
+    srcs = [
+        "jwks_test.go",
+        "jwtcache_test.go",
+        "types_test.go",
+    ],
+    embed = [":oauth"],
+    deps = [
+        "//src/libraries/go/lib/pkg/core",
+        "@com_github_go_jose_go_jose_v4//:go-jose",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+    ],
+)

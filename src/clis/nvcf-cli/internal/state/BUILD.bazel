@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "state",
+    srcs = ["state.go"],
+    importpath = "nvcf-cli/internal/state",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+    deps = ["//src/clis/nvcf-cli/internal/logging"],
+)
+
+go_test(
+    name = "state_test",
+    srcs = ["state_test.go"],
+    embed = [":state"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

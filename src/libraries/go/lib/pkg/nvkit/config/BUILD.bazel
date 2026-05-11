@@ -1,0 +1,31 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "config",
+    srcs = [
+        "config.go",
+        "example.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/config",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_mitchellh_go_homedir//:go-homedir",
+        "@com_github_spf13_cobra//:cobra",
+        "@com_github_spf13_pflag//:pflag",
+        "@com_github_spf13_viper//:viper",
+    ],
+)
+
+go_test(
+    name = "config_test",
+    srcs = [
+        "config_extra_test.go",
+        "config_test.go",
+    ],
+    embed = [":config"],
+    deps = [
+        "@com_github_spf13_cobra//:cobra",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

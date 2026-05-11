@@ -1,5 +1,8 @@
 .worktrees/
 
+# Bazel symlinks (point into ~/.cache/bazel)
+/bazel-*
+
 # IDE / editor
 .idea/
 .vscode/
@@ -16,6 +19,8 @@
 .env
 /go.work
 /go.work.sum
+# Per-user Bazel overrides imported via try-import in .bazelrc
+/user.bazelrc
 
 # Local CI/test artifacts.
 /public/

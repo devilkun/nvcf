@@ -76,6 +76,39 @@ Kubernetes resources.
 | Tools | [`tools/`](tools/) | Build, docs, dependency, license, and validation utilities. |
 | AI tooling | [`ai-tooling/`](ai-tooling/) | Public agent skills and workflow helpers for NVCF users and developers. |
 
+## Building with Bazel
+
+The `nvcf-cli` binary, multi-platform release matrix, and OCI image are built
+with Bazel. The shared Go library under `src/libraries/go/lib` also has Bazel
+targets. Other subtrees still use their existing build systems and will be
+onboarded one at a time.
+
+Quick start (Linux):
+
+```bash
+curl -fSL -o ~/.local/bin/bazel \
+  "https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-$(dpkg --print-architecture)"
+chmod +x ~/.local/bin/bazel
+
+bazel build //src/clis/nvcf-cli:nvcf-cli            # host binary
+bazel test  //src/clis/nvcf-cli/...                 # unit tests
+bazel build //src/clis/nvcf-cli:dist                # all 5 platforms
+```
+
+Quick start (macOS):
+
+```bash
+brew install bazelisk
+
+bazel build //src/clis/nvcf-cli:nvcf-cli
+bazel test  //src/clis/nvcf-cli/...
+bazel build //src/clis/nvcf-cli:dist
+```
+
+Full setup, day-to-day commands, OCI image build/push, stamping, caches, and
+CI map live in [`BAZEL.md`](BAZEL.md). For CLI-specific developer flow see
+[`src/clis/nvcf-cli/README.md`](src/clis/nvcf-cli/README.md).
+
 ## Support
 
 - If you have found a bug or want to request a feature, please open a [GitHub issue](https://github.com/nvidia/nvcf/issues/new/choose) in this repository. Use the appropriate template and include the component name in the title (e.g., [nvcf-nvca] Pod fails to start on arm64).

@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "ngc",
+    srcs = ["tokenfetcher.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/ngc",
+    visibility = ["//visibility:public"],
+    deps = ["//src/libraries/go/lib/pkg/core"],
+)
+
+go_test(
+    name = "ngc_test",
+    srcs = ["tokenfetcher_test.go"],
+    embed = [":ngc"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

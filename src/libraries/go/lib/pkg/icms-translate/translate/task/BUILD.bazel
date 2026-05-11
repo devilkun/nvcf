@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "task",
+    srcs = [
+        "translate.go",
+        "translate_all.go",
+        "translate_helm.go",
+        "types.go",
+        "zz_generated.deepcopy.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/task",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/icms-translate/translate/cache",
+        "//src/libraries/go/lib/pkg/icms-translate/translate/common",
+        "//src/libraries/go/lib/pkg/icms-translate/translate/util",
+        "//src/libraries/go/lib/pkg/otelconfig/backendconfig",
+        "@com_github_google_shlex//:shlex",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+    ],
+)

@@ -34,7 +34,7 @@ limitations under the License.
 
 ## Prerequisites
 
-- Go 1.21 or later
+- Bazel (managed via Bazelisk; see `BAZEL.md` at the repo root for setup)
 - Git
 - Valid NVIDIA Cloud Functions credentials
 
@@ -45,17 +45,21 @@ limitations under the License.
 1. Clone the repository:
 ```bash
 git clone <repository-url>
-cd nvcf-cli
+cd nvcf
 ```
 
-2. Build the binary:
+2. Build the binary (host platform):
 ```bash
-make build
+bazel build //src/clis/nvcf-cli:nvcf-cli
 ```
 
-3. (Optional) Install globally:
+The binary is at `bazel-bin/src/clis/nvcf-cli/nvcf-cli_/nvcf-cli`.
+
+3. (Optional) Install globally by copying it onto your `PATH`:
 ```bash
-make install
+install -m 0755 \
+  bazel-bin/src/clis/nvcf-cli/nvcf-cli_/nvcf-cli \
+  /usr/local/bin/nvcf-cli
 ```
 
 ### Option 2: Download Pre-built Binary
@@ -1301,75 +1305,77 @@ export NVCF_API_KEY="nvapi-your-general-operations-token"  # fallback
 │       └── multi_token_transport.go  # Multi-token auth
 ├── examples/              # JSON configuration examples
 ├── main.go                # Application entry point
-├── go.mod                 # Go module definition
+├── go.mod                 # Go module definition (consumed by Bazel via go.work.bazel)
 ├── go.sum                 # Go module checksums
-├── Makefile              # Build automation
+├── BUILD.bazel            # Bazel targets: nvcf-cli binary, dist matrix, OCI image
 └── README.md             # This file
 ```
 
-### **Building**
+### Building
+
+All build, test, and packaging operations go through Bazel. See `BAZEL.md` at the repo root for one-time setup.
 
 ```bash
 # Build for current platform
-make build
+bazel build //src/clis/nvcf-cli:nvcf-cli
 
-# Build for all supported platforms
-make build-all
+# Build for all supported platforms (linux/darwin/windows x amd64/arm64)
+bazel build //src/clis/nvcf-cli:dist
 
-# Install dependencies
-make deps
+# Stamp the binary with full version metadata (Version, GitCommit, BuildDate, ...)
+bazel build --stamp //src/clis/nvcf-cli:nvcf-cli
 
-# Format code
-make fmt
+# Build the multi-arch OCI image
+bazel build //src/clis/nvcf-cli:image_index
 
-# Run linter
-make lint
+# Load the host-arch image into your local docker daemon
+bazel run //src/clis/nvcf-cli:image_load
 
-# Run tests
-make test
+# Format Go and Bazel files (gofmt + buildifier)
+gofmt -w .
+bazel run @rules_go//go -- fmt ./...
 
-# Run tests with coverage
-make test-coverage
-
-# Run all checks
-make check
+# Run linter (still go-tooling; not yet wired into Bazel)
+golangci-lint run ./...
 ```
 
-### **Running Tests**
+### Running Tests
 
-The project includes comprehensive tests with mocked HTTP servers:
+The CLI test suite runs under the Bazel sandbox. Tests that need real
+infrastructure (k3d clusters, helmfile, NVCF backends) are tagged `e2e` and
+live under `test/e2e/`; see that directory's README.
 
 ```bash
-# Run all tests
-make test
+# Run all unit tests
+bazel test //src/clis/nvcf-cli/...
 
-# Run tests with coverage report
-make test-coverage
+# Run a single package's tests
+bazel test //src/clis/nvcf-cli/internal/client:client_test
 
-# Run tests with verbose output
-go test -v ./...
+# Stream test output even on success
+bazel test //src/clis/nvcf-cli/... --test_output=streamed
 
-# Run specific test
-go test -v ./internal/client -run TestClient_CreateFunction
+# Coverage (requires lcov on PATH; html report generation is a follow-up)
+bazel coverage //src/clis/nvcf-cli/...
 ```
 
-### **Contributing**
+### Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Make your changes
-4. Run tests and linting (`make check`)
-5. Commit your changes (`git commit -m 'Add amazing feature'`)
-6. Push to the branch (`git push origin feature/amazing-feature`)  
+4. Run `bazel test //src/clis/nvcf-cli/...` to verify tests pass
+5. Commit your changes with DCO sign-off (`git commit -s -m 'Add amazing feature'`)
+6. Push to the branch (`git push origin feature/amazing-feature`)
 7. Open a Pull Request
 
-### **Development Guidelines**
+### Development Guidelines
 
 - Follow Go coding standards and conventions
 - Write comprehensive tests for new features
 - Update documentation for any API changes
-- Ensure all tests pass before submitting PRs
-- Use `make check` to run all quality checks
+- Ensure `bazel test //src/clis/nvcf-cli/...` is green before submitting PRs
+- After adding a new Go import, run `bazel run //:gazelle` to refresh BUILD files
 
 ---
 

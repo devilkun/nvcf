@@ -1,0 +1,48 @@
+FROM ubuntu:24.04
+
+ARG BAZELISK_VERSION=1.25.0
+ARG BAZEL_VERSION=8.6.0
+ARG GRPCURL_VERSION=1.9.1
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    curl git gcc g++ python3 \
+    docker.io docker-compose-v2 \
+    build-essential cmake pkg-config perl lld \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && update-alternatives --install /usr/bin/ld ld /usr/bin/ld.lld 100
+
+# grpcurl is used by the .bazel-remote-probe step in .gitlab-ci.yml to
+# do a real GetCapabilities round-trip against bb-storage before the
+# build commits to --config=remote-write. A TCP/h2-preface probe is
+# not enough: a runner can complete the handshake to the cache and
+# still be unable to drive a useful gRPC conversation across an IT
+# firewall. If GetCapabilities fails, the probe disables remote
+# caching for the run instead of letting Bazel hang on the same RPC.
+RUN arch="$(uname -m)" && case "$arch" in x86_64) arch=x86_64;; aarch64|arm64) arch=arm64;; esac \
+  && curl -fSL -o /tmp/grpcurl.tgz \
+     "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${arch}.tar.gz" \
+  && tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl \
+  && chmod +x /usr/local/bin/grpcurl \
+  && rm -f /tmp/grpcurl.tgz
+
+# docker-compose shim for Testcontainers withLocalCompose(true).
+RUN printf '#!/usr/bin/env bash\ndocker compose "$@"\n' > /usr/local/bin/docker-compose \
+  && chmod +x /usr/local/bin/docker-compose
+
+# Bazelisk (installed as `bazel`).
+RUN arch="$(uname -m)" && case "$arch" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac \
+  && curl -fSL -o /usr/local/bin/bazel \
+     "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${arch}" \
+  && chmod +x /usr/local/bin/bazel
+
+# Pre-warm: download Bazel itself so first build does not pay the cost.
+RUN mkdir /tmp/warmup && cd /tmp/warmup \
+  && echo "${BAZEL_VERSION}" > .bazelversion \
+  && touch MODULE.bazel WORKSPACE \
+  && bazel version \
+  && rm -rf /tmp/warmup
+
+LABEL description="NVCF monorepo Bazel CI image - Ubuntu 24.04 + Bazel ${BAZEL_VERSION}"

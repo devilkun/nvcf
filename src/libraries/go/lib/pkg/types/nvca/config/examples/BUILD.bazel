@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "examples_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config/examples",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//src/libraries/go/lib/pkg/types/nvca/config",
+        "@com_github_spf13_cobra//:cobra",
+        "@in_yaml_go_yaml_v3//:yaml",
+    ],
+)
+
+go_binary(
+    name = "examples",
+    embed = [":examples_lib"],
+    visibility = ["//visibility:public"],
+)

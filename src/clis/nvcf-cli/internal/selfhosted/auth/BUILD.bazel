@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "auth",
+    srcs = ["fingerprint.go"],
+    importpath = "nvcf-cli/internal/selfhosted/auth",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+)
+
+go_test(
+    name = "auth_test",
+    srcs = ["fingerprint_test.go"],
+    deps = [
+        ":auth",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

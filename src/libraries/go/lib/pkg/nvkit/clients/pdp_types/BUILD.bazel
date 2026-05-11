@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "pdp_types",
+    srcs = ["pdp_types.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/clients/pdp_types",
+    visibility = ["//visibility:public"],
+    deps = ["@org_golang_google_protobuf//types/known/structpb"],
+)
+
+go_test(
+    name = "pdp_types_test",
+    srcs = ["pdp_types_test.go"],
+    embed = [":pdp_types"],
+    deps = ["@org_golang_google_protobuf//types/known/structpb"],
+)

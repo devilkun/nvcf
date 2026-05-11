@@ -1,0 +1,29 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "logs",
+    srcs = ["logger.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/middleware/logs",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/nvkit/logs",
+        "@com_github_go_kit_kit//endpoint",
+        "@com_github_go_kit_kit//log",
+        "@org_uber_go_zap//:zap",
+    ],
+)
+
+go_test(
+    name = "logs_test",
+    srcs = [
+        "logger_test.go",
+        "zap_logger_test.go",
+    ],
+    embed = [":logs"],
+    deps = [
+        "@com_github_go_kit_kit//endpoint",
+        "@com_github_go_kit_kit//log",
+        "@com_github_stretchr_testify//assert",
+        "@org_uber_go_zap//:zap",
+    ],
+)

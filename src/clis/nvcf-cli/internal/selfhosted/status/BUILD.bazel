@@ -1,0 +1,31 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "status",
+    srcs = ["collector.go"],
+    importpath = "nvcf-cli/internal/selfhosted/status",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/client",
+        "//src/clis/nvcf-cli/internal/selfhosted/progress",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//kubernetes",
+        "@org_golang_x_sync//errgroup",
+    ],
+)
+
+go_test(
+    name = "status_test",
+    srcs = ["collector_test.go"],
+    embed = [":status"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/client",
+        "//src/clis/nvcf-cli/internal/selfhosted/progress",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_k8s_api//apps/v1:apps",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime",
+        "@io_k8s_client_go//kubernetes/fake",
+    ],
+)

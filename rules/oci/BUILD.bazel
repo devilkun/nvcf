@@ -1,0 +1,2 @@
+# OCI image helpers.
+# A cacerts target can be added here later if using scratch/distroless bases.

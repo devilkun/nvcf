@@ -1,0 +1,34 @@
+# Bazel skips these directories during package loading and Gazelle traversal.
+# Mirrors gazelle:exclude entries in root BUILD.bazel; .bazelignore is needed
+# in addition because some Bazel commands (build //..., query) load packages
+# directly without consulting BUILD-level directives.
+#
+# Native subtrees (src/clis/nvcf-cli, src/libraries/go/lib) have their own
+# vendor/ entries listed below.
+
+# Synthetic-import subtrees with their own historical BUILD files referencing
+# WORKSPACE-style repository names (@io_bazel_rules_go etc.) that conflict
+# with our bzlmod setup. Re-enable per-subtree as Phase B brings each upstream
+# native.
+src/compute-plane-services
+src/control-plane-services
+src/invocation-plane-services
+src/libraries/python
+src/libraries/ts
+deploy
+docs
+examples
+fern
+infra
+migrations
+nvidia-internal
+ai-tooling
+tools
+
+# Vendored dependencies inside the two Phase 1 subtrees. Bazel resolves these
+# from MODULE.bazel via Gazelle's go_deps extension, not from on-disk vendor.
+src/libraries/go/lib/vendor
+src/clis/nvcf-cli/vendor
+
+# Bazel-managed caches we keep inside the workspace for CI cache: paths.
+.bazel-cache

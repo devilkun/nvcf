@@ -1,0 +1,45 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "selfhosted",
+    srcs = [
+        "orchestrator.go",
+        "orchestrator_errors.go",
+        "output.go",
+        "preflight.go",
+        "register.go",
+        "render.go",
+        "stack.go",
+    ],
+    importpath = "nvcf-cli/internal/selfhosted",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/client",
+        "//src/clis/nvcf-cli/internal/selfhosted/progress",
+        "@com_github_masterminds_semver_v3//:semver",
+        "@io_k8s_client_go//rest",
+        "@io_k8s_client_go//tools/clientcmd",
+    ],
+)
+
+go_test(
+    name = "selfhosted_test",
+    srcs = [
+        "orchestrator_errors_test.go",
+        "orchestrator_test.go",
+        "output_test.go",
+        "preflight_test.go",
+        "register_test.go",
+        "render_test.go",
+        "stack_test.go",
+    ],
+    embed = [":selfhosted"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/client",
+        "//src/clis/nvcf-cli/internal/selfhosted/progress",
+        "@com_github_masterminds_semver_v3//:semver",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_k8s_client_go//rest",
+    ],
+)

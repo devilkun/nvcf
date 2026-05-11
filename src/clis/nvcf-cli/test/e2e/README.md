@@ -47,14 +47,26 @@ export E2E_CLUSTER_CREATE_CMD='make -C ../../ncp-local-cluster build-and-deploy-
 ## Run
 
 ```bash
-cd nvcf-cli
+# From the monorepo root
 export STACK_PATH=/path/to/nvcf-self-managed-stack
 export NVCF_TOKEN=$(jq -r .token ~/.nvcf-cli.state)
-make e2e-self-hosted
+
+# Build the CLI under test
+bazel build //src/clis/nvcf-cli:nvcf-cli
+cp "$(bazel cquery --output=files //src/clis/nvcf-cli:nvcf-cli)" /tmp/nvcf-cli
+
+# Run the e2e suite (still go-tooling because it shells out to k3d/helm/kubectl)
+cd src/clis/nvcf-cli
+NVCF_E2E=1 go test -tags=e2e -v ./test/e2e/...
 ```
 
-The `make e2e-self-hosted` target sets `NVCF_E2E=1`, which is required. The test file panics
-on startup if this guard is absent.
+`NVCF_E2E=1` is required. The test file panics on startup if this guard is absent.
+
+The e2e tests intentionally remain on `go test -tags=e2e` rather than `bazel
+test`: they shell out to `k3d`, `helm`, `helmfile`, `cqlsh`, and `toxiproxy`
+(see `make e2e-self-hosted-faults` history), which do not run inside Bazel
+sandboxes. Migrating them to Bazel is a separate effort tracked outside the
+build-tooling MR that introduced the rest of the Bazel wiring.
 
 ## Expected runtime
 
@@ -75,8 +87,9 @@ T6 is unconditionally skipped pending the orchestrator-level lock implementation
 ## Selective runs
 
 ```bash
-make e2e-self-hosted ARGS="-run TestT1"          # Just T1
-make e2e-self-hosted ARGS="-run 'TestT[123]'"    # T1-T3
+# From src/clis/nvcf-cli (after the build step above)
+NVCF_E2E=1 go test -tags=e2e -v -run TestT1 ./test/e2e/...           # Just T1
+NVCF_E2E=1 go test -tags=e2e -v -run 'TestT[123]' ./test/e2e/...     # T1-T3
 ```
 
 ## Release gate
@@ -106,7 +119,9 @@ These tests require two or three k3d clusters and exercise the split-cluster
 context routing in `up` / `status`. These tests are not run in CI.
 
 ```sh
-NVCF_E2E=1 make e2e-self-hosted-split
+# After bazel build //src/clis/nvcf-cli:nvcf-cli (see Run section).
+cd src/clis/nvcf-cli
+NVCF_E2E=1 go test -tags=e2e -v -timeout=60m -run 'TestE2E_T(8|9|10)' ./test/e2e/...
 ```
 
 Prerequisites:

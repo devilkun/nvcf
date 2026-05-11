@@ -1,0 +1,37 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "http",
+    srcs = [
+        "logger.go",
+        "requestheaders.go",
+        "retryclient.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/http",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/core",
+        "//src/libraries/go/lib/pkg/version",
+        "@com_github_hashicorp_go_retryablehttp//:go-retryablehttp",
+        "@com_github_sirupsen_logrus//:logrus",
+        "@io_opentelemetry_go_contrib_instrumentation_net_http_otelhttp//:otelhttp",
+    ],
+)
+
+go_test(
+    name = "http_test",
+    srcs = [
+        "logger_test.go",
+        "requestheaders_test.go",
+        "retryclient_test.go",
+    ],
+    embed = [":http"],
+    deps = [
+        "//src/libraries/go/lib/pkg/core",
+        "//src/libraries/go/lib/pkg/version",
+        "@com_github_hashicorp_go_retryablehttp//:go-retryablehttp",
+        "@com_github_sirupsen_logrus//:logrus",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

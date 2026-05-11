@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "config",
+    srcs = [
+        "render.go",
+        "telemetries.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otelconfig/config",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/otelconfig/backendconfig",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)
+
+go_test(
+    name = "config_test",
+    srcs = ["render_test.go"],
+    embed = [":config"],
+    deps = [
+        "//src/libraries/go/lib/pkg/otelconfig/backendconfig",
+        "@com_github_stretchr_testify//assert",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)

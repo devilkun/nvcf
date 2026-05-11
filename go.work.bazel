@@ -1,0 +1,16 @@
+// Phase 1 Bazel-scope go workspace.
+//
+// Only lists the native Go subtrees that Bazel currently builds:
+//   - src/clis/nvcf-cli
+//   - src/libraries/go/lib
+//
+// The repo also has a generated go.work (gitignored) used by the existing
+// non-Bazel CI for license/dependency checks across all 31 go.mod files.
+// Bazel deliberately uses a narrower scope to avoid pulling in deps for
+// synthetic-import subtrees that are out of scope for Phase 1.
+go 1.25.0
+
+use (
+	./src/clis/nvcf-cli
+	./src/libraries/go/lib
+)

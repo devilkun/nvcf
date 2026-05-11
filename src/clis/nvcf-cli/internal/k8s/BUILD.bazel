@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "k8s",
+    srcs = ["client.go"],
+    importpath = "nvcf-cli/internal/k8s",
+    visibility = ["//src/clis/nvcf-cli:__subpackages__"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/logging",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//kubernetes",
+        "@io_k8s_client_go//rest",
+        "@io_k8s_client_go//tools/clientcmd",
+    ],
+)

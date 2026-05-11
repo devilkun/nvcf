@@ -1,0 +1,37 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "errors",
+    srcs = [
+        "encryption_errors.go",
+        "errors.go",
+    ],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/errors",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/nvkit/api/errors/v1:errors",
+        "@com_github_google_uuid//:uuid",
+        "@com_github_grpc_ecosystem_grpc_gateway_v2//runtime",
+        "@org_golang_google_genproto_googleapis_rpc//status",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+    ],
+)
+
+go_test(
+    name = "errors_test",
+    srcs = [
+        "encryption_errors_test.go",
+        "errors_test.go",
+    ],
+    embed = [":errors"],
+    deps = [
+        "//src/libraries/go/lib/pkg/nvkit/api/errors/v1:errors",
+        "@com_github_grpc_ecosystem_grpc_gateway_v2//runtime",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_genproto_googleapis_rpc//status",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+    ],
+)

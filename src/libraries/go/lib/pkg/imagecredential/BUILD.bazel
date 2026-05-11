@@ -1,0 +1,33 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "imagecredential",
+    srcs = ["imagecredential.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/imagecredential",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/libraries/go/lib/pkg/icms-translate/translate/common",
+        "@io_k8s_api//batch/v1:batch",
+        "@io_k8s_api//core/v1:core",
+    ],
+)
+
+go_test(
+    name = "imagecredential_test",
+    srcs = ["imagecredential_test.go"],
+    data = glob(["testdata/**"]),
+    embed = [":imagecredential"],
+    embedsrcs = [
+        "testdata/cronjob.yaml",
+        "testdata/job.yaml",
+        "testdata/secret.yaml",
+    ],
+    deps = [
+        "//src/libraries/go/lib/pkg/icms-translate/translate/common",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime/schema",
+        "@io_k8s_apimachinery//pkg/util/yaml",
+    ],
+)
