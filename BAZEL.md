@@ -402,10 +402,20 @@ maintainers; centralising it would couple unrelated release decisions.
 - `bazel info release` blocks for >30 s on first run: it is downloading the
   pinned Bazel binary. One-time cost.
 
+## Phase B status
+
+Per-service rollout state for synthetic-import subtrees is tracked in
+[`nvidia-internal/plans/bazel-phase-b.plan.md`](nvidia-internal/plans/bazel-phase-b.plan.md)
+(NVIDIA-internal; references upstream GitLab URLs and per-service
+rollout state that does not belong in the public mirror), including
+which upstream MRs are open, which are merged, and which umbrella
+`imports.yaml` bumps have landed. Update that file as each service
+moves through the playbook.
+
 ## Out of scope (Phase B and later)
 
 - Wiring synthetic-import subtrees (22 entries in `imports.yaml`). One MR
-  per upstream owner.
+  per upstream owner. See the tracker.
 - Migrating goreleaser-driven release stages
   (archive/package/publish/ngc-push) onto Bazel-native equivalents (e.g.
   `pkg_tar`, `oci_push`, custom rules for NGC). Today the artifact

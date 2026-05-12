@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 FROM ubuntu:24.04
 
 ARG BAZELISK_VERSION=1.25.0
@@ -11,8 +26,18 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     docker.io docker-compose-v2 \
     build-essential cmake pkg-config perl lld \
     ca-certificates \
+    jq unzip \
   && rm -rf /var/lib/apt/lists/* \
   && update-alternatives --install /usr/bin/ld ld /usr/bin/ld.lld 100
+# jq is required by the cds/cicd-pipelines `.vault-reader-before-script`
+# template, which iterates `$SECRETS_TO_RETRIEVE_IN_JSON | jq -c '.[]'`
+# to drive vault secret retrieval. Without jq the loop silently runs
+# zero iterations, NGC_REGISTRY_TOKEN never gets exported, and any
+# downstream `bazel run //:image_push` 401s against nvcr.io. First
+# reproduced on nvcf-grpc-proxy MR !69 (job 316400245).
+# unzip is required by the same template chain's `.nv-vault` snippet
+# that downloads NVIDIA's nvault wrapper from urm.nvidia.com and
+# unpacks it into vault/bin/.
 
 # grpcurl is used by the .bazel-remote-probe step in .gitlab-ci.yml to
 # do a real GetCapabilities round-trip against bb-storage before the
