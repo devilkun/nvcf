@@ -15,9 +15,12 @@ description: >-
   container image, multi-arch container Bazel, oci_push GitLab, stamp git
   commit OCI tag, go_oci_image, java_oci_image, rust_oci_image, or
   oci.pull.
+license: Apache-2.0
+compatibility: Requires a local checkout of an NVCF or Bazel monorepo
+author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
 version: "1.0.0"
-author: NVCF Platform Team
 tags:
+  - nvcf
   - bazel
   - oci
   - container
@@ -27,6 +30,25 @@ tools:
   - Read
   - Shell
   - Write
+metadata:
+  internal: false
+  author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
+  version: "1.0.0"
+  tags:
+    - nvcf
+    - bazel
+    - oci
+    - container
+    - rules_oci
+    - hermetic_cc
+  languages:
+    - starlark
+    - go
+    - rust
+    - java
+  frameworks:
+    - bazel
+  domain: build-systems
 ---
 
 # Bazel OCI Images
@@ -132,14 +154,14 @@ files do not have to repeat the multi-arch boilerplate. Five files:
 
 ```
 rules/oci/
-├── BUILD.bazel               # comment-only marker
-├── defs.bzl                  # public API: go_oci_image, java_oci_image, rust_oci_image
-├── transition.bzl            # multi_arch transition rule
-└── private/
-    ├── common.bzl            # create_oci_image: shared image+push helper
-    ├── go.bzl                # go_oci_image macro
-    ├── java.bzl              # java_oci_image macro
-    └── rust.bzl              # rust_oci_image macro
+|-- BUILD.bazel               # comment-only marker
+|-- defs.bzl                  # public API: go_oci_image, java_oci_image, rust_oci_image
+|-- transition.bzl            # multi_arch transition rule
+`-- private/
+    |-- common.bzl            # create_oci_image: shared image+push helper
+    |-- go.bzl                # go_oci_image macro
+    |-- java.bzl              # java_oci_image macro
+    `-- rust.bzl              # rust_oci_image macro
 ```
 
 Full bodies in [reference.md](reference.md). The high-level flow each

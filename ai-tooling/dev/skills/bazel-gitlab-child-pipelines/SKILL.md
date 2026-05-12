@@ -15,9 +15,12 @@ description: >-
   GitLab CI, parent-child pipeline Bazel, per-service trigger Bazel,
   GitLab change rules Bazel monorepo, or wiring Bazel into GitLab CI
   without breaking existing pipelines.
+license: Apache-2.0
+compatibility: Requires a local checkout of an NVCF or Bazel monorepo
+author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
 version: "1.0.0"
-author: NVCF Platform Team
 tags:
+  - nvcf
   - bazel
   - gitlab-ci
   - parent-child-pipelines
@@ -26,6 +29,22 @@ tools:
   - Read
   - Shell
   - Write
+metadata:
+  internal: false
+  author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
+  version: "1.0.0"
+  tags:
+    - nvcf
+    - bazel
+    - gitlab-ci
+    - parent-child-pipelines
+    - monorepo
+  languages:
+    - yaml
+    - starlark
+  frameworks:
+    - bazel
+  domain: build-systems
 ---
 
 # Bazel on GitLab CI: Parent-Child Pipelines
@@ -209,10 +228,10 @@ all run anyway.
 `if: $CI_PIPELINE_SOURCE == "schedule"` plus the matching web rule give
 you two extra ways to run all services:
 
-- Set up a nightly schedule in **CI/CD > Schedules**: every service
+- Set up a nightly schedule in `CI/CD > Schedules`: every service
   pipeline runs unconditionally, catching bit-rot from infra changes
   that did not touch any individual service path.
-- Manual run from the GitLab UI (**Run Pipeline**) is `web`. Without
+- Manual run from the GitLab UI (`Run Pipeline`) is `web`. Without
   variables, every service runs. Add `SERVICE=<name>` to scope to one.
 
 ### Step 7: Validate

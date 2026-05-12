@@ -16,7 +16,6 @@ Useful pointers:
 - `.cursor/skills/documentation-style/SKILL.md` for docs style
 - `.cursor/skills/` for root dev-skill symlink fanout
 - `ai-tooling/user/skills/` and `ai-tooling/dev/skills/` for public skills
-- `nvidia-internal/user/skills/` and `nvidia-internal/dev/skills/` for private skills
 
 If a referenced skill is outdated, update it before finishing.
 
@@ -84,31 +83,51 @@ Skills are split by visibility and audience:
 
 - `ai-tooling/user/skills/`: public user-facing NVCF skills.
 - `ai-tooling/dev/skills/`: public developer workflow skills.
-- `nvidia-internal/user/skills/`: private user-facing NVCF skills.
-- `nvidia-internal/dev/skills/`: private developer, release-engineering, and monorepo-maintenance skills.
-- `.cursor/skills/`: root dev-skill fanout only. Each entry is a symlink to a public dev source under `ai-tooling/dev/skills/` or a private dev source under `nvidia-internal/dev/skills/`.
+- Private skill source trees follow the same `user/skills/` and `dev/skills/` split in the private subtree.
+- `.cursor/skills/`: root dev-skill fanout only. Each entry is a symlink to a public or private dev skill source directory.
 
-Cross-tool symlinks make root dev skills available to all agents:
+Cross-tool symlinks make root dev skills available to all agents. The root fanout directories must contain symlinks only, never source skill directories or regular skill files:
 - `.cursor/skills/<name>` -> symlink to the dev skill source directory.
 - `.codex/skills/<name>` -> symlink to the same dev skill source directory.
 - `.claude/skills/<name>` -> symlink to the same dev skill source directory.
 
+The project hook `.cursor/hooks/validate-skill-fanout.py` audits this before an agent finishes. If it reports a fanout error, fix the symlinks or source placement before responding.
+
 When adding a skill:
-1. Decide visibility (`ai-tooling` public or `nvidia-internal` private) and audience (`user/skills` or `dev/skills`).
+1. Decide visibility (public or private) and audience (`user/skills` or `dev/skills`).
 2. Create the `SKILL.md` with valid frontmatter.
 3. For root-wide dev skills, create matching `.cursor/skills/<name>`, `.codex/skills/<name>`, and `.claude/skills/<name>` symlinks to the same source directory.
 4. Update the relevant public or private skills table.
+
+### Where hooks live
+
+Hooks follow the same source-and-fanout pattern as root dev skills:
+
+- `ai-tooling/dev/hooks/`: public hook source scripts.
+- Private hook source scripts live in the private `dev/hooks/` source tree.
+- `.cursor/hooks/`: Cursor hook script fanout only. Entries must be symlinks.
+- `.codex/hooks/`: Codex hook script fanout only. Entries must be symlinks.
+- `.claude/hooks/`: Claude hook script fanout only. Entries must be symlinks.
+
+Tool-specific hook config files, such as `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, and `.claude/settings.json`, may be regular files. Hook implementation scripts must live in a public or private `dev/hooks/` source tree and be exposed through matching symlinks in all three root hook fanouts.
 
 ### Public skills
 
 | Skill | Location | Purpose |
 |-------|----------|---------|
+| `bazel-gitlab-child-pipelines` | `ai-tooling/dev/skills/` | Add per-service Bazel GitLab child pipelines |
+| `bazel-go-gazelle` | `ai-tooling/dev/skills/` | Wire Go modules into Bazel with rules_go and Gazelle |
+| `bazel-java-maven` | `ai-tooling/dev/skills/` | Wire Java and Spring Boot services into Bazel with Maven artifacts |
+| `bazel-monorepo-bootstrap` | `ai-tooling/dev/skills/` | Bootstrap Bazel in an existing polyglot monorepo |
+| `bazel-oci-images` | `ai-tooling/dev/skills/` | Build multi-arch OCI images from Bazel binaries |
+| `bazel-rust-crate-universe` | `ai-tooling/dev/skills/` | Wire Rust services into Bazel with crate_universe |
+| `bazel-synthetic-import-strategy` | `ai-tooling/dev/skills/` | Plan Bazel rollout for NVCF synthetic imports |
 | `documentation-style` | `ai-tooling/dev/skills/` | NVCF documentation conventions (no bold, no emojis, no em-dash) |
 | `nvcf-explore-stack` | `ai-tooling/dev/skills/` | Navigate the self-hosted stack topology and dependency graph |
 | `nvcf-self-managed-cli` | `ai-tooling/user/skills/` | Install, operate, and manage self-managed NVCF through `nvcf-cli` |
 | `nvcf-self-managed-installation` | `ai-tooling/user/skills/` | Install and deploy the self-managed NVCF stack |
 
-Private skill inventory lives in `nvidia-internal/AGENTS.md`.
+Private skill inventory lives in the private subtree guidance.
 
 ## Commit Messages
 

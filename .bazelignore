@@ -38,7 +38,6 @@ examples
 fern
 infra
 migrations
-nvidia-internal
 tools
 
 # Vendored dependencies inside the two Phase 1 subtrees. Bazel resolves these

@@ -38,7 +38,6 @@ load("@gazelle//:def.bzl", "gazelle")
 # gazelle:exclude fern
 # gazelle:exclude infra
 # gazelle:exclude migrations
-# gazelle:exclude nvidia-internal
 # gazelle:exclude platforms
 # gazelle:exclude rules
 # gazelle:exclude src/compute-plane-services

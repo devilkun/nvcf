@@ -15,8 +15,10 @@ description: >-
   imports.yaml authoritative_source upstream, BUILD files overwritten by
   sync, NVCF subtree Bazel, or adding Bazel to a service whose code
   lives in another repo.
+license: Apache-2.0
+compatibility: Requires a local checkout of an NVCF or Bazel monorepo
+author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
 version: "1.0.0"
-author: NVCF Platform Team
 tags:
   - bazel
   - nvcf
@@ -26,6 +28,21 @@ tools:
   - Read
   - Shell
   - Write
+metadata:
+  internal: false
+  author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
+  version: "1.0.0"
+  tags:
+    - bazel
+    - nvcf
+    - synthetic-imports
+    - monorepo
+  languages:
+    - markdown
+    - starlark
+  frameworks:
+    - bazel
+  domain: build-systems
 ---
 
 # Bazel Synthetic Import Strategy (NVCF-specific)

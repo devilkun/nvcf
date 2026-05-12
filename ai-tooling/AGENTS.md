@@ -4,7 +4,7 @@ This subtree contains public Agent Skills for NVIDIA Cloud Functions (NVCF). All
 
 ## Instructions
 
-Use this file as the authoring contract for every public skill in `user/skills/` and `dev/skills/`. Keep private skills under `nvidia-internal/`.
+Use this file as the authoring contract for every public skill in `user/skills/` and `dev/skills/`. Keep private skills in the private subtree.
 
 When adding or editing a skill, keep the external skill spec fields at the top level of the frontmatter, retain the required NVCARPS fields under `metadata`, and include a concise `## Instructions` section in the body.
 
@@ -21,6 +21,8 @@ dev/skills/
 - dev-skill-name/
   - SKILL.md
 ```
+
+Public hook source scripts live under `dev/hooks/`. Do not place hook implementation scripts directly under `.cursor/hooks/`, `.codex/hooks/`, or `.claude/hooks/`; those root directories are fanouts only and must contain matching symlinks to `dev/hooks/`.
 
 ## SKILL.md Format
 
@@ -170,6 +172,13 @@ Before committing changes, verify:
 
 | Skill | Purpose | Domain |
 |-------|---------|--------|
+| `bazel-gitlab-child-pipelines` | Add per-service Bazel GitLab child pipelines | build-systems |
+| `bazel-go-gazelle` | Wire Go modules into Bazel with rules_go and Gazelle | build-systems |
+| `bazel-java-maven` | Wire Java and Spring Boot services into Bazel with Maven artifacts | build-systems |
+| `bazel-monorepo-bootstrap` | Bootstrap Bazel in an existing polyglot monorepo | build-systems |
+| `bazel-oci-images` | Build multi-arch OCI images from Bazel binaries | build-systems |
+| `bazel-rust-crate-universe` | Wire Rust services into Bazel with crate_universe | build-systems |
+| `bazel-synthetic-import-strategy` | Plan Bazel rollout for NVCF synthetic imports | build-systems |
 | `documentation-style` | NVCF documentation conventions for public repo prose | documentation |
 | `nvcf-explore-stack` | Navigate self-hosted stack topology, helmfile deployment order, chart ownership, and dependencies | cloud-infrastructure |
 | `nvcf-self-managed-installation` | Install and deploy the nvcf-self-managed-stack helmfile bundle: installation, teardown, values overrides, pull secrets, debugging | cloud-infrastructure |

@@ -288,10 +288,25 @@ looks_generated() {
 # ---------------------------------------------------------------------------
 # Check whether the required header snippets are present.
 # ---------------------------------------------------------------------------
+read_license_header_window() {
+    local filepath="$1"
+    local header
+
+    # Executable scripts need the shebang on line 1. Treat it as outside the
+    # license header window so script files can remain directly executable.
+    header=$(head -n "$((HEADER_WINDOW + 1))" "${filepath}" 2>/dev/null) || true
+    if [[ "${header}" == '#!'* ]]; then
+        header="${header#*$'\n'}"
+    else
+        header="$(printf '%s\n' "${header}" | head -n "${HEADER_WINDOW}")"
+    fi
+    printf '%s' "${header}"
+}
+
 has_required_header() {
     local filepath="$1"
     local header
-    header=$(head -n "${HEADER_WINDOW}" "${filepath}" 2>/dev/null) || true
+    header="$(read_license_header_window "${filepath}")"
     for snippet in "${HEADER_SNIPPETS[@]}"; do
         [[ "${header}" != *"${snippet}"* ]] && return 1
     done
@@ -304,7 +319,7 @@ has_allowed_spdx_header() {
 
     [[ ${#ALLOWED_SPDX_DIRS[@]} -eq 0 ]] && return 1
 
-    header=$(head -n "${HEADER_WINDOW}" "${filepath}" 2>/dev/null) || true
+    header="$(read_license_header_window "${filepath}")"
     for (( i=0; i<${#ALLOWED_SPDX_DIRS[@]}; i++ )); do
         allow_dir="${ALLOWED_SPDX_DIRS[i]}"
         license_id="${ALLOWED_SPDX_IDS[i]}"

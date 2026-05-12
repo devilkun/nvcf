@@ -6,6 +6,13 @@ Public agent skills for users and developers working with NVIDIA Cloud Functions
 
 | Skill | Description |
 |-------|-------------|
+| [bazel-gitlab-child-pipelines](dev/skills/bazel-gitlab-child-pipelines/SKILL.md) | Add per-service Bazel GitLab child pipelines |
+| [bazel-go-gazelle](dev/skills/bazel-go-gazelle/SKILL.md) | Wire Go modules into Bazel with rules_go and Gazelle |
+| [bazel-java-maven](dev/skills/bazel-java-maven/SKILL.md) | Wire Java and Spring Boot services into Bazel with Maven artifacts |
+| [bazel-monorepo-bootstrap](dev/skills/bazel-monorepo-bootstrap/SKILL.md) | Bootstrap Bazel in an existing polyglot monorepo |
+| [bazel-oci-images](dev/skills/bazel-oci-images/SKILL.md) | Build multi-arch OCI images from Bazel binaries |
+| [bazel-rust-crate-universe](dev/skills/bazel-rust-crate-universe/SKILL.md) | Wire Rust services into Bazel with crate_universe |
+| [bazel-synthetic-import-strategy](dev/skills/bazel-synthetic-import-strategy/SKILL.md) | Plan Bazel rollout for NVCF synthetic imports |
 | [documentation-style](dev/skills/documentation-style/SKILL.md) | NVCF documentation conventions for public repo prose |
 | [nvcf-explore-stack](dev/skills/nvcf-explore-stack/SKILL.md) | Navigate the self-hosted stack topology, helmfile dependency graph, chart ownership, and deployment order |
 | [nvcf-self-managed-installation](user/skills/nvcf-self-managed-installation/SKILL.md) | Install and deploy the nvcf-self-managed-stack helmfile bundle: installation, teardown, values overrides, pull secrets, debugging |

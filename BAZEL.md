@@ -405,12 +405,11 @@ maintainers; centralising it would couple unrelated release decisions.
 ## Phase B status
 
 Per-service rollout state for synthetic-import subtrees is tracked in
-[`nvidia-internal/plans/bazel-phase-b.plan.md`](nvidia-internal/plans/bazel-phase-b.plan.md)
-(NVIDIA-internal; references upstream GitLab URLs and per-service
-rollout state that does not belong in the public mirror), including
-which upstream MRs are open, which are merged, and which umbrella
-`imports.yaml` bumps have landed. Update that file as each service
-moves through the playbook.
+an internal plan that references upstream GitLab URLs and per-service
+rollout state that does not belong in the public mirror, including which
+upstream MRs are open, which are merged, and which umbrella `imports.yaml`
+bumps have landed. Update that internal plan as each service moves through
+the playbook.
 
 ## Out of scope (Phase B and later)
 

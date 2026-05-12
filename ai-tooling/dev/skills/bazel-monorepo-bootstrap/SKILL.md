@@ -11,9 +11,12 @@ description: >-
   Bazelisk install, polyglot monorepo Bazel, .bazelrc profiles
   (debug/release/ci), Bzlmod migration, or initial Bazel scaffold for
   a polyglot codebase.
+license: Apache-2.0
+compatibility: Requires a local checkout of an NVCF or Bazel monorepo
+author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
 version: "1.0.0"
-author: NVCF Platform Team
 tags:
+  - nvcf
   - bazel
   - bootstrap
   - bzlmod
@@ -23,6 +26,23 @@ tools:
   - Read
   - Shell
   - Write
+metadata:
+  internal: false
+  author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
+  version: "1.0.0"
+  tags:
+    - nvcf
+    - bazel
+    - bootstrap
+    - bzlmod
+    - gazelle
+    - polyglot-monorepo
+  languages:
+    - starlark
+    - shell
+  frameworks:
+    - bazel
+  domain: build-systems
 ---
 
 # Bazel Monorepo Bootstrap

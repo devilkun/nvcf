@@ -13,9 +13,12 @@ description: >-
   sandbox workaround for `cargo_build_script`. Use when the user mentions
   rules_rust, crate_universe, Bazel Rust, private cargo registry Bazel,
   hermetic_cc Rust, CARGO_BAZEL_REPIN, build.rs Bazel, or jemalloc Bazel.
+license: Apache-2.0
+compatibility: Requires a local checkout of an NVCF or Bazel monorepo
+author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
 version: "1.0.0"
-author: NVCF Platform Team
 tags:
+  - nvcf
   - bazel
   - rust
   - rules_rust
@@ -25,6 +28,23 @@ tools:
   - Read
   - Shell
   - Write
+metadata:
+  internal: false
+  author: "nvcf-core-eng <nvcf-core-eng@exchange.nvidia.com>"
+  version: "1.0.0"
+  tags:
+    - nvcf
+    - bazel
+    - rust
+    - rules_rust
+    - crate_universe
+    - hermetic_cc
+  languages:
+    - rust
+    - starlark
+  frameworks:
+    - bazel
+  domain: build-systems
 ---
 
 # Bazel Rust and crate_universe

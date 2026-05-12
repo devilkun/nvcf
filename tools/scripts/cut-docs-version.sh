@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Snapshot the current docs/user tree into a versioned subdirectory and
-# generate a matching Fern navigation file. See
-# nvidia-internal/plans/docs-versioning.plan.md for the design.
+# generate a matching Fern navigation file. See the internal docs-versioning
+# plan for the design.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
