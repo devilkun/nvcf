@@ -67,6 +67,9 @@ func (h *OpenAIChatHandlers) handleChatCompletionRequest(
 	overrideStreamResponseSender StreamResponseSender,
 ) error {
 	responseModel := request.Model
+	if err := applyChatSessionAffinity(c, request); err != nil {
+		return err
+	}
 	normalized, err := h.handlers.normalizeChatRequest(c, request)
 	if err != nil {
 		return err
@@ -97,6 +100,7 @@ func (h *OpenAIChatHandlers) handleChatCompletionRequest(
 	if responseModel != "" {
 		response.Model = responseModel
 	}
+	setMultiTurnSessionResponseHeader(c)
 
 	if overrideUnaryResponseSender != nil {
 		return overrideUnaryResponseSender(c, response, normalized)
@@ -139,6 +143,7 @@ func (h *OpenAIChatHandlers) streamChatCompletionWithSender(
 	if err != nil {
 		return providerHTTPError(err)
 	}
+	setMultiTurnSessionResponseHeader(c)
 
 	wrappedStream := h.wrapStreamForFinalization(
 		finalizeCtx,

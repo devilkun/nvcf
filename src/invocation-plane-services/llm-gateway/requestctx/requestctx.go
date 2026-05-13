@@ -22,14 +22,17 @@ import (
 )
 
 type RequestContext struct {
-	RequestID     string
-	APIKeyID      string // client auth subject; reserved for attribution, auditing, or future API-key policy hooks
-	OrgID         string // auth-derived rate limit key; currently used to scope rate limiting
-	ProjectID     string // used to further scope rate limiting when auth provides a project ID
-	BearerToken   string
-	RoutingKey    string
-	Model         string
-	RoutingMethod string
-	ModelSpecs    map[string]nvcf.ModelSpec
-	TargetRegion  string
+	RequestID        string
+	APIKeyID         string // client auth subject; reserved for attribution, auditing, or future API-key policy hooks
+	OrgID            string // auth-derived rate limit key; currently used to scope rate limiting
+	ProjectID        string // used to further scope rate limiting when auth provides a project ID
+	BearerToken      string
+	RoutingKey       string
+	Model            string
+	RoutingMethod    string
+	ModelSpecs       map[string]nvcf.ModelSpec
+	TargetRegion     string
+	SessionID        string
+	SessionSource    string
+	CacheAffinityKey string
 }

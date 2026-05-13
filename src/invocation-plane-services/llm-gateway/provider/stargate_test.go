@@ -61,12 +61,13 @@ func TestStargateProviderCompleteForwardsRenderedPromptAndRoutingHeaders(t *test
 		InputTokens:    3,
 	}
 	reqCtx := &requestctx.RequestContext{
-		RequestID:     "req-123",
-		BearerToken:   "secret-token",
-		RoutingKey:    "fn-abc",
-		Model:         "upstream-model",
-		RoutingMethod: "experimental_method",
-		TargetRegion:  "us-west1",
+		RequestID:        "req-123",
+		BearerToken:      "secret-token",
+		RoutingKey:       "fn-abc",
+		Model:            "upstream-model",
+		RoutingMethod:    "experimental_method",
+		TargetRegion:     "us-west1",
+		CacheAffinityKey: "mt:v1:header:hash",
 	}
 
 	wantEstimate := routingTokenEstimate(request)
@@ -86,6 +87,7 @@ func TestStargateProviderCompleteForwardsRenderedPromptAndRoutingHeaders(t *test
 		require.Equal(t, "fn-abc", r.Header.Get(headerRoutingKey))
 		require.Equal(t, "upstream-model", r.Header.Get(headerModel))
 		require.Equal(t, "experimental_method", r.Header.Get(headerRoutingMethod))
+		require.Equal(t, "mt:v1:header:hash", r.Header.Get(headerCacheAffinityKey))
 		require.Equal(t, fmt.Sprintf("%d", wantEstimate), r.Header.Get(headerInputTokens))
 		require.Equal(t, fmt.Sprintf("%d", wantEstimate), r.Header.Get(headerTokenEstimate))
 
@@ -251,10 +253,11 @@ func TestStargateProviderProxyForwardsRoutingMethod(t *testing.T) {
 	t.Parallel()
 
 	reqCtx := &requestctx.RequestContext{
-		RequestID:     "req-proxy",
-		RoutingKey:    "fn-proxy",
-		Model:         "proxy-model",
-		RoutingMethod: "least_loaded",
+		RequestID:        "req-proxy",
+		RoutingKey:       "fn-proxy",
+		Model:            "proxy-model",
+		RoutingMethod:    "least_loaded",
+		CacheAffinityKey: "mt:v1:header:proxy-hash",
 	}
 	request := &ProxyRequest{
 		Method: http.MethodPost,
@@ -273,6 +276,7 @@ func TestStargateProviderProxyForwardsRoutingMethod(t *testing.T) {
 		require.Equal(t, "fn-proxy", r.Header.Get(headerRoutingKey))
 		require.Equal(t, "proxy-model", r.Header.Get(headerModel))
 		require.Equal(t, "least_loaded", r.Header.Get(headerRoutingMethod))
+		require.Equal(t, "mt:v1:header:proxy-hash", r.Header.Get(headerCacheAffinityKey))
 
 		return &http.Response{
 			StatusCode: http.StatusOK,

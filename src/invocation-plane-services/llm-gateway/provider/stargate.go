@@ -45,16 +45,17 @@ import (
 const (
 	stargateChatCompletionsPath = "/v1/chat/completions"
 
-	headerAuthorization = "Authorization"
-	headerContentType   = "Content-Type"
-	headerAccept        = "Accept"
-	headerRequestID     = "X-Request-Id"
-	headerTargetRegion  = "X-Groq-Region"
-	headerRoutingKey    = "X-Routing-Key"
-	headerRoutingMethod = "X-Routing-Method"
-	headerModel         = "X-Model"
-	headerInputTokens   = "X-Input-Tokens"
-	headerTokenEstimate = "X-Token-Estimate"
+	headerAuthorization    = "Authorization"
+	headerContentType      = "Content-Type"
+	headerAccept           = "Accept"
+	headerRequestID        = "X-Request-Id"
+	headerTargetRegion     = "X-Groq-Region"
+	headerRoutingKey       = "X-Routing-Key"
+	headerRoutingMethod    = "X-Routing-Method"
+	headerModel            = "X-Model"
+	headerCacheAffinityKey = "X-Cache-Affinity-Key"
+	headerInputTokens      = "X-Input-Tokens"
+	headerTokenEstimate    = "X-Token-Estimate"
 
 	contentTypeJSON = "application/json"
 	contentTypeSSE  = "text/event-stream"
@@ -210,6 +211,9 @@ func (p *StargateProvider) newOutboundRequest(
 	if reqCtx.RoutingMethod != "" {
 		req.Header.Set(headerRoutingMethod, reqCtx.RoutingMethod)
 	}
+	if reqCtx.CacheAffinityKey != "" {
+		req.Header.Set(headerCacheAffinityKey, reqCtx.CacheAffinityKey)
+	}
 	if bearerToken := reqCtx.BearerToken; bearerToken != "" {
 		req.Header.Set(headerAuthorization, "Bearer "+bearerToken)
 	}
@@ -270,6 +274,9 @@ func (p *StargateProvider) Proxy(
 		}
 		if reqCtx.RoutingMethod != "" {
 			outbound.Header.Set(headerRoutingMethod, reqCtx.RoutingMethod)
+		}
+		if reqCtx.CacheAffinityKey != "" {
+			outbound.Header.Set(headerCacheAffinityKey, reqCtx.CacheAffinityKey)
 		}
 		if reqCtx.Model != "" {
 			outbound.Header.Set(headerModel, reqCtx.Model)

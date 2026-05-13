@@ -47,6 +47,9 @@ func (h *ResponsesHandlers) CreateResponse(ec echo.Context) error {
 	if err := request.Validate(); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
+	if err := applyResponsesSessionAffinity(c, &request); err != nil {
+		return err
+	}
 
 	chatRequest := ConvertToChatCompletionRequest(&request)
 	return h.handlers.AsOpenAIChatHandlers().handleChatCompletionRequest(

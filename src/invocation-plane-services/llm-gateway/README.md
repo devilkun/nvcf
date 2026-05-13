@@ -89,6 +89,18 @@ configured/default load-balancer algorithm. Stargate owns routing method
 acceptance and algorithm preconfiguration; unknown or unconfigured methods are
 rejected by Stargate.
 
+For OpenAI-compatible multi-turn stickiness, chat completions and responses
+return `x-multi-turn-session-id`. Clients should persist that value and send it
+on later requests for the same conversation. Responses requests prefer native
+body fields before the header: `prompt_cache_key`, then `conversation.id`, then
+`x-multi-turn-session-id`. Chat completions use `x-multi-turn-session-id` when
+present. If no explicit ID is available, the gateway returns an opaque ID
+derived from the first input payload (`input` for responses, `messages` for
+chat completions). The gateway forwards only a hashed internal
+`x-cache-affinity-key` to Stargate; raw body IDs and client session IDs are not
+sent to the router. Sending a returned session ID back in the header maps to the
+same internal affinity key used by the request that produced it.
+
 When `NVCF_GRPC_ADDR` and `NVCF_GRPC_AUTH_TOKEN` are configured, the gateway
 authenticates each chat or responses request through the NVCF LLM gRPC auth
 service, derives the per-caller rate-limit key from `authContext["ncaId"]`,

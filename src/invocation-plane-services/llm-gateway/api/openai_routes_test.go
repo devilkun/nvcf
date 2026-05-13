@@ -27,6 +27,7 @@ import (
 	echo "github.com/labstack/echo/v4"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/provider"
 )
@@ -90,6 +91,111 @@ func TestOpenAIChatCompletionsServesRequests(t *testing.T) {
 	}
 	if response.Model != "fn-alpha/company-name/model-name" {
 		t.Fatalf("model = %q, want fn-alpha/company-name/model-name", response.Model)
+	}
+}
+
+func TestOpenAIChatCompletionsReturnsHeaderSessionID(t *testing.T) {
+	t.Parallel()
+
+	e := newTestAPI(config.Default())
+
+	body := `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set(HeaderMultiTurnSessionID, "chat-session")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get(HeaderMultiTurnSessionID); got != "chat-session" {
+		t.Fatalf("%s = %q, want chat-session", HeaderMultiTurnSessionID, got)
+	}
+}
+
+func TestOpenAIChatCompletionsReturnsGeneratedSessionIDForPayloadFallback(t *testing.T) {
+	t.Parallel()
+
+	e := newTestAPI(config.Default())
+
+	body := `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	got := rec.Header().Get(HeaderMultiTurnSessionID)
+	if !strings.HasPrefix(got, "mt:v1:payload:") {
+		t.Fatalf("%s = %q, want generated payload session ID", HeaderMultiTurnSessionID, got)
+	}
+}
+
+func TestOpenAIChatCompletionsStreamReturnsSessionHeader(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+	handlers := NewHandlers(
+		cfg,
+		&stubResponsesProvider{
+			streamEvents: []provider.StreamEvent{
+				{
+					Chunk: &models.ChatCompletionChunk{
+						Choices: []models.ChatCompletionChunkChoice{
+							{
+								Delta: models.ChatCompletionChunkDelta{
+									Content: ptr.To("hello"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		nil,
+		nil,
+	)
+
+	e := echo.New()
+	e.Use(NewContextMiddleware(cfg))
+	handlers.AsOpenAIChatHandlers().RegisterRoutes(e.Group(""))
+
+	body := `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set(HeaderMultiTurnSessionID, "chat-stream-session")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get(HeaderMultiTurnSessionID); got != "chat-stream-session" {
+		t.Fatalf("%s = %q, want chat-stream-session", HeaderMultiTurnSessionID, got)
+	}
+}
+
+func TestOpenAIChatCompletionsRejectsInvalidSessionHeader(t *testing.T) {
+	t.Parallel()
+
+	e := newTestAPI(config.Default())
+
+	body := `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set(HeaderMultiTurnSessionID, "bad\nsession")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 }
 
