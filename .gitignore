@@ -13,6 +13,8 @@
 .claude/plans/
 .codex/settings.local.json
 .cursor/settings.local.json
+**/superpowers/plans/
+*.plan.md
 
 # Local overrides
 .secrets
