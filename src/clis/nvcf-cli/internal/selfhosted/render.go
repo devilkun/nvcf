@@ -42,6 +42,9 @@ type RenderOptions struct {
 	// HelmfileBin is the path to the helmfile binary. Defaults to "helmfile"
 	// (resolved via PATH) when empty.
 	HelmfileBin string
+	// HelmRuntimeMode selects compatibility flags for the installed helm
+	// major version. Empty preserves the Helm 3 legacy behavior.
+	HelmRuntimeMode HelmRuntimeMode
 	// Selector (optional) is the -l flag value for narrowing to a single
 	// release group (e.g. "component=control-plane").
 	Selector string
@@ -79,17 +82,18 @@ func Render(opts RenderOptions) error {
 		target = "helmfile.d/"
 	}
 	args := []string{"-f", opts.StackPath + "/" + target}
+	verb := "template"
+	if opts.Apply {
+		verb = "apply"
+	}
+	args = append(args, HelmfileCompatibilityArgs(opts.HelmRuntimeMode, target, verb)...)
 	if opts.Selector != "" {
 		args = append(args, "-l", opts.Selector)
 	}
 	if opts.KubeContext != "" {
 		args = append(args, "--kube-context="+opts.KubeContext)
 	}
-	if opts.Apply {
-		args = append(args, "apply")
-	} else {
-		args = append(args, "template")
-	}
+	args = append(args, verb)
 
 	ctx := opts.Ctx
 	if ctx == nil {

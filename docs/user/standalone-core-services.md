@@ -172,7 +172,7 @@ install to initialize the NVCF account with registry credentials.
 
 | **Chart** | `helm-nvcf-api` |
 | --- | --- |
-| **Version** | `1.18.1` |
+| **Version** | `1.19.1` |
 | **Namespace** | `nvcf` |
 | **Depends on** | ESS API (must be running) |
 
@@ -253,7 +253,7 @@ Replace the following placeholders:
 ```bash
 helm upgrade --install api \
   oci://${REGISTRY}/${REPOSITORY}/helm-nvcf-api \
-  --version 1.18.1 \
+  --version 1.19.1 \
   --namespace nvcf \
   --wait --wait-for-jobs --timeout 15m \
   -f nvcf-api-values.yaml
@@ -469,7 +469,7 @@ installed in the `nvcf` namespace with the `helm-reval` chart.
 
 | **Chart** | `helm-reval` |
 | --- | --- |
-| **Version** | `1.3.0` |
+| **Version** | `1.3.3` |
 | **Namespace** | `nvcf` |
 | **Depends on** | Infrastructure only |
 
@@ -501,7 +501,7 @@ Replace `<REGISTRY>` and `<REPOSITORY>` with your registry settings.
 ```bash
 helm upgrade --install reval \
   oci://${REGISTRY}/${REPOSITORY}/helm-reval \
-  --version 1.3.0 \
+  --version 1.3.3 \
   --namespace nvcf \
   --wait --timeout 10m \
   -f reval-values.yaml

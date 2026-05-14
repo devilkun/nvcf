@@ -180,12 +180,13 @@ func runSelfHostedUp(c *cobra.Command, _ []string) error {
 }
 
 type selfHostedUpRun struct {
-	c              *cobra.Command
-	ctx            context.Context
-	sink           progress.EventSink
-	started        time.Time
-	helmfileStdout io.Writer
-	helmfileStderr io.Writer
+	c               *cobra.Command
+	ctx             context.Context
+	sink            progress.EventSink
+	started         time.Time
+	helmfileStdout  io.Writer
+	helmfileStderr  io.Writer
+	helmRuntimeMode selfhosted.HelmRuntimeMode
 }
 
 type upClusterRegistration struct {
@@ -292,6 +293,7 @@ func (r *selfHostedUpRun) runPreflight() (time.Time, error) {
 	}
 	p1Start := r.emitPhase(1, upPhasePreflight)
 	results := runUpPreflight(r.ctx, selfhosted.PreflightConfig{Tools: selfHostedPreflightTools()})
+	r.helmRuntimeMode = helmRuntimeModeFromPreflightResults(results)
 	selfhosted.RenderText(r.c.ErrOrStderr(), results)
 	if anyFailed(results) {
 		r.emitFailure(selfhosted.Failure{Phase: selfhosted.PhasePreflight, Err: fmt.Errorf("pre-flight checks failed")}, p1Start)
@@ -383,13 +385,14 @@ func (r *selfHostedUpRun) applyControlPlane(stackPath string) error {
 	}
 	cancelWatcher, watcherDone := startWatcher(r.ctx, r.sink, 4, upPhaseApplyCP, controlPlaneNamespaces())
 	err := selfhosted.Render(selfhosted.RenderOptions{
-		StackPath:   stackPath,
-		Env:         selfHostedEnv,
-		Apply:       true,
-		KubeContext: kubectxFor(4), // M+9.E: control-plane context in split mode
-		Stdout:      r.helmfileStdout,
-		Stderr:      r.helmfileStderr,
-		Ctx:         r.ctx,
+		StackPath:       stackPath,
+		Env:             selfHostedEnv,
+		Apply:           true,
+		HelmRuntimeMode: r.helmRuntimeMode,
+		KubeContext:     kubectxFor(4), // M+9.E: control-plane context in split mode
+		Stdout:          r.helmfileStdout,
+		Stderr:          r.helmfileStderr,
+		Ctx:             r.ctx,
 	})
 	stopWatcher(cancelWatcher, watcherDone)
 	if err != nil {
@@ -533,16 +536,17 @@ func (r *selfHostedUpRun) applyComputePlane(stackPath string, registration upClu
 	cancelWatcher, watcherDone := startWatcher(r.ctx, r.sink, 7, upPhaseApplyComputePlane, computePlaneNamespaces())
 	helmfileFile, selector := computePlaneTarget(stackPath)
 	err := selfhosted.Render(selfhosted.RenderOptions{
-		StackPath:    stackPath,
-		HelmfileFile: helmfileFile,
-		Env:          selfHostedEnv,
-		Apply:        true,
-		Selector:     selector,
-		KubeContext:  kubectxFor(7), // M+9.E: compute-plane context in split mode
-		Stdout:       r.helmfileStdout,
-		Stderr:       r.helmfileStderr,
-		Ctx:          r.ctx,
-		ExtraEnv:     registration.computePlaneEnv(),
+		StackPath:       stackPath,
+		HelmfileFile:    helmfileFile,
+		Env:             selfHostedEnv,
+		Apply:           true,
+		Selector:        selector,
+		HelmRuntimeMode: r.helmRuntimeMode,
+		KubeContext:     kubectxFor(7), // M+9.E: compute-plane context in split mode
+		Stdout:          r.helmfileStdout,
+		Stderr:          r.helmfileStderr,
+		Ctx:             r.ctx,
+		ExtraEnv:        registration.computePlaneEnv(),
 	})
 	stopWatcher(cancelWatcher, watcherDone)
 	if err != nil {
@@ -1136,6 +1140,18 @@ func splitAndTrim(csv string) []string {
 // fully-functional fake of each tool. Production callers run the real check.
 var runUpPreflight = func(ctx context.Context, cfg selfhosted.PreflightConfig) []selfhosted.CheckResult {
 	return selfhosted.RunPreflight(ctx, cfg)
+}
+
+func helmRuntimeModeFromPreflightResults(results []selfhosted.CheckResult) selfhosted.HelmRuntimeMode {
+	for _, r := range results {
+		if r.ID == "local-host-tools-helm-runtime" && r.Passed && r.Detail != "" {
+			mode := selfhosted.HelmRuntimeMode(r.Detail)
+			if selfhosted.IsKnownHelmRuntimeMode(mode) {
+				return mode
+			}
+		}
+	}
+	return selfhosted.HelmRuntimeHelm3Legacy
 }
 
 // runSelfHostedInit shells out to the existing nvcf-cli init command — the

@@ -12,11 +12,11 @@ registries:
     namespace: 0833294136851237/nvcf-ncp-staging
 stack:
   name: nvcf-self-managed-stack
-  version: 0.6.0-rc.20
+  version: 0.6.0-rc.22
   registry: staging
   gitlab_project_id: 182049
   package_name: ncp-deploy
-  artifacts_file: artifacts-0.6.0-rc.20.txt
+  artifacts_file: artifacts-0.6.0-rc.22.txt
 artifacts:
   - name: admin-token-issuer-proxy
     type: image
@@ -49,7 +49,7 @@ artifacts:
   - name: helm-nvcf-api
     type: chart
     registry: staging
-    version: 1.18.1
+    version: 1.19.1
   - name: helm-nvcf-cassandra
     type: chart
     registry: staging
@@ -81,15 +81,19 @@ artifacts:
   - name: helm-nvcf-nats
     type: chart
     registry: staging
-    version: 0.6.0
+    version: 0.6.1
   - name: helm-nvcf-notary-service
     type: chart
     registry: staging
     version: 1.3.1
+  - name: helm-nvcf-nvct-api
+    type: chart
+    registry: staging
+    version: 1.1.0
   - name: helm-nvcf-openbao-server
     type: chart
     registry: staging
-    version: 0.30.4
+    version: 0.30.9
   - name: helm-nvcf-sis
     type: chart
     registry: staging
@@ -98,18 +102,14 @@ artifacts:
     type: chart
     registry: staging
     version: 1.0.1
-  - name: helm-nvct-api
-    type: chart
-    registry: staging
-    version: 1.0.2
   - name: helm-reval
     type: chart
     registry: staging
-    version: 1.3.0
+    version: 1.3.3
   - name: nats-box
     type: image
     registry: staging
-    version: 0.19.2-nonroot
+    version: 0.19.5-nonroot
   - name: nats-server-config-reloader
     type: image
     registry: staging
@@ -157,25 +157,19 @@ artifacts:
   - name: nvcf-openbao-migrations
     type: image
     registry: staging
-    version: 0.11.0
-  - id: nvcf-openbao-1
-    name: nvcf-openbao
-    type: image
-    registry: staging
-    version: 2.2.2-nv-1
-  - id: nvcf-openbao-2
-    name: nvcf-openbao
+    version: 0.11.2
+  - name: nvcf-openbao
     type: image
     registry: staging
     version: 2.5.1-nv-1.2.1
   - name: nvcf-service-oss
     type: image
     registry: staging
-    version: 1.1.7
+    version: 1.2.3
   - name: nvct-service-oss
     type: image
     registry: staging
-    version: 1.2.11
+    version: 1.3.6
   - name: oss-vault-k8s
     type: image
     registry: staging
@@ -183,7 +177,7 @@ artifacts:
   - name: reval-server
     type: image
     registry: staging
-    version: 0.15.0
+    version: 0.16.2
   - name: spot
     type: image
     registry: staging
@@ -193,6 +187,10 @@ supplemental_artifacts:
     type: resource
     registry: staging
     version: 0.0.30
+  - name: helm-nvct-api
+    type: chart
+    registry: staging
+    version: 1.0.2
   - name: strap
     type: image
     registry: staging

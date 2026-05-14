@@ -899,6 +899,31 @@ esac
 	assert.Contains(t, string(args), "jsonpath={.status.agentStatus}")
 }
 
+func TestHelmRuntimeModeFromPreflightResults(t *testing.T) {
+	got := helmRuntimeModeFromPreflightResults([]selfhosted.CheckResult{
+		{ID: "local-host-tools-helm", Passed: true, Detail: "4.0.5"},
+		{ID: "local-host-tools-helm-runtime", Passed: true, Detail: string(selfhosted.HelmRuntimeHelm4Compat)},
+	})
+
+	assert.Equal(t, selfhosted.HelmRuntimeHelm4Compat, got)
+}
+
+func TestHelmRuntimeModeFromPreflightResultsDefaultsToHelm3Legacy(t *testing.T) {
+	got := helmRuntimeModeFromPreflightResults([]selfhosted.CheckResult{
+		{ID: "stub", Passed: true},
+	})
+
+	assert.Equal(t, selfhosted.HelmRuntimeHelm3Legacy, got)
+}
+
+func TestHelmRuntimeModeFromPreflightResultsDefaultsToHelm3LegacyOnUnknownDetail(t *testing.T) {
+	got := helmRuntimeModeFromPreflightResults([]selfhosted.CheckResult{
+		{ID: "local-host-tools-helm-runtime", Passed: true, Detail: "helm5-surprise"},
+	})
+
+	assert.Equal(t, selfhosted.HelmRuntimeHelm3Legacy, got)
+}
+
 func TestNamespacePodsReadySkipsTerminalPods(t *testing.T) {
 	kube := fake.NewSimpleClientset(
 		&corev1.Pod{

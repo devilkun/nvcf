@@ -88,6 +88,10 @@ func runSelfHostedUninstall(c *cobra.Command, _ []string) error {
 
 func runUninstallDestroy(c *cobra.Command) error {
 	ctx := c.Context()
+	helmRuntimeMode, err := resolveSelfHostedHelmRuntimeMode(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve Helm runtime mode: %w", err)
+	}
 
 	plane := "control-plane"
 	kubeCtx := selfHostedControlPlaneContext
@@ -105,14 +109,15 @@ func runUninstallDestroy(c *cobra.Command) error {
 	}
 
 	if err := teardown.Destroy(teardown.DestroyOpts{
-		Plane:       plane,
-		ClusterName: uninstallClusterName,
-		KubeContext: kubeCtx,
-		StackPath:   resolved.Path,
-		Env:         selfHostedEnv,
-		Stdout:      c.OutOrStdout(),
-		Stderr:      c.ErrOrStderr(),
-		Ctx:         ctx,
+		Plane:           plane,
+		ClusterName:     uninstallClusterName,
+		KubeContext:     kubeCtx,
+		StackPath:       resolved.Path,
+		Env:             selfHostedEnv,
+		HelmRuntimeMode: helmRuntimeMode,
+		Stdout:          c.OutOrStdout(),
+		Stderr:          c.ErrOrStderr(),
+		Ctx:             ctx,
 	}, &uninstallNoopSink{}); err != nil {
 		return fmt.Errorf("helmfile destroy: %w", err)
 	}
@@ -177,4 +182,4 @@ func uninstallDefaultReleases() []teardown.ReleaseRef {
 type uninstallNoopSink struct{}
 
 func (uninstallNoopSink) Emit(_ context.Context, _ progress.Event) error { return nil }
-func (uninstallNoopSink) Close() error                                    { return nil }
+func (uninstallNoopSink) Close() error                                   { return nil }

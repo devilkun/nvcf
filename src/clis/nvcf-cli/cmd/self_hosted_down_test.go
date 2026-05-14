@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"nvcf-cli/internal/client"
+	"nvcf-cli/internal/selfhosted"
 	"nvcf-cli/internal/selfhosted/teardown"
 )
 
@@ -271,6 +272,12 @@ func TestDown_ClusterNameCleansControlPlaneWhenLastClusterRemoved(t *testing.T) 
 	selfHostedStack = stack
 	selfHostedICMSURL = "http://sis.test"
 
+	prevRuntimeResolver := resolveSelfHostedHelmRuntimeMode
+	t.Cleanup(func() { resolveSelfHostedHelmRuntimeMode = prevRuntimeResolver })
+	resolveSelfHostedHelmRuntimeMode = func(context.Context) (selfhosted.HelmRuntimeMode, error) {
+		return selfhosted.HelmRuntimeHelm4Compat, nil
+	}
+
 	fakeClient := &fakeDownClusterClient{}
 	prevDeleterFactory := newClusterDeleterForDown
 	t.Cleanup(func() { newClusterDeleterForDown = prevDeleterFactory })
@@ -299,4 +306,5 @@ func TestDown_ClusterNameCleansControlPlaneWhenLastClusterRemoved(t *testing.T) 
 	assert.Contains(t, invocations[0], "helmfile-nvca-operator.yaml.gotmpl")
 	assert.Contains(t, invocations[0], "CLUSTER_NAME=test-cluster")
 	assert.Contains(t, invocations[1], filepath.Join(stack, "helmfile.d")+"/")
+	assert.Contains(t, invocations[1], "--sequential-helmfiles")
 }

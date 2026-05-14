@@ -211,7 +211,7 @@ func DefaultTools() []BinarySpec {
 			LookPath: exec.LookPath, Version: probeHelmfileVersion,
 		},
 		{
-			Name: "helm", MinVer: semver.MustParse("3.14.0"), MaxVerExclusive: semver.MustParse("4.0.0"),
+			Name: "helm", MinVer: semver.MustParse("3.14.0"),
 			HintURL:  "https://helm.sh/docs/intro/install/",
 			LookPath: exec.LookPath, Version: probeHelmVersion,
 		},
@@ -327,6 +327,9 @@ func buildLocalHostCategory(cfg PreflightConfig) *categorySpec {
 				return checkBinary(ctx, t)
 			},
 		})
+	}
+	if compat := helmRuntimeCompatibilityCheck(cfg.Tools); compat != nil {
+		checks = append(checks, *compat)
 	}
 	if len(checks) == 0 {
 		return nil

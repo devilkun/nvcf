@@ -28,6 +28,7 @@ go_library(
     importpath = "nvcf-cli/internal/selfhosted/teardown",
     visibility = ["//src/clis/nvcf-cli:__subpackages__"],
     deps = [
+        "//src/clis/nvcf-cli/internal/selfhosted/helmruntime",
         "//src/clis/nvcf-cli/internal/selfhosted/progress",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
         "@io_k8s_client_go//kubernetes",
@@ -46,6 +47,7 @@ go_test(
     ],
     embed = [":teardown"],
     deps = [
+        "//src/clis/nvcf-cli/internal/selfhosted/helmruntime",
         "//src/clis/nvcf-cli/internal/selfhosted/progress",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",

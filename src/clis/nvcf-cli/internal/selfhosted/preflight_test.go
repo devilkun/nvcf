@@ -90,6 +90,92 @@ func TestCheckBinary_VersionTooHigh(t *testing.T) {
 	assert.Contains(t, r.Message, ">= 3.14.0 and < 4.0.0 required")
 }
 
+func TestDefaultTools_AllowsHelm4IndividualVersionCheck(t *testing.T) {
+	var helm BinarySpec
+	for _, tool := range DefaultTools() {
+		if tool.Name == "helm" {
+			helm = tool
+			break
+		}
+	}
+	require.Equal(t, "helm", helm.Name)
+	helm.LookPath = func(string) (string, error) { return "/usr/local/bin/helm", nil }
+	helm.Version = func(_ context.Context, _ string) (*semver.Version, error) {
+		return semver.MustParse("4.0.5"), nil
+	}
+
+	r := checkBinary(context.Background(), helm)
+
+	require.NoError(t, r.Err)
+	assert.True(t, r.Passed)
+	assert.Contains(t, r.Message, "helm 4.0.5")
+}
+
+func TestRunPreflight_Helm4RequiresCompatibleHelmfile(t *testing.T) {
+	cfg := PreflightConfig{Tools: []BinarySpec{
+		{
+			Name: "helmfile", MinVer: semver.MustParse("1.0.0"),
+			LookPath: func(string) (string, error) { return "/usr/local/bin/helmfile", nil },
+			Version: func(_ context.Context, _ string) (*semver.Version, error) {
+				return semver.MustParse("1.1.9"), nil
+			},
+		},
+		{
+			Name: "helm", MinVer: semver.MustParse("3.14.0"),
+			LookPath: func(string) (string, error) { return "/usr/local/bin/helm", nil },
+			Version: func(_ context.Context, _ string) (*semver.Version, error) {
+				return semver.MustParse("4.0.5"), nil
+			},
+		},
+	}}
+
+	results := RunPreflight(context.Background(), cfg)
+
+	var compat *CheckResult
+	for i := range results {
+		if results[i].ID == "local-host-tools-helm-runtime" {
+			compat = &results[i]
+			break
+		}
+	}
+	require.NotNil(t, compat)
+	assert.False(t, compat.Passed)
+	require.Error(t, compat.Err)
+	assert.Contains(t, compat.Message, "Helm 4.0.5 requires helmfile >= 1.5.0")
+}
+
+func TestRunPreflight_Helm4WithCompatibleHelmfilePasses(t *testing.T) {
+	cfg := PreflightConfig{Tools: []BinarySpec{
+		{
+			Name: "helmfile", MinVer: semver.MustParse("1.0.0"),
+			LookPath: func(string) (string, error) { return "/usr/local/bin/helmfile", nil },
+			Version: func(_ context.Context, _ string) (*semver.Version, error) {
+				return semver.MustParse("1.5.1"), nil
+			},
+		},
+		{
+			Name: "helm", MinVer: semver.MustParse("3.14.0"),
+			LookPath: func(string) (string, error) { return "/usr/local/bin/helm", nil },
+			Version: func(_ context.Context, _ string) (*semver.Version, error) {
+				return semver.MustParse("4.0.5"), nil
+			},
+		},
+	}}
+
+	results := RunPreflight(context.Background(), cfg)
+
+	var compat *CheckResult
+	for i := range results {
+		if results[i].ID == "local-host-tools-helm-runtime" {
+			compat = &results[i]
+			break
+		}
+	}
+	require.NotNil(t, compat)
+	assert.True(t, compat.Passed)
+	assert.Equal(t, "helm4-compat", compat.Detail)
+}
+
 func TestCheckBinary_RetriesTransientVersionProbeFailure(t *testing.T) {
 	attempts := 0
 	r := checkBinary(context.Background(), BinarySpec{
@@ -310,13 +396,13 @@ func TestRunPreflightForRole_LocalOnly(t *testing.T) {
 	}}
 	res := RunPreflightForRole(context.Background(), cfg, RoleLocalOnly, RoleConfig{}, sink)
 
-	// Only local-host-tools category emitted; 3 checks (kubectl/helmfile/helm).
+	// Only local-host-tools category emitted; 3 tools plus the helm runtime compatibility check.
 	for _, e := range sink.events {
 		if cs, ok := e.(progress.CheckStarted); ok {
 			assert.Equal(t, "local-host-tools", cs.Category, "unexpected category for check %s", cs.ID)
 		}
 	}
-	assert.Len(t, res, 3, "expected 3 results (one per tool)")
+	assert.Len(t, res, 4, "expected 3 tool results plus helm runtime compatibility")
 }
 
 func TestRunPreflightForRole_ControlPlaneAddsClusterCategory(t *testing.T) {

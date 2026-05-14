@@ -36,6 +36,7 @@ go_library(
         "self_hosted.go",
         "self_hosted_check.go",
         "self_hosted_down.go",
+        "self_hosted_helm_runtime.go",
         "self_hosted_install.go",
         "self_hosted_preflight_tools.go",
         "self_hosted_status.go",

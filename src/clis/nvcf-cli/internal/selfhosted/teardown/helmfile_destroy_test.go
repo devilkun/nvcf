@@ -25,6 +25,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"nvcf-cli/internal/selfhosted/helmruntime"
 )
 
 func TestDestroy_ArgsContainDestroy(t *testing.T) {
@@ -86,6 +88,26 @@ func TestDestroy_DefaultHelmfileFile(t *testing.T) {
 	args := recorded.Args
 	// Without HelmfileFile override, -f should point to StackPath+"/helmfile.yaml.gotmpl"
 	assert.Contains(t, args, "/mystack/helmfile.d/")
+}
+
+func TestDestroy_Helm4CompatDirectoryEmitsSequentialFlag(t *testing.T) {
+	var recorded *exec.Cmd
+	orig := destroyRunner
+	destroyRunner = func(cmd *exec.Cmd) error { recorded = cmd; return nil }
+	t.Cleanup(func() { destroyRunner = orig })
+
+	opts := DestroyOpts{
+		StackPath:       "/mystack",
+		Env:             "prod",
+		HelmRuntimeMode: helmruntime.Helm4Compat,
+		Stdout:          &bytes.Buffer{},
+		Stderr:          &bytes.Buffer{},
+		Ctx:             context.Background(),
+	}
+	require.NoError(t, Destroy(opts, &discardSink{}))
+
+	assert.Contains(t, recorded.Args, "--sequential-helmfiles")
+	assert.NotContains(t, recorded.Args, "--track-mode")
 }
 
 func TestDestroy_HelmfileFileOverride(t *testing.T) {

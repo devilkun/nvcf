@@ -17,7 +17,7 @@ components.
 
 | **Chart** | `helm-nvcf-nats` |
 | --- | --- |
-| **Version** | `0.6.0` |
+| **Version** | `0.6.1` |
 | **Namespace** | `nats-system` |
 | **Depends on** | None |
 
@@ -85,7 +85,7 @@ If you are using node selectors for dedicated NVCF node pools, uncomment the
 ```bash
 helm upgrade --install nats \
   oci://${REGISTRY}/${REPOSITORY}/helm-nvcf-nats \
-  --version 0.6.0 \
+  --version 0.6.1 \
   --namespace nats-system \
   --wait --timeout 15m \
   -f nats-values.yaml
@@ -123,7 +123,7 @@ pull secrets.
 
 | **Chart** | `helm-nvcf-openbao-server` |
 | --- | --- |
-| **Version** | `0.30.4` |
+| **Version** | `0.30.9` |
 | **Namespace** | `vault-system` |
 | **Depends on** | NATS (must be running) |
 
@@ -233,7 +233,7 @@ If you are using node selectors, uncomment the `nodeSelector` sections under bot
 ```bash
 helm upgrade --install openbao-server \
   oci://${REGISTRY}/${REPOSITORY}/helm-nvcf-openbao-server \
-  --version 0.30.4 \
+  --version 0.30.9 \
   --namespace vault-system \
   --wait --wait-for-jobs --timeout 15m \
   -f openbao-values.yaml

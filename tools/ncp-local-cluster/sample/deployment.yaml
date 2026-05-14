@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample
+  labels:
+    app: sample
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sample
+  template:
+    metadata:
+      labels:
+        app: sample
+    spec:
+      nodeSelector:
+        usage: workload
+      containers:
+      - name: sample
+        image: sample # This will be transformed by Kustomize
+        command: ["sh", "-c"]
+        args: ["while true; do echo \"Still healthy at $(date)\"; sleep 10; done"]
+        ports:
+        - containerPort: 80 
