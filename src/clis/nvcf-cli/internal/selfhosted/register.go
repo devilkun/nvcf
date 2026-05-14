@@ -147,7 +147,20 @@ func (a *clusterClientAdapter) RegisterCluster(ctx context.Context, req Register
 	if err != nil {
 		// Idempotent semantics: if cluster already exists, look it up.
 		if strings.Contains(err.Error(), "already exists") {
-			return resolveExistingCluster(ctx, a.inner, a.sisURL, ncaID, req.ClusterName)
+			existing, lookupErr := resolveExistingCluster(ctx, a.inner, a.sisURL, ncaID, req.ClusterName)
+			if lookupErr != nil {
+				return nil, lookupErr
+			}
+			if req.JWKS != "" {
+				updateReq := &client.UpdateClusterJWKSRequest{JWKS: req.JWKS}
+				if req.OIDCIssuer != "" {
+					updateReq.OIDCIssuer = &req.OIDCIssuer
+				}
+				if updateErr := a.inner.UpdateClusterJWKS(ctx, a.sisURL, existing.ClusterID, updateReq); updateErr != nil {
+					return nil, fmt.Errorf("failed to update existing cluster JWKS: %w", updateErr)
+				}
+			}
+			return existing, nil
 		}
 		return nil, fmt.Errorf("failed to register cluster: %w", err)
 	}

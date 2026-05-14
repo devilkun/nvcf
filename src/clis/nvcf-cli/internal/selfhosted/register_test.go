@@ -19,9 +19,13 @@ package selfhosted
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -95,6 +99,56 @@ func TestResolveExistingCluster_ListError(t *testing.T) {
 	l := &fakeLister{err: errors.New("list failed")}
 	_, err := resolveExistingCluster(context.Background(), l, "url", "nca", "x")
 	assert.ErrorContains(t, err, "list failed")
+}
+
+func TestClusterClientAdapter_RegisterExistingUpdatesJWKS(t *testing.T) {
+	var updateCalled bool
+	var gotUpdate client.UpdateClusterJWKSRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/accounts/nca/clusters":
+			http.Error(w, "cluster already exists", http.StatusConflict)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/nca/clusters":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"clusterName":"wanted","clusterId":"cl-existing","clusterGroupId":"cg-existing"}]`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/nvca/clusters/cl-existing/jwks":
+			updateCalled = true
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&gotUpdate))
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	cfg := &client.Config{
+		AuthType:       client.AuthTypeBearer,
+		Token:          "admin-token",
+		ClientID:       "nca",
+		BaseHTTPURL:    server.URL,
+		BaseGRPCURL:    "localhost:1",
+		DefaultTimeout: time.Second,
+	}
+	inner, err := client.NewClient(cfg)
+	require.NoError(t, err)
+	defer inner.Close()
+
+	adapter := &clusterClientAdapter{inner: inner, sisURL: server.URL, cfg: cfg}
+	resp, err := adapter.RegisterCluster(context.Background(), RegisterRequest{
+		ClusterName: "wanted",
+		NCAID:       "nca",
+		JWKS:        `{"keys":[{"kid":"new"}]}`,
+		OIDCIssuer:  "https://issuer.example.com",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "cl-existing", resp.ClusterID)
+	assert.Equal(t, "cg-existing", resp.ClusterGroupID)
+	assert.True(t, updateCalled, "existing cluster registration should refresh JWKS")
+	assert.Equal(t, `{"keys":[{"kid":"new"}]}`, gotUpdate.JWKS)
+	require.NotNil(t, gotUpdate.OIDCIssuer)
+	assert.Equal(t, "https://issuer.example.com", *gotUpdate.OIDCIssuer)
 }
 
 // TestLoadKubeConfigFn_SeamIsReplaceable verifies that loadKubeConfigFn is a
