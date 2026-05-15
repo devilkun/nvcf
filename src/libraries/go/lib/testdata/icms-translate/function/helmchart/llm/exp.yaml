@@ -200,7 +200,7 @@ spec:
     - name: LLM_CREDENTIAL_MANAGER_IMAGE
       value: nvcr.io/nvcf-core/llm-credential-manager:0.1.0
     - name: LLM_ROUTER_CLIENT_IMAGE
-      value: nvcr.io/nvcf-core/llm-worker:0.1.0
+      value: nvcr.io/nvcf-core/stargate-client:0.2.0
     - name: MAX_REQUEST_CONCURRENCY
       value: "1"
     - name: NCA_ID
@@ -231,7 +231,7 @@ spec:
       value: nvcr.io/org/worker-utils:2.21.4
     - name: WORKER_TOKEN_PATH
       value: /var/run/llm/worker-token
-    image: nvcr.io/nvcf-core/llm-worker:0.1.0
+    image: nvcr.io/nvcf-core/stargate-client:0.2.0
     imagePullPolicy: IfNotPresent
     name: llm-worker
     resources:
@@ -359,7 +359,7 @@ spec:
     - name: LLM_CREDENTIAL_MANAGER_IMAGE
       value: nvcr.io/nvcf-core/llm-credential-manager:0.1.0
     - name: LLM_ROUTER_CLIENT_IMAGE
-      value: nvcr.io/nvcf-core/llm-worker:0.1.0
+      value: nvcr.io/nvcf-core/stargate-client:0.2.0
     - name: MAX_REQUEST_CONCURRENCY
       value: "1"
     - name: NCA_ID

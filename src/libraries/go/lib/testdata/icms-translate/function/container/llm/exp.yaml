@@ -263,7 +263,7 @@ spec:
       value: nvcr.io/nvcf-core/worker-utils:2.21.4
     - name: WORKER_TOKEN_PATH
       value: /var/run/llm/worker-token
-    image: nvcr.io/0651155215864979/ncp-dev/llm-router-client:a9556d67
+    image: nvcr.io/0651155215864979/ncp-dev/stargate-client:0.2.0
     imagePullPolicy: IfNotPresent
     name: llm-worker
     resources:

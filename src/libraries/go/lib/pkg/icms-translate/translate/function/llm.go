@@ -35,7 +35,7 @@ const (
 	//nolint:gosec
 	llmCredentialManagerImageDefault = "nvcr.io/0651155215864979/ncp-dev/nvcf_worker_llm_credentials:2.109.0"
 	llmRouterClientImageEnv          = "LLM_ROUTER_CLIENT_IMAGE"
-	llmRouterClientImageDefault      = "nvcr.io/0651155215864979/ncp-dev/llm-router-client:a9556d67"
+	llmRouterClientImageDefault      = "nvcr.io/0651155215864979/ncp-dev/stargate-client:0.2.0"
 
 	llmDirMountPath    = "/var/run/llm"
 	llmWorkerTokenPath = llmDirMountPath + "/worker-token"
