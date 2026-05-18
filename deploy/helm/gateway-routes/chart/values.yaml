@@ -147,8 +147,6 @@ nvcfGatewayRoutes:
     grpc:
       enabled: true
       name: grpc
-      hostnames:
-        - "grpc.{{ .Values.nvcfGatewayRoutes.domain }}"
       backend:
         name: grpc
         namespace: nvcf

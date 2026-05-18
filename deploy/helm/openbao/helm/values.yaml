@@ -16,6 +16,9 @@
 openbao:
   # Namespace to deploy wrapper chart resources. Defaults to the release namespace.
   namespace: ""
+  # Keep the embedded OpenBao chart identity aligned with the wrapper-managed
+  # secrets, volumes, and bootstrap scripts.
+  fullnameOverride: openbao-server
 
   hooks:
     initializeCluster:

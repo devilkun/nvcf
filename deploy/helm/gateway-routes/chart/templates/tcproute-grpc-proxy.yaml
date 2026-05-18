@@ -47,14 +47,6 @@ spec:
       namespace: {{ .Values.nvcfGatewayRoutes.gateways.grpc.namespace }}
       sectionName: {{ .Values.nvcfGatewayRoutes.gateways.grpc.listenerName }}
 
-  # Hostname matching for gRPC Proxy
-  # With TLS termination at the NLB, no SNI matching, and no hostname matching
-  # So this will be ignored, but it is useful as self-documentation.
-  hostnames:
-    {{- range .Values.nvcfGatewayRoutes.routes.grpc.hostnames }}
-    - {{ tpl . $ | quote }}
-    {{- end }}
-
   # Routing rules for gRPC
   rules:
     - backendRefs:

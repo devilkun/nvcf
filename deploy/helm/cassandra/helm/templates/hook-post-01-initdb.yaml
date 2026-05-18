@@ -19,10 +19,12 @@
 # - bash
 # - kubectl
 # - jq
+{{- $fullname := include "nvcf-cassandra.fullname" . }}
+{{- $cassandraFullname := include "nvcf-cassandra.cassandraFullname" . }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ .Release.Name }}-initialize-cluster
+  name: {{ $fullname }}-initialize-cluster
   namespace: {{ include "nvcf-cassandra.namespace" . }}
   annotations:
     helm.sh/hook: post-install,post-upgrade
@@ -50,7 +52,7 @@ spec:
           command: ["/bin/bash"]
           args:
             - -c
-            - /scripts/initdb.sh {{ include "nvcf-cassandra.namespace" . }} {{ .Release.Name }}
+            - /scripts/initdb.sh {{ include "nvcf-cassandra.namespace" . }} {{ $cassandraFullname }}
           env:
             - name: CASSANDRA_USER
               value: {{ .Values.cassandra.dbUser.user | quote }}
@@ -63,7 +65,7 @@ spec:
           resources:
             {{- toYaml .Values.cassandra.hooks.initializeCluster.resources | nindent 12 }}
       restartPolicy: Never
-      serviceAccountName: {{ .Release.Name }}-initialize-cluster
+      serviceAccountName: {{ $fullname }}-initialize-cluster
       volumes:
         - name: init-script
           configMap:

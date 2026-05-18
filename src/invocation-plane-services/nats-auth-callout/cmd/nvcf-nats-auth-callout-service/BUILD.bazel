@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+load("//rules/oci:defs.bzl", "go_oci_image")
+
+go_library(
+    name = "nvcf-nats-auth-callout-service_lib",
+    srcs = ["main.go"],
+    embedsrcs = ["config.yaml"],
+    importpath = "github.com/NVIDIA/nvcf/src/invocation-plan-services/nats-auth-callout/cmd/nvcf-nats-auth-callout-service",
+    visibility = ["//visibility:private"],
+    deps = ["//cmd/nvcf-nats-auth-callout-service/cli"],
+)
+
+go_binary(
+    name = "nvcf-nats-auth-callout-service",
+    embed = [":nvcf-nats-auth-callout-service_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "nvcf-nats-auth-callout-service_test",
+    srcs = ["main_test.go"],
+    embed = [":nvcf-nats-auth-callout-service_lib"],
+)
+
+# Build/load/index/tar targets live here. The internal NGC publish
+# lanes (kaze, nv-ngc-devops, ncp-dev) are defined under
+# //nvidia-internal:* so the registry coordinates stay out of the
+# public OSS snapshot.
+go_oci_image(
+    name = "image",
+    base = "@distroless_go",
+    binary = ":nvcf-nats-auth-callout-service",
+    binary_path = "/usr/bin/app",
+    tags = ["nvcf-nats-auth-callout-service"],
+    visibility = ["//visibility:public"],
+)

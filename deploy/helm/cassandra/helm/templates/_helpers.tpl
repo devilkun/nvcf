@@ -44,7 +44,26 @@ Create a default fully qualified app name.
 Allow the release namespace to be overridden.
 */}}
 {{- define "nvcf-cassandra.namespace" -}}
-{{- default .Release.Namespace .Values.cassandra.namespace -}}
+{{- $cassandraValues := default dict (get .Values "cassandra") -}}
+{{- $namespace := default .Release.Namespace (get $cassandraValues "namespace") -}}
+{{- default $namespace (get $cassandraValues "namespaceOverride") -}}
+{{- end -}}
+
+{{/*
+Resolve the fullname used by the embedded Bitnami Cassandra chart.
+*/}}
+{{- define "nvcf-cassandra.cassandraFullname" -}}
+{{- $cassandraValues := default dict (get .Values "cassandra") -}}
+{{- if get $cassandraValues "fullnameOverride" -}}
+{{- get $cassandraValues "fullnameOverride" | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default "cassandra" (get $cassandraValues "nameOverride") -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

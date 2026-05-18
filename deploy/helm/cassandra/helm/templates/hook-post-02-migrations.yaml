@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+{{- $fullname := include "nvcf-cassandra.fullname" . }}
+{{- $cassandraFullname := include "nvcf-cassandra.cassandraFullname" . }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ .Release.Name }}-migrations
+  name: {{ $fullname }}-migrations
   namespace: {{ include "nvcf-cassandra.namespace" . }}
   annotations:
     helm.sh/hook: post-install,post-upgrade
@@ -44,7 +46,7 @@ spec:
           {{- end }}
           env:
             - name: CASSANDRA_HOSTS
-              value: "{{ .Release.Name }}.{{ include "nvcf-cassandra.namespace" . }}.svc.cluster.local"
+              value: "{{ $cassandraFullname }}.{{ include "nvcf-cassandra.namespace" . }}.svc.cluster.local"
             - name: CASSANDRA_USER
               value: {{ .Values.cassandra.dbUser.user | quote }}
             - name: CASSANDRA_PASSWORD

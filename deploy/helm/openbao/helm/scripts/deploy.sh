@@ -276,7 +276,7 @@ get_and_save_jwt_signing_key() {
         printenv KUBERNETES_SERVICE_HOST)
 
     # get svc account token to access kubernetes api
-    local svc_token=$(kubectl exec openbao-server-0 -c openbao -n ${namespace} -- \
+    local svc_token=$(kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
         cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 
     # call kubernetes api to get the jwt signing key and decode it to a pem
