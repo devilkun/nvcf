@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -142,6 +143,10 @@ func probeAllNodes(ctx context.Context, client kubernetes.Interface) ([]NodeInot
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(probeConcurrency)
 	for i, n := range nodes.Items {
+		// Unschedulable nodes won't have control plane components deployed on them.
+		if n.Spec.Unschedulable {
+			continue
+		}
 		i, nodeName := i, n.Name
 		eg.Go(func() error {
 			results[i] = probeOneNode(egCtx, client, nodeName)
@@ -152,6 +157,10 @@ func probeAllNodes(ctx context.Context, client kubernetes.Interface) ([]NodeInot
 		})
 	}
 	_ = eg.Wait()
+	// Remove any results from skipped nodes.
+	results = slices.DeleteFunc(results, func(item NodeInotifyLimits) bool {
+		return item.Err == nil && item.NodeName == ""
+	})
 	return results, nil
 }
 

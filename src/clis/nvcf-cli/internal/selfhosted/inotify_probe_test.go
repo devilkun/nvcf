@@ -56,7 +56,9 @@ func TestProbeAllNodes_ListNodesError(t *testing.T) {
 }
 
 func TestProbeAllNodes_PodCreateErrorSurfacesPerNode(t *testing.T) {
-	client := fake.NewSimpleClientset(fakeNode("node-a"), fakeNode("node-b"))
+	unschedulableNode := fakeNode("node-c")
+	unschedulableNode.Spec.Unschedulable = true
+	client := fake.NewSimpleClientset(fakeNode("node-a"), fakeNode("node-b"), unschedulableNode)
 	client.PrependReactor("create", "pods", func(_ ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, fmt.Errorf("forbidden: pod create denied")
 	})
