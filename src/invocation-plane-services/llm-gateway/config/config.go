@@ -58,6 +58,7 @@ type ServerConfig struct {
 
 type TelemetryConfig struct {
 	ServiceName string
+	MetricsPort int
 }
 
 type StargateConfig struct {
@@ -191,6 +192,7 @@ func Default() *Config {
 	return &Config{
 		Telemetry: TelemetryConfig{
 			ServiceName: "llm-api-gateway",
+			MetricsPort: 9464,
 		},
 		Server: ServerConfig{
 			Addr:              ":8080",
@@ -247,6 +249,20 @@ func LoadFromEnv() (*Config, error) {
 	cfg := Default()
 	var errs envErrs
 
+	applyServerTelemetryEnv(cfg, &errs)
+	applyStargateNVCFEnv(cfg, &errs)
+	applyOlricNetworkEnv(cfg, &errs)
+	applyOlricRuntimeEnv(cfg, &errs)
+	applyRateLimitEnv(cfg, &errs)
+	applyDefaultModelEnv(cfg, &errs)
+
+	if err := errs.err(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func applyServerTelemetryEnv(cfg *Config, errs *envErrs) {
 	if addr := os.Getenv("PORT"); addr != "" {
 		if strings.HasPrefix(addr, ":") {
 			cfg.Server.Addr = addr
@@ -263,10 +279,16 @@ func LoadFromEnv() (*Config, error) {
 		cfg.Telemetry.ServiceName = serviceName
 	}
 
+	if port, ok := errs.integer("METRICS_PORT"); ok {
+		cfg.Telemetry.MetricsPort = port
+	}
+
 	if region := os.Getenv("NVCF_REGION"); region != "" {
 		cfg.Server.Region = region
 	}
+}
 
+func applyStargateNVCFEnv(cfg *Config, errs *envErrs) {
 	if stargateURL := os.Getenv("STARGATE_URL"); stargateURL != "" {
 		cfg.Stargate.URL = stargateURL
 	}
@@ -298,7 +320,9 @@ func LoadFromEnv() (*Config, error) {
 	if tokenizerPath := os.Getenv("TOKENIZERS_PATH"); tokenizerPath != "" {
 		cfg.Tokenizers.Path = tokenizerPath
 	}
+}
 
+func applyOlricNetworkEnv(cfg *Config, errs *envErrs) {
 	if v, ok := errs.boolean("OLRIC_ENABLED"); ok {
 		cfg.Olric.Enabled = v
 	}
@@ -330,7 +354,9 @@ func LoadFromEnv() (*Config, error) {
 	if selector := os.Getenv("OLRIC_K8S_LABEL_SELECTOR"); selector != "" {
 		cfg.Olric.K8sLabelSelector = selector
 	}
+}
 
+func applyOlricRuntimeEnv(cfg *Config, errs *envErrs) {
 	if replicas, ok := errs.integer("OLRIC_REPLICA_COUNT"); ok && replicas > 0 {
 		cfg.Olric.ReplicaCount = replicas
 	}
@@ -354,7 +380,9 @@ func LoadFromEnv() (*Config, error) {
 	if level := os.Getenv("OLRIC_LOG_LEVEL"); level != "" {
 		cfg.Olric.LogLevel = level
 	}
+}
 
+func applyRateLimitEnv(cfg *Config, errs *envErrs) {
 	if v, ok := errs.boolean("RATE_LIMIT_FAIL_OPEN"); ok {
 		cfg.RateLimiter.FailOpen = v
 	}
@@ -410,7 +438,9 @@ func LoadFromEnv() (*Config, error) {
 	if emulatorHost := os.Getenv("RATE_LIMIT_SYNC_PUBSUB_EMULATOR_HOST"); emulatorHost != "" {
 		cfg.RateLimitSync.PubSub.EmulatorHost = emulatorHost
 	}
+}
 
+func applyDefaultModelEnv(cfg *Config, errs *envErrs) {
 	if tokenizer := os.Getenv("NVCF_DEFAULT_TOKENIZER"); tokenizer != "" {
 		cfg.DefaultTokenizer = tokenizer
 	}
@@ -449,11 +479,6 @@ func LoadFromEnv() (*Config, error) {
 			cfg.ModelCapabilities = caps
 		}
 	}
-
-	if err := errs.err(); err != nil {
-		return nil, err
-	}
-	return cfg, nil
 }
 
 // envErrs accumulates per-env-var parse failures so LoadFromEnv can surface

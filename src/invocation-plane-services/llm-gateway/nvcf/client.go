@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -82,6 +83,7 @@ func NewClient(cfg Config) (*GRPCClient, error) {
 	conn, err := grpc.NewClient(
 		cfg.Addr,
 		grpc.WithTransportCredentials(transportCredentials),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create nvcf grpc client: %w", err)

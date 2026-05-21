@@ -22,6 +22,7 @@ import (
 	"net/http"
 
 	echo "github.com/labstack/echo/v4"
+	otelmetric "go.opentelemetry.io/otel/metric"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
@@ -42,6 +43,23 @@ type Handlers struct {
 	tokenCounter  TokenCounter
 	tokenizers    TokenizerProvider
 	limitResolver LimitResolver
+	observability observabilityMetrics
+}
+
+type observabilityMetrics struct {
+	llmTokens        otelmetric.Int64Counter
+	providerTime     otelmetric.Float64Histogram
+	streamFirstToken otelmetric.Float64Histogram
+	streamDuration   otelmetric.Float64Histogram
+}
+
+func newObservabilityMetrics() observabilityMetrics {
+	return observabilityMetrics{
+		llmTokens:        telemetry.LLMTokens(),
+		providerTime:     telemetry.ProviderTime(),
+		streamFirstToken: telemetry.StreamFirstToken(),
+		streamDuration:   telemetry.StreamDuration(),
+	}
 }
 
 type TemplateEngine interface {
@@ -108,6 +126,7 @@ func NewHandlers(
 		rateLimiter:   limiter,
 		templater:     templater,
 		limitResolver: CallerLimitResolver{},
+		observability: newObservabilityMetrics(),
 	}
 	if proxyProvider, ok := any(p).(provider.OpenAIProxyProvider); ok {
 		h.proxyProvider = proxyProvider

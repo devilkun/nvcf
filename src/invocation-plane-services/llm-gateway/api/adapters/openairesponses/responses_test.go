@@ -856,6 +856,50 @@ func TestResponse_HasError(t *testing.T) {
 	}
 }
 
+func TestResponse_ProviderMetadataCompatibility(t *testing.T) {
+	metadata := &ProviderResponseMetadata{
+		Metrics: &ProviderTimingMetrics{
+			PromptTime:     1.2,
+			CompletionTime: 2.3,
+			TotalTime:      3.5,
+		},
+	}
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "provider_metadata",
+			input: `{"provider_metadata":{"metrics":{"prompt_time":1.2,"completion_time":2.3,"total_time":3.5,"queue_time":null}}}`,
+		},
+		{
+			name:  "legacy groq",
+			input: `{"groq":{"metrics":{"prompt_time":1.2,"completion_time":2.3,"total_time":3.5,"queue_time":null}}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var response Response
+			require.NoError(t, json.Unmarshal([]byte(tt.input), &response))
+			require.NotNil(t, response.ProviderMetadata)
+			require.NotNil(t, response.Groq)
+			assert.Equal(t, metadata, response.ProviderMetadata)
+			assert.Equal(t, metadata, response.Groq)
+
+			encoded, err := json.Marshal(response)
+			require.NoError(t, err)
+			assert.Contains(t, string(encoded), `"provider_metadata"`)
+			assert.Contains(t, string(encoded), `"groq"`)
+		})
+	}
+
+	encoded, err := json.Marshal(Response{ProviderMetadata: metadata})
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"provider_metadata"`)
+	assert.Contains(t, string(encoded), `"groq"`)
+}
+
 func TestInput_IsItems(t *testing.T) {
 	tests := []struct {
 		name     string

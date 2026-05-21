@@ -58,6 +58,6 @@ COPY --from=builder /tmp/tiktoken-rs-cache /home/app/tiktoken-cache
 
 ENV TIKTOKEN_RS_CACHE_DIR=/home/app/tiktoken-cache
 
-EXPOSE 8080
+EXPOSE 8080 9464
 
 ENTRYPOINT ["./llm-api-gateway"]

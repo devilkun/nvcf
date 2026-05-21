@@ -28,6 +28,15 @@ import (
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
 )
 
+const (
+	metricPrefix = "llm_api_gateway_"
+
+	dropReasonSameCluster      = "same_cluster"
+	dropReasonOldMessage       = "old_message"
+	dropReasonRemoteApplyOff   = "remote_apply_disabled"
+	synchronizerDropOldMessage = "old_message"
+)
+
 var DurationBuckets = []float64{
 	0.005,
 	0.01,
@@ -53,19 +62,28 @@ func Meter() otelmetric.Meter {
 }
 
 func InitializeMetrics() {
+	_ = HTTPRequestsTotal()
+	_ = HTTPServerRequestDuration()
+	_ = HTTPActiveRequests()
+	_ = UpstreamRequestsTotal()
+	_ = UpstreamRequestDuration()
+	_ = LLMTokens()
+	_ = ProviderTime()
+	_ = StreamFirstToken()
+	_ = StreamDuration()
 	_ = PubSubPublishFailures()
 	_ = PubSubConsumeFailures()
 	_ = PubSubConsumeDuration()
 	_ = RateLimitEventReplicationLag()
-	_ = RateLimitEventReceived()
-	_ = RateLimitEventDroppedSameCluster()
-	_ = RateLimitEventDroppedOldMessage()
-	_ = RateLimitEventApplied()
-	_ = RateLimitEventFailedToApply()
-	_ = RateLimitEventDryRunWouldApply()
-	_ = RateLimitPubsubPublishTime()
-	_ = RateLimitPubsubQueueWaitTime()
-	_ = RateLimitPublisherEventsDroppedOldMessage()
+	_ = RateLimitEventsReceived()
+	_ = RateLimitEventsDropped()
+	_ = RateLimitEventsApplied()
+	_ = RateLimitEventsFailedApply()
+	_ = RateLimitEventsDryRunWouldApply()
+	_ = RateLimitSynchronizerPublishDuration()
+	_ = RateLimitSynchronizerQueueWait()
+	_ = RateLimitSynchronizerQueueLength()
+	_ = RateLimitSynchronizerEventsDropped()
 }
 
 func Add(
@@ -79,6 +97,15 @@ func Add(
 func AddWithContext(
 	ctx context.Context,
 	counter otelmetric.Int64Counter,
+	delta int64,
+	attrs ...attribute.KeyValue,
+) {
+	counter.Add(ctx, delta, otelmetric.WithAttributes(attrs...))
+}
+
+func AddUpDownWithContext(
+	ctx context.Context,
+	counter otelmetric.Int64UpDownCounter,
 	delta int64,
 	attrs ...attribute.KeyValue,
 ) {
@@ -102,103 +129,225 @@ func RecordWithContext(
 	histogram.Record(ctx, value, otelmetric.WithAttributes(attrs...))
 }
 
+func HTTPRequestsTotal() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"http_requests_total",
+		otelmetric.WithDescription("Total inbound HTTP requests."),
+	))
+}
+
+func HTTPServerRequestDuration() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"http_request_duration_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Duration of inbound HTTP requests."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+func HTTPActiveRequests() otelmetric.Int64UpDownCounter {
+	return must.Get(Meter().Int64UpDownCounter(
+		metricPrefix+"http_active_requests",
+		otelmetric.WithDescription("Current in-flight inbound HTTP requests."),
+	))
+}
+
+func UpstreamRequestsTotal() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"upstream_requests_total",
+		otelmetric.WithDescription("Total outbound upstream requests."),
+	))
+}
+
+func UpstreamRequestDuration() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"upstream_request_duration_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Duration of outbound upstream requests."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+func LLMTokens() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"llm_tokens_total",
+		otelmetric.WithDescription("LLM token counts reported by upstream providers."),
+	))
+}
+
+func ProviderTime() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"provider_time_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Provider-reported timing phases."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+func StreamFirstToken() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"stream_first_token_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Time from stream request start to first token."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+func StreamDuration() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"stream_duration_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Total stream duration."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+func PubSubPublishFailures() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"pubsub_publish_failures_total",
+		otelmetric.WithDescription("Number of messages failing to be published."),
+	))
+}
+
+func PubSubConsumeFailures() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"pubsub_consume_failures_total",
+		otelmetric.WithDescription("Number of messages failing to be consumed."),
+	))
+}
+
+func PubSubConsumeDuration() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"pubsub_consume_duration_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Time taken to consume a message."),
+		otelmetric.WithExplicitBucketBoundaries(0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 1, 5, 10, 60, 120),
+	))
+}
+
+func RateLimitEventReplicationLag() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"rate_limit_event_replication_lag_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Lag between rate limit event creation and processing."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+func RateLimitEventsReceived() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"rate_limit_events_received_total",
+		otelmetric.WithDescription("Number of rate limit events received from sync transport."),
+	))
+}
+
+func RateLimitEventsDropped() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"rate_limit_events_dropped_total",
+		otelmetric.WithDescription("Number of received rate limit events dropped."),
+	))
+}
+
+func RateLimitEventsApplied() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"rate_limit_events_applied_total",
+		otelmetric.WithDescription("Number of rate limit events applied to the local limiter."),
+	))
+}
+
+func RateLimitEventsFailedApply() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"rate_limit_events_failed_apply_total",
+		otelmetric.WithDescription("Number of rate limit events that failed to apply locally."),
+	))
+}
+
+func RateLimitEventsDryRunWouldApply() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"rate_limit_events_dry_run_would_apply_total",
+		otelmetric.WithDescription("Number of rate limit events that would apply when remote application is disabled."),
+	))
+}
+
+func RateLimitSynchronizerPublishDuration() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"rate_limit_synchronizer_publish_duration_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Time taken to publish a rate limit event."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+func RateLimitSynchronizerQueueWait() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"rate_limit_synchronizer_queue_wait_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Time spent queueing a rate limit event."),
+		otelmetric.WithExplicitBucketBoundaries(0, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10),
+	))
+}
+
 var (
-	PubSubPublishFailures = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.publish_failures",
-			otelmetric.WithDescription("Number of messages failing to be published to a topic"),
-		))
-	})
-
-	PubSubConsumeFailures = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.consume_failures",
-			otelmetric.WithDescription("Number of messages failing to be consumed from a subscription"),
-		))
-	})
-
-	PubSubConsumeDuration = sync.OnceValue(func() otelmetric.Float64Histogram {
-		return must.Get(Meter().Float64Histogram(
-			"orion.pubsub.consume_duration",
-			otelmetric.WithUnit("s"),
-			otelmetric.WithDescription("Time taken to consume a message from a subscription"),
-			otelmetric.WithExplicitBucketBoundaries(0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 1, 5, 10, 60, 120),
-		))
-	})
-
-	RateLimitEventReplicationLag = sync.OnceValue(func() otelmetric.Float64Histogram {
-		return must.Get(Meter().Float64Histogram(
-			"orion.pubsub.rate_limit_events.consumer.replication_lag",
-			otelmetric.WithUnit("s"),
-			otelmetric.WithDescription("Measure of lag between when a rate limit event is created and when it is processed"),
-			otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
-		))
-	})
-
-	RateLimitEventReceived = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.rate_limit_events.consumer.events_received",
-			otelmetric.WithDescription("Number of rate limit events we received from pubsub"),
-		))
-	})
-
-	RateLimitEventDroppedSameCluster = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.rate_limit_events.consumer.events_dropped_same_cluster",
-			otelmetric.WithDescription("Number of rate limit events we dropped because they were from the same cluster"),
-		))
-	})
-
-	RateLimitEventDroppedOldMessage = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.rate_limit_events.consumer.events_dropped_old_message",
-			otelmetric.WithDescription("Number of rate limit events we dropped because they were too old"),
-		))
-	})
-
-	RateLimitEventApplied = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.rate_limit_events.consumer.events_applied",
-			otelmetric.WithDescription("Number of rate limit events we applied to the local cluster"),
-		))
-	})
-
-	RateLimitEventFailedToApply = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.rate_limit_events.consumer.events_failed_apply",
-			otelmetric.WithDescription("Number of rate limit events we failed to apply to the local cluster"),
-		))
-	})
-
-	RateLimitEventDryRunWouldApply = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.rate_limit_events.consumer.events_dry_run_would_apply",
-			otelmetric.WithDescription("Number of rate limit events we would apply if we weren't in dry run mode"),
-		))
-	})
-
-	RateLimitPubsubPublishTime = sync.OnceValue(func() otelmetric.Float64Histogram {
-		return must.Get(Meter().Float64Histogram(
-			"orion.pubsub.rate_limit_events.synchronizer_publish_time",
-			otelmetric.WithUnit("s"),
-			otelmetric.WithDescription("Measure of how long it took to send a Rate Limit Event to pubsub"),
-			otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
-		))
-	})
-
-	RateLimitPubsubQueueWaitTime = sync.OnceValue(func() otelmetric.Float64Histogram {
-		return must.Get(Meter().Float64Histogram(
-			"orion.pubsub.rate_limit_events.synchronizer_queue_wait_time",
-			otelmetric.WithUnit("s"),
-			otelmetric.WithDescription("Measure of how long it took to queue a Rate Limit Event onto the channel"),
-			otelmetric.WithExplicitBucketBoundaries(0, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10),
-		))
-	})
-
-	RateLimitPublisherEventsDroppedOldMessage = sync.OnceValue(func() otelmetric.Int64Counter {
-		return must.Get(Meter().Int64Counter(
-			"orion.pubsub.rate_limit_events.synchronizer_events_dropped_old_message",
-			otelmetric.WithDescription("Number of rate limit events we dropped in the publisher because they were too old"),
-		))
-	})
+	queueLengthMu        sync.RWMutex
+	queueLengthObservers []func() int64
 )
+
+func RateLimitSynchronizerQueueLength() otelmetric.Int64ObservableGauge {
+	return must.Get(Meter().Int64ObservableGauge(
+		metricPrefix+"rate_limit_synchronizer_queue_length",
+		otelmetric.WithDescription("Current rate limit synchronizer queue length."),
+		otelmetric.WithInt64Callback(func(_ context.Context, observer otelmetric.Int64Observer) error {
+			observer.Observe(observedRateLimitSynchronizerQueueLength())
+			return nil
+		}),
+	))
+}
+
+func RegisterRateLimitSynchronizerQueueLength(observer func() int64) {
+	queueLengthMu.Lock()
+	if observer == nil {
+		queueLengthObservers = nil
+	} else {
+		queueLengthObservers = append(queueLengthObservers, observer)
+	}
+	queueLengthMu.Unlock()
+	_ = RateLimitSynchronizerQueueLength()
+}
+
+func observedRateLimitSynchronizerQueueLength() int64 {
+	queueLengthMu.RLock()
+	observers := append([]func() int64(nil), queueLengthObservers...)
+	queueLengthMu.RUnlock()
+
+	if len(observers) == 0 {
+		return -1
+	}
+	var total int64
+	for _, observer := range observers {
+		total += observer()
+	}
+	return total
+}
+
+func RateLimitSynchronizerEventsDropped() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"rate_limit_synchronizer_events_dropped_total",
+		otelmetric.WithDescription("Number of rate limit events dropped before publishing."),
+	))
+}
+
+func DropReasonSameCluster() attribute.KeyValue {
+	return attribute.String("reason", dropReasonSameCluster)
+}
+
+func DropReasonOldMessage() attribute.KeyValue {
+	return attribute.String("reason", dropReasonOldMessage)
+}
+
+func DropReasonRemoteApplyDisabled() attribute.KeyValue {
+	return attribute.String("reason", dropReasonRemoteApplyOff)
+}
+
+func SynchronizerDropReasonOldMessage() attribute.KeyValue {
+	return attribute.String("reason", synchronizerDropOldMessage)
+}

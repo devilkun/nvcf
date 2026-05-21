@@ -22,8 +22,6 @@ import (
 	"fmt"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
@@ -61,28 +59,27 @@ func ApplySynchronizedEvent(
 
 	log := telemetry.Logger(ctx)
 	lag := time.Since(time.Unix(rle.CreatedAt, 0))
-	attr := attribute.String("cluster_name", rle.ClusterName)
 
 	telemetry.RecordWithContext(
 		ctx,
 		telemetry.RateLimitEventReplicationLag(),
 		lag.Seconds(),
-		attr,
 	)
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventReceived(), 0, attr)
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventDroppedSameCluster(), 0, attr)
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventDroppedOldMessage(), 0, attr)
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventDryRunWouldApply(), 0, attr)
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventFailedToApply(), 0, attr)
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventApplied(), 0, attr)
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventReceived(), 1, attr)
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsReceived(), 0)
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDropped(), 0, telemetry.DropReasonSameCluster())
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDropped(), 0, telemetry.DropReasonOldMessage())
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDropped(), 0, telemetry.DropReasonRemoteApplyDisabled())
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDryRunWouldApply(), 0)
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsFailedApply(), 0)
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsApplied(), 0)
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsReceived(), 1)
 
 	if rle.ClusterName == clusterName {
 		log.Debug().
 			Str("request_id", rle.RequestID).
 			Str("source_cluster", rle.ClusterName).
 			Msg("dropping same-cluster rate limit event")
-		telemetry.AddWithContext(ctx, telemetry.RateLimitEventDroppedSameCluster(), 1, attr)
+		telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDropped(), 1, telemetry.DropReasonSameCluster())
 		return nil
 	}
 
@@ -91,7 +88,7 @@ func ApplySynchronizedEvent(
 			Str("request_id", rle.RequestID).
 			Dur("lag", lag).
 			Msg("dropping too-old rate limit event")
-		telemetry.AddWithContext(ctx, telemetry.RateLimitEventDroppedOldMessage(), 1, attr)
+		telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDropped(), 1, telemetry.DropReasonOldMessage())
 		return nil
 	}
 
@@ -99,7 +96,8 @@ func ApplySynchronizedEvent(
 		log.Debug().
 			Str("request_id", rle.RequestID).
 			Msg("dropping rate limit event because remote application is disabled")
-		telemetry.AddWithContext(ctx, telemetry.RateLimitEventDryRunWouldApply(), 1, attr)
+		telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDropped(), 1, telemetry.DropReasonRemoteApplyDisabled())
+		telemetry.AddWithContext(ctx, telemetry.RateLimitEventsDryRunWouldApply(), 1)
 		return nil
 	}
 
@@ -117,10 +115,10 @@ func ApplySynchronizedEvent(
 		rle.MustConsume,
 	)
 	if err != nil {
-		telemetry.AddWithContext(ctx, telemetry.RateLimitEventFailedToApply(), 1, attr)
+		telemetry.AddWithContext(ctx, telemetry.RateLimitEventsFailedApply(), 1)
 		return err
 	}
-	telemetry.AddWithContext(ctx, telemetry.RateLimitEventApplied(), 1, attr)
+	telemetry.AddWithContext(ctx, telemetry.RateLimitEventsApplied(), 1)
 	return err
 }
 

@@ -46,7 +46,9 @@ func main() {
 		telemetry.SetServiceName(cfg.Telemetry.ServiceName)
 	}
 
-	observability, err := telemetry.InitFromEnv(context.Background())
+	observability, err := telemetry.Init(context.Background(), telemetry.RuntimeConfig{
+		MetricsPort: cfg.Telemetry.MetricsPort,
+	})
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to initialize open telemetry")
 	}

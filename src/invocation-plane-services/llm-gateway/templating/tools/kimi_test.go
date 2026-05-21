@@ -39,14 +39,14 @@ func TestKimiToolPattern(t *testing.T) {
 		}{
 			{
 				name:  "basic",
-				input: `<|tool_calls_section_begin|><|tool_call_begin|>functions.tavily-search:0<|tool_call_argument_begin|>{"days": 3, "query": "Groq launched model", "topic": "news"}<|tool_call_end|><|tool_calls_section_end|>`,
+				input: `<|tool_calls_section_begin|><|tool_call_begin|>functions.tavily-search:0<|tool_call_argument_begin|>{"days": 3, "query": "Model launch news", "topic": "news"}<|tool_call_end|><|tool_calls_section_end|>`,
 				want: []tools.Call{
 					{
 						Name: "tavily-search",
 						ID:   "functions.tavily-search:0",
 						Arguments: map[string]any{
 							"days":  3.0,
-							"query": "Groq launched model",
+							"query": "Model launch news",
 							"topic": "news",
 						},
 					},
@@ -54,14 +54,14 @@ func TestKimiToolPattern(t *testing.T) {
 			},
 			{
 				name:  "function name with `:`",
-				input: `<|tool_calls_section_begin|><|tool_call_begin|>functions.tavily:search:0<|tool_call_argument_begin|>{"days": 3, "query": "Groq launched model", "topic": "news"}<|tool_call_end|><|tool_calls_section_end|>`,
+				input: `<|tool_calls_section_begin|><|tool_call_begin|>functions.tavily:search:0<|tool_call_argument_begin|>{"days": 3, "query": "Model launch news", "topic": "news"}<|tool_call_end|><|tool_calls_section_end|>`,
 				want: []tools.Call{
 					{
 						Name: "tavily:search",
 						ID:   "functions.tavily:search:0",
 						Arguments: map[string]any{
 							"days":  3.0,
-							"query": "Groq launched model",
+							"query": "Model launch news",
 							"topic": "news",
 						},
 					},
@@ -69,14 +69,14 @@ func TestKimiToolPattern(t *testing.T) {
 			},
 			{
 				name:  "function name with `.`",
-				input: `<|tool_calls_section_begin|><|tool_call_begin|>functions.tavily.search:0<|tool_call_argument_begin|>{"days": 3, "query": "Groq launched model", "topic": "news"}<|tool_call_end|><|tool_calls_section_end|>`,
+				input: `<|tool_calls_section_begin|><|tool_call_begin|>functions.tavily.search:0<|tool_call_argument_begin|>{"days": 3, "query": "Model launch news", "topic": "news"}<|tool_call_end|><|tool_calls_section_end|>`,
 				want: []tools.Call{
 					{
 						Name: "tavily.search",
 						ID:   "functions.tavily.search:0",
 						Arguments: map[string]any{
 							"days":  3.0,
-							"query": "Groq launched model",
+							"query": "Model launch news",
 							"topic": "news",
 						},
 					},

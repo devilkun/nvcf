@@ -34,7 +34,7 @@ var llama31KnowledgePrompt = fmt.Sprintf(
 	time.Now().Format("02 January 2006"),
 )
 
-func Test_getGroqLlamaFormattedPrompt_NoTools_U(t *testing.T) {
+func Test_getLlamaFormattedPrompt_NoTools_U(t *testing.T) {
 	t.Parallel()
 	// Arrange
 	messages := []models.ChatMessage{
@@ -66,7 +66,7 @@ func Test_getGroqLlamaFormattedPrompt_NoTools_U(t *testing.T) {
 	}
 }
 
-func Test_getGroqLlamaFormattedPrompt_NoTools_SU(t *testing.T) {
+func Test_getLlamaFormattedPrompt_NoTools_SU(t *testing.T) {
 	t.Parallel()
 	// Arrange
 	var (
@@ -102,7 +102,7 @@ func Test_getGroqLlamaFormattedPrompt_NoTools_SU(t *testing.T) {
 }
 
 // test all state transitions A->S, A->U, S->A, S->U, U->A, U->S
-func Test_getGroqLlamaFormattedPrompt_NoTools_ASUSAUA(t *testing.T) {
+func Test_getLlamaFormattedPrompt_NoTools_ASUSAUA(t *testing.T) {
 	t.Parallel()
 	// Arrange
 	var (
@@ -164,7 +164,7 @@ func Test_getGroqLlamaFormattedPrompt_NoTools_ASUSAUA(t *testing.T) {
 	}
 }
 
-func Test_getGroqLlamaFormattedPrompt_Tools_SA(t *testing.T) {
+func Test_getLlamaFormattedPrompt_Tools_SA(t *testing.T) {
 	t.Parallel()
 	var (
 		messages = []models.ChatMessage{
@@ -203,7 +203,7 @@ func Test_getGroqLlamaFormattedPrompt_Tools_SA(t *testing.T) {
 	}
 }
 
-func Test_getGroqLlamaFormattedPrompt_Tools_UAtU(t *testing.T) {
+func Test_getLlamaFormattedPrompt_Tools_UAtU(t *testing.T) {
 	t.Parallel()
 	// Arrange
 	var (
@@ -306,7 +306,7 @@ u2<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 	}
 }
 
-func Test_getGroqLlamaFormattedPrompt_Tools_UAtTAU(t *testing.T) {
+func Test_getLlamaFormattedPrompt_Tools_UAtTAU(t *testing.T) {
 	t.Parallel()
 	// Arrange
 	var (
@@ -767,7 +767,7 @@ You must use the function foo to answer the user query.
 	assert.Equal(t, expectedPrompt, out)
 }
 
-func Test_getGroqLlamaFormattedPrompt_Image(t *testing.T) {
+func Test_getLlamaFormattedPrompt_Image(t *testing.T) {
 	t.Parallel()
 	var (
 		pre      = models.ContentPartText("Pre")

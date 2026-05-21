@@ -23,11 +23,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
@@ -84,6 +88,7 @@ func TestStargateProviderCompleteForwardsRenderedPromptAndRoutingHeaders(t *test
 		require.Equal(t, "Bearer secret-token", r.Header.Get(headerAuthorization))
 		require.Equal(t, "req-123", r.Header.Get(headerRequestID))
 		require.Equal(t, "us-west1", r.Header.Get(headerTargetRegion))
+		require.Equal(t, "us-west1", r.Header.Get(headerLegacyTargetRegion))
 		require.Equal(t, "fn-abc", r.Header.Get(headerRoutingKey))
 		require.Equal(t, "upstream-model", r.Header.Get(headerModel))
 		require.Equal(t, "experimental_method", r.Header.Get(headerRoutingMethod))
@@ -139,6 +144,48 @@ func TestStargateProviderCompleteForwardsRenderedPromptAndRoutingHeaders(t *test
 	require.Equal(t, "upstream-model", response.Model)
 	require.Len(t, response.Choices, 1)
 	require.Equal(t, "hello from stargate", ptr.Deref(response.Choices[0].Message.Content))
+}
+
+func TestStargateProviderCompletePropagatesTraceContext(t *testing.T) {
+	oldPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTextMapPropagator(oldPropagator)
+	})
+
+	tracerProvider := sdktrace.NewTracerProvider()
+	t.Cleanup(func() {
+		_ = tracerProvider.Shutdown(context.Background())
+	})
+
+	var traceparent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceparent = r.Header.Get("traceparent")
+		w.Header().Set(headerContentType, contentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":123,"model":"upstream-model","choices":[]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	provider, err := NewStargateProvider(config.StargateConfig{URL: server.URL})
+	require.NoError(t, err)
+
+	ctx, span := tracerProvider.Tracer("test").Start(context.Background(), "test-parent")
+	defer span.End()
+
+	_, err = provider.Complete(ctx, &requestctx.RequestContext{RequestID: "req-trace", RoutingKey: "fn-trace"}, &NormalizedRequest{
+		ChatRequest: &models.ChatCompletionRequest{
+			Model: "upstream-model",
+			Messages: &[]models.ChatMessage{
+				{
+					Role:    models.ChatCompletionRoleUser,
+					Content: models.SingleTextContent("hello"),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, traceparent)
+	require.Contains(t, traceparent, span.SpanContext().TraceID().String())
 }
 
 func TestStargateProviderStreamParsesSSE(t *testing.T) {

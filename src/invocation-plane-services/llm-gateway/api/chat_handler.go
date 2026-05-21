@@ -24,13 +24,18 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	echo "github.com/labstack/echo/v4"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/provider"
+	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 type UnaryResponseSender func(
@@ -96,6 +101,7 @@ func (h *OpenAIChatHandlers) handleChatCompletionRequest(
 
 	if usageHasTokenCounts(&response.Usage) {
 		finalUsage = &response.Usage
+		h.handlers.observability.recordLLMUsage(c.UserContext(), endpointLabel(c), finalUsage, false)
 	}
 	if responseModel != "" {
 		response.Model = responseModel
@@ -147,6 +153,8 @@ func (h *OpenAIChatHandlers) streamChatCompletionWithSender(
 
 	wrappedStream := h.wrapStreamForFinalization(
 		finalizeCtx,
+		c.UserContext(),
+		endpointLabel(c),
 		request,
 		responseModel,
 		stream,
@@ -225,6 +233,8 @@ func (s *streamFinalizationState) IsFinalized() bool {
 
 func (h *OpenAIChatHandlers) wrapStreamForFinalization(
 	finalizeCtx context.Context,
+	streamCtx context.Context,
+	endpoint string,
 	request *provider.NormalizedRequest,
 	responseModel string,
 	stream <-chan provider.StreamEvent,
@@ -237,13 +247,38 @@ func (h *OpenAIChatHandlers) wrapStreamForFinalization(
 	wrapped := make(chan provider.StreamEvent)
 	go func() {
 		defer close(wrapped)
+		ctx, span := telemetry.Tracer().Start(streamCtx, "llm-api-gateway.stream")
+		defer span.End()
+		span.SetAttributes(attribute.String("endpoint", endpoint))
+
+		streamStart := time.Now()
+		firstTokenRecorded := false
+		streamStatus := "completed"
+		observation := streamObservation{
+			ctx:                context.WithoutCancel(ctx),
+			finalizeCtx:        finalizeCtx,
+			endpoint:           endpoint,
+			metrics:            h.handlers.observability,
+			request:            request,
+			firstTokenRecorded: &firstTokenRecorded,
+			streamStart:        streamStart,
+			state:              state,
+			span:               span,
+		}
+		defer func() {
+			telemetry.RecordWithContext(
+				context.WithoutCancel(ctx),
+				observation.metrics.streamDuration,
+				time.Since(streamStart).Seconds(),
+				attribute.String("endpoint", endpoint),
+				attribute.String("status", streamStatus),
+			)
+		}()
 
 		for event := range stream {
-			if event.Chunk != nil && responseModel != "" {
-				event.Chunk.Model = responseModel
-			}
-			if event.Chunk != nil && usageHasTokenCounts(event.Chunk.Usage) && state.MarkFinalized() {
-				h.handlers.finalizeTokenConsumption(finalizeCtx, request, event.Chunk.Usage)
+			setChunkResponseModel(event.Chunk, responseModel)
+			if status, ok := h.observeStreamEvent(observation, event); ok {
+				streamStatus = status
 			}
 
 			wrapped <- event
@@ -251,4 +286,88 @@ func (h *OpenAIChatHandlers) wrapStreamForFinalization(
 	}()
 
 	return wrapped
+}
+
+type streamObservation struct {
+	ctx                context.Context
+	finalizeCtx        context.Context
+	endpoint           string
+	metrics            observabilityMetrics
+	request            *provider.NormalizedRequest
+	firstTokenRecorded *bool
+	streamStart        time.Time
+	state              *streamFinalizationState
+	span               trace.Span
+}
+
+func (h *OpenAIChatHandlers) observeStreamEvent(obs streamObservation, event provider.StreamEvent) (string, bool) {
+	streamStatus, hasStatus := streamEventStatus(event.Err, obs.span)
+	recordFirstTokenIfNeeded(obs.ctx, obs.endpoint, obs.metrics, event.Chunk, obs.firstTokenRecorded, obs.streamStart)
+	h.finalizeStreamUsageIfNeeded(obs.ctx, obs.finalizeCtx, obs.endpoint, obs.request, event.Chunk, obs.state)
+	return streamStatus, hasStatus
+}
+
+func setChunkResponseModel(chunk *models.ChatCompletionChunk, responseModel string) {
+	if chunk != nil && responseModel != "" {
+		chunk.Model = responseModel
+	}
+}
+
+func streamEventStatus(err error, span trace.Span) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled", true
+	}
+	span.RecordError(err)
+	span.SetStatus(codes.Error, "stream failed")
+	return "error", true
+}
+
+func recordFirstTokenIfNeeded(
+	ctx context.Context,
+	endpoint string,
+	metrics observabilityMetrics,
+	chunk *models.ChatCompletionChunk,
+	firstTokenRecorded *bool,
+	streamStart time.Time,
+) {
+	if chunk == nil || *firstTokenRecorded || !chunkHasContent(chunk) {
+		return
+	}
+	*firstTokenRecorded = true
+	telemetry.RecordWithContext(
+		ctx,
+		metrics.streamFirstToken,
+		time.Since(streamStart).Seconds(),
+		attribute.String("endpoint", endpoint),
+	)
+}
+
+func (h *OpenAIChatHandlers) finalizeStreamUsageIfNeeded(
+	ctx context.Context,
+	finalizeCtx context.Context,
+	endpoint string,
+	request *provider.NormalizedRequest,
+	chunk *models.ChatCompletionChunk,
+	state *streamFinalizationState,
+) {
+	if chunk == nil || !usageHasTokenCounts(chunk.Usage) || !state.MarkFinalized() {
+		return
+	}
+	h.handlers.observability.recordLLMUsage(ctx, endpoint, chunk.Usage, true)
+	h.handlers.finalizeTokenConsumption(finalizeCtx, request, chunk.Usage)
+}
+
+func chunkHasContent(chunk *models.ChatCompletionChunk) bool {
+	if chunk == nil {
+		return false
+	}
+	for _, choice := range chunk.Choices {
+		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
+			return true
+		}
+	}
+	return false
 }

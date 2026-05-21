@@ -29,6 +29,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -59,6 +61,10 @@ func TestNewContextMiddlewareRecordsTraceParentAndStatus(t *testing.T) {
 	cfg := config.Default()
 
 	e := echo.New()
+	e.Use(NewContextMiddleware(cfg))
+	e.POST("/v1/chat/completions", func(ec echo.Context) error {
+		return ec.NoContent(http.StatusAccepted)
+	})
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/chat/completions",
@@ -68,15 +74,8 @@ func TestNewContextMiddlewareRecordsTraceParentAndStatus(t *testing.T) {
 	req.Header.Set("traceparent", "00-11111111111111111111111111111111-2222222222222222-01")
 
 	rec := httptest.NewRecorder()
-	ec := e.NewContext(req, rec)
 
-	handler := NewContextMiddleware(cfg)(func(ec echo.Context) error {
-		return ec.NoContent(http.StatusAccepted)
-	})
-
-	if err := handler(ec); err != nil {
-		t.Fatalf("handler returned error: %v", err)
-	}
+	e.ServeHTTP(rec, req)
 
 	spans := spanRecorder.Ended()
 	if len(spans) != 1 {
@@ -95,6 +94,49 @@ func TestNewContextMiddlewareRecordsTraceParentAndStatus(t *testing.T) {
 	assertHasAttribute(t, attrs, "http.response.status_code", int64(http.StatusAccepted))
 	assertHasAttribute(t, attrs, "url.path", "/v1/chat/completions")
 	assertHasAttribute(t, attrs, "http.request.method", http.MethodPost)
+}
+
+func TestNewContextMiddlewareRecordsServiceScopedHTTPMetrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	oldMeterProvider := otel.GetMeterProvider()
+	otel.SetMeterProvider(meterProvider)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(oldMeterProvider)
+		_ = meterProvider.Shutdown(context.Background())
+	})
+
+	cfg := config.Default()
+
+	e := echo.New()
+	e.Use(NewContextMiddleware(cfg))
+	e.GET("/healthz", func(ec echo.Context) error {
+		return ec.NoContent(http.StatusAccepted)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+
+	metrics := collectMetrics(t, reader)
+	assertMetricHasAttributes(t, metrics, "llm_api_gateway_http_requests_total", map[string]string{
+		"method": http.MethodGet,
+		"route":  "/healthz",
+		"status": "202",
+	})
+	assertMetricHasAttributes(t, metrics, "llm_api_gateway_http_request_duration_seconds", map[string]string{
+		"method": http.MethodGet,
+		"route":  "/healthz",
+		"status": "202",
+	})
+	assertMetricHasAttributes(t, metrics, "llm_api_gateway_http_active_requests", map[string]string{
+		"method": http.MethodGet,
+		"route":  "/healthz",
+	})
 }
 
 func assertHasAttribute(t *testing.T, attrs []attribute.KeyValue, key string, want any) {
@@ -120,4 +162,71 @@ func assertHasAttribute(t *testing.T, attrs []attribute.KeyValue, key string, wa
 	}
 
 	t.Fatalf("missing attribute %q", key)
+}
+
+func collectMetrics(t *testing.T, reader *sdkmetric.ManualReader) []metricdata.Metrics {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	var out []metricdata.Metrics
+	for _, scope := range rm.ScopeMetrics {
+		out = append(out, scope.Metrics...)
+	}
+	return out
+}
+
+func assertMetricHasAttributes(
+	t *testing.T,
+	metrics []metricdata.Metrics,
+	name string,
+	want map[string]string,
+) {
+	t.Helper()
+
+	for _, metric := range metrics {
+		if metric.Name != name {
+			continue
+		}
+		if metricDataHasAttributes(metric.Data, want) {
+			return
+		}
+		t.Fatalf("metric %q missing labels %#v in %#v", name, want, metric.Data)
+	}
+
+	t.Fatalf("missing metric %q in %#v", name, metrics)
+}
+
+func metricDataHasAttributes(data metricdata.Aggregation, want map[string]string) bool {
+	switch typed := data.(type) {
+	case metricdata.Sum[int64]:
+		for _, point := range typed.DataPoints {
+			if pointHasAttributes(point.Attributes.ToSlice(), want) {
+				return true
+			}
+		}
+	case metricdata.Histogram[float64]:
+		for _, point := range typed.DataPoints {
+			if pointHasAttributes(point.Attributes.ToSlice(), want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pointHasAttributes(attrs []attribute.KeyValue, want map[string]string) bool {
+	got := make(map[string]string, len(attrs))
+	for _, attr := range attrs {
+		got[string(attr.Key)] = attr.Value.AsString()
+	}
+	for key, value := range want {
+		if got[key] != value {
+			return false
+		}
+	}
+	return true
 }

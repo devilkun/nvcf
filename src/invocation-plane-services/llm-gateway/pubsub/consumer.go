@@ -22,7 +22,6 @@ import (
 	"time"
 
 	gcppubsub "cloud.google.com/go/pubsub/v2"
-	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
@@ -63,7 +62,6 @@ func (c *consumer) Run(ctx context.Context) error {
 				ctx,
 				telemetry.PubSubConsumeDuration(),
 				time.Since(start).Seconds(),
-				attribute.Stringer("subscription", c.subscription),
 			)
 		}()
 
@@ -71,7 +69,6 @@ func (c *consumer) Run(ctx context.Context) error {
 			telemetry.Add(
 				telemetry.PubSubConsumeFailures(),
 				1,
-				attribute.Stringer("subscription", c.subscription),
 			)
 			msg.Nack()
 			return

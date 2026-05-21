@@ -23,6 +23,8 @@ import (
 	"net/http"
 
 	echo "github.com/labstack/echo/v4"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -63,15 +65,24 @@ func NewNVCFAuthMiddleware(client InvocationAuthClient) echo.MiddlewareFunc {
 				return echo.NewHTTPError(http.StatusUnauthorized, "bearer authorization is required")
 			}
 
+			authCtx, span := telemetry.Tracer().Start(gc.UserContext(), "llm-api-gateway.auth")
+			span.SetAttributes(
+				attribute.String("routing_key", reqCtx.RoutingKey),
+				attribute.String("target_region", reqCtx.TargetRegion),
+			)
 			authResponse, err := client.AuthorizeInvocation(
-				gc.UserContext(),
+				authCtx,
 				bearerToken,
 				reqCtx.RoutingKey,
 			)
 			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(otelcodes.Error, "nvcf auth failed")
+				span.End()
 				return nvcfAuthHTTPError(err)
 			}
-			telemetry.Logger(gc.UserContext()).
+			span.End()
+			telemetry.Logger(authCtx).
 				Info().
 				Str("auth_routing_key", authResponse.RoutingKey).
 				Str("client_auth_id", authResponse.ClientAuthID).

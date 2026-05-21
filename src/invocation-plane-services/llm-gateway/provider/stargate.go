@@ -34,39 +34,48 @@ import (
 	"time"
 
 	echo "github.com/labstack/echo/v4"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/servicetier"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 const (
 	stargateChatCompletionsPath = "/v1/chat/completions"
 
-	headerAuthorization    = "Authorization"
-	headerContentType      = "Content-Type"
-	headerAccept           = "Accept"
-	headerRequestID        = "X-Request-Id"
-	headerTargetRegion     = "X-Groq-Region"
-	headerRoutingKey       = "X-Routing-Key"
-	headerRoutingMethod    = "X-Routing-Method"
-	headerModel            = "X-Model"
-	headerCacheAffinityKey = "X-Cache-Affinity-Key"
-	headerInputTokens      = "X-Input-Tokens"
-	headerTokenEstimate    = "X-Token-Estimate"
+	headerAuthorization      = "Authorization"
+	headerContentType        = "Content-Type"
+	headerAccept             = "Accept"
+	headerRequestID          = "X-Request-Id"
+	headerTargetRegion       = "X-NVCF-Target-Region"
+	headerLegacyTargetRegion = "X-Groq-Region"
+	headerRoutingKey         = "X-Routing-Key"
+	headerRoutingMethod      = "X-Routing-Method"
+	headerModel              = "X-Model"
+	headerCacheAffinityKey   = "X-Cache-Affinity-Key"
+	headerInputTokens        = "X-Input-Tokens"
+	headerTokenEstimate      = "X-Token-Estimate"
 
 	contentTypeJSON = "application/json"
 	contentTypeSSE  = "text/event-stream"
+
+	upstreamName = "llm-request-router"
 
 	sseMaxToken = 4 * 1024 * 1024
 )
 
 type StargateProvider struct {
-	baseURL        *url.URL
-	client         *http.Client
-	requestTimeout time.Duration
+	baseURL                 *url.URL
+	client                  *http.Client
+	requestTimeout          time.Duration
+	upstreamRequestsTotal   otelmetric.Int64Counter
+	upstreamRequestDuration otelmetric.Float64Histogram
 }
 
 func NewStargateProvider(cfg config.StargateConfig) (*StargateProvider, error) {
@@ -94,9 +103,16 @@ func NewStargateProvider(cfg config.StargateConfig) (*StargateProvider, error) {
 	}
 
 	return &StargateProvider{
-		baseURL:        parsed,
-		client:         &http.Client{Transport: transport},
-		requestTimeout: cfg.RequestTimeout,
+		baseURL: parsed,
+		client: &http.Client{Transport: otelhttp.NewTransport(
+			transport,
+			otelhttp.WithSpanNameFormatter(func(_ string, _ *http.Request) string {
+				return "llm-api-gateway.upstream." + upstreamName
+			}),
+		)},
+		requestTimeout:          cfg.RequestTimeout,
+		upstreamRequestsTotal:   telemetry.UpstreamRequestsTotal(),
+		upstreamRequestDuration: telemetry.UpstreamRequestDuration(),
 	}, nil
 }
 
@@ -113,21 +129,26 @@ func (p *StargateProvider) Complete(
 	requestCtx, cancel := p.requestContext(ctx)
 	defer cancel()
 
+	start := time.Now()
 	resp, err := p.client.Do(outbound.WithContext(requestCtx))
 	if err != nil {
+		p.recordUpstreamRequest(ctx, reqCtx, start, 0, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if err := checkHTTPError(resp); err != nil {
+		p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, err)
 		return nil, err
 	}
 
 	var response models.ChatCompletionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, err)
 		return nil, fmt.Errorf("decode stargate completion response: %w", err)
 	}
 
+	p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, nil)
 	return &response, nil
 }
 
@@ -142,18 +163,22 @@ func (p *StargateProvider) Stream(
 	}
 
 	requestCtx, cancel := p.requestContext(ctx)
+	start := time.Now()
 	resp, err := p.client.Do(outbound.WithContext(requestCtx))
 	if err != nil {
 		cancel()
+		p.recordUpstreamRequest(ctx, reqCtx, start, 0, err)
 		return nil, err
 	}
 
 	if err := checkHTTPError(resp); err != nil {
 		cancel()
 		resp.Body.Close()
+		p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, err)
 		return nil, err
 	}
 
+	p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, nil)
 	events := make(chan StreamEvent, 8)
 	go p.readStream(requestCtx, cancel, resp.Body, events)
 
@@ -167,6 +192,55 @@ func (p *StargateProvider) requestContext(
 		return context.WithTimeout(ctx, p.requestTimeout)
 	}
 	return ctx, func() {}
+}
+
+func (p *StargateProvider) recordUpstreamRequest(
+	ctx context.Context,
+	reqCtx *requestctx.RequestContext,
+	start time.Time,
+	statusCode int,
+	err error,
+) {
+	result := "success"
+	if err != nil || statusCode >= http.StatusBadRequest || statusCode == 0 {
+		result = "error"
+	}
+
+	status := "error"
+	if statusCode > 0 {
+		status = strconv.Itoa(statusCode)
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("upstream", upstreamName),
+		attribute.String("result", result),
+		attribute.String("status", status),
+	}
+	telemetry.AddWithContext(ctx, p.upstreamRequestsTotal, 1, attrs...)
+	telemetry.RecordWithContext(ctx, p.upstreamRequestDuration, time.Since(start).Seconds(), attrs...)
+
+	logEvent := telemetry.Logger(ctx).Debug()
+	if err != nil || statusCode >= http.StatusInternalServerError || statusCode == 0 {
+		logEvent = telemetry.Logger(ctx).Warn()
+	}
+
+	log := logEvent.
+		Str("upstream", upstreamName).
+		Str("upstream_result", result).
+		Str("upstream_status", status).
+		Dur("duration", time.Since(start))
+	if err != nil {
+		log = log.Err(err)
+	}
+	if reqCtx != nil {
+		log = log.
+			Str("request_id", reqCtx.RequestID).
+			Str("routing_key", reqCtx.RoutingKey).
+			Str("target_region", reqCtx.TargetRegion).
+			Str("project_id", reqCtx.ProjectID).
+			Str("rate_limit_key", reqCtx.OrgID)
+	}
+	log.Msg("completed upstream request")
 }
 
 func (p *StargateProvider) newOutboundRequest(
@@ -203,7 +277,7 @@ func (p *StargateProvider) newOutboundRequest(
 		req.Header.Set(headerRequestID, reqCtx.RequestID)
 	}
 	if reqCtx.TargetRegion != "" {
-		req.Header.Set(headerTargetRegion, reqCtx.TargetRegion)
+		setTargetRegionHeaders(req.Header, reqCtx.TargetRegion)
 	}
 	if reqCtx.RoutingKey != "" {
 		req.Header.Set(headerRoutingKey, reqCtx.RoutingKey)
@@ -228,6 +302,11 @@ func (p *StargateProvider) newOutboundRequest(
 	req.Header.Set(headerTokenEstimate, strconv.Itoa(inputTokens))
 
 	return req, nil
+}
+
+func setTargetRegionHeaders(headers http.Header, targetRegion string) {
+	headers.Set(headerTargetRegion, targetRegion)
+	headers.Set(headerLegacyTargetRegion, targetRegion)
 }
 
 func (p *StargateProvider) Proxy(
@@ -267,7 +346,7 @@ func (p *StargateProvider) Proxy(
 			outbound.Header.Set(headerRequestID, reqCtx.RequestID)
 		}
 		if reqCtx.TargetRegion != "" {
-			outbound.Header.Set(headerTargetRegion, reqCtx.TargetRegion)
+			setTargetRegionHeaders(outbound.Header, reqCtx.TargetRegion)
 		}
 		if reqCtx.RoutingKey != "" {
 			outbound.Header.Set(headerRoutingKey, reqCtx.RoutingKey)
@@ -292,12 +371,15 @@ func (p *StargateProvider) Proxy(
 		outbound.Header.Set(headerTokenEstimate, strconv.Itoa(request.TokenEstimate))
 	}
 
+	start := time.Now()
 	resp, err := p.client.Do(outbound)
 	if err != nil {
 		cancel()
+		p.recordUpstreamRequest(ctx, reqCtx, start, 0, err)
 		return nil, err
 	}
 
+	p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, nil)
 	return &ProxyResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header.Clone(),

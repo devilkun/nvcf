@@ -27,6 +27,12 @@ import (
 func TestDefaultSetsExpectedDefaults(t *testing.T) {
 	cfg := Default()
 
+	if cfg.Telemetry.ServiceName != "llm-api-gateway" {
+		t.Fatalf("service name = %q, want llm-api-gateway", cfg.Telemetry.ServiceName)
+	}
+	if cfg.Telemetry.MetricsPort != 9464 {
+		t.Fatalf("metrics port = %d, want 9464", cfg.Telemetry.MetricsPort)
+	}
 	if cfg.DefaultServiceTier != servicetier.Auto {
 		t.Fatalf("default service tier = %q, want %q", cfg.DefaultServiceTier, servicetier.Auto)
 	}
@@ -38,6 +44,31 @@ func TestDefaultSetsExpectedDefaults(t *testing.T) {
 	}
 	if cfg.DefaultRPM != 0 {
 		t.Fatalf("default rpm = %d, want 0", cfg.DefaultRPM)
+	}
+}
+
+func TestLoadFromEnvReadsMetricsPort(t *testing.T) {
+	t.Setenv("METRICS_PORT", "0")
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+
+	if cfg.Telemetry.MetricsPort != 0 {
+		t.Fatalf("metrics port = %d, want 0", cfg.Telemetry.MetricsPort)
+	}
+}
+
+func TestLoadFromEnvRejectsInvalidMetricsPort(t *testing.T) {
+	t.Setenv("METRICS_PORT", "disabled")
+
+	_, err := LoadFromEnv()
+	if err == nil {
+		t.Fatal("LoadFromEnv() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "METRICS_PORT") {
+		t.Fatalf("error %q does not mention METRICS_PORT", err.Error())
 	}
 }
 

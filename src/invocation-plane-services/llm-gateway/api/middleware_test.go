@@ -81,6 +81,39 @@ func TestNewContextMiddlewareExtractsRoutingKeyFromModelPrefix(t *testing.T) {
 	}
 }
 
+func TestNewContextMiddlewareAcceptsLegacyTargetRegionHeader(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+
+	e := echo.New()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"fn-chat/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`),
+	)
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set(HeaderLegacyTargetRegion, "us-legacy")
+
+	rec := httptest.NewRecorder()
+	ec := e.NewContext(req, rec)
+
+	handler := NewContextMiddleware(cfg)(func(ec echo.Context) error {
+		reqCtx := ec.(*GatewayContext).RequestContext()
+		if reqCtx == nil {
+			t.Fatal("request context was not set")
+		}
+		if reqCtx.TargetRegion != "us-legacy" {
+			t.Fatalf("target region = %q, want us-legacy", reqCtx.TargetRegion)
+		}
+		return ec.NoContent(http.StatusNoContent)
+	})
+
+	if err := handler(ec); err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+}
+
 func TestNewContextMiddlewareNoReqCtxWhenHeaderMissing(t *testing.T) {
 	t.Parallel()
 

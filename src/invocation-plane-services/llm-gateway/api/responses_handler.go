@@ -28,8 +28,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	echo "github.com/labstack/echo/v4"
+	"go.opentelemetry.io/otel/attribute"
 
 	openairesponses "github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/api/adapters/openairesponses"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
@@ -38,18 +40,20 @@ import (
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/provider"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/ratelimit"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 const (
-	responsesEndpointPath   = "/v1/responses"
-	headerResponsesInput    = "X-Input-Tokens"
-	headerResponsesEstimate = "X-Token-Estimate"
-	headerResponsesRequest  = "X-Request-Id"
-	headerResponsesRegion   = "X-Groq-Region"
-	headerResponsesRouting  = "X-Routing-Key"
-	headerResponsesMethod   = "X-Routing-Method"
-	headerResponsesModel    = "X-Model"
-	headerResponsesAffinity = "X-Cache-Affinity-Key"
+	responsesEndpointPath       = "/v1/responses"
+	headerResponsesInput        = "X-Input-Tokens"
+	headerResponsesEstimate     = "X-Token-Estimate"
+	headerResponsesRequest      = "X-Request-Id"
+	headerResponsesRegion       = "X-NVCF-Target-Region"
+	headerResponsesLegacyRegion = "X-Groq-Region"
+	headerResponsesRouting      = "X-Routing-Key"
+	headerResponsesMethod       = "X-Routing-Method"
+	headerResponsesModel        = "X-Model"
+	headerResponsesAffinity     = "X-Cache-Affinity-Key"
 )
 
 func (h *ResponsesHandlers) RegisterRoutes(group *echo.Group) {
@@ -283,6 +287,7 @@ func setResponsesProxyContextHeaders(headers http.Header, reqCtx *requestctx.Req
 	}
 	if reqCtx.TargetRegion != "" {
 		headers.Set(headerResponsesRegion, reqCtx.TargetRegion)
+		headers.Set(headerResponsesLegacyRegion, reqCtx.TargetRegion)
 	}
 	if reqCtx.RoutingKey != "" {
 		headers.Set(headerResponsesRouting, reqCtx.RoutingKey)
@@ -307,16 +312,20 @@ func (h *ResponsesHandlers) relayNativeResponsesStream(
 	setMultiTurnSessionResponseHeader(c)
 	c.Response().WriteHeader(resp.StatusCode)
 	if resp.Body == nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil)
+		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, true)
 		return nil
 	}
 	defer resp.Body.Close()
 
+	start := time.Now()
 	terminalResponse, err := consumeNativeResponsesSSE(
 		resp.Body,
 		c.Response().Writer,
 	)
-	h.finalizeNativeResponsesUsage(c.UserContext(), request, terminalResponse)
+	if terminalResponse != nil {
+		h.recordNativeResponsesProviderTime(c.UserContext(), start, true)
+	}
+	h.finalizeNativeResponsesUsage(c.UserContext(), request, terminalResponse, true)
 	return err
 }
 
@@ -326,7 +335,7 @@ func (h *ResponsesHandlers) aggregateNativeResponsesStream(
 	resp *provider.ProxyResponse,
 ) error {
 	if resp.Body == nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil)
+		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
 		return echo.NewHTTPError(http.StatusBadGateway, "responses proxy returned no body")
 	}
 	defer resp.Body.Close()
@@ -336,24 +345,26 @@ func (h *ResponsesHandlers) aggregateNativeResponsesStream(
 		setMultiTurnSessionResponseHeader(c)
 		c.Response().WriteHeader(resp.StatusCode)
 		_, err := io.Copy(c.Response().Writer, resp.Body)
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil)
+		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
 		return err
 	}
 
+	start := time.Now()
 	terminalResponse, err := consumeNativeResponsesSSE(resp.Body, nil)
 	if err != nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil)
+		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
 		return err
 	}
 	if terminalResponse == nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil)
+		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
 		return echo.NewHTTPError(
 			http.StatusBadGateway,
 			"responses proxy stream ended without a terminal response event",
 		)
 	}
 
-	h.finalizeNativeResponsesUsage(c.UserContext(), request, terminalResponse)
+	h.recordNativeResponsesProviderTime(c.UserContext(), start, false)
+	h.finalizeNativeResponsesUsage(c.UserContext(), request, terminalResponse, false)
 	setMultiTurnSessionResponseHeader(c)
 	return c.JSON(http.StatusOK, terminalResponse)
 }
@@ -463,8 +474,28 @@ func (h *ResponsesHandlers) finalizeNativeResponsesUsage(
 	ctx context.Context,
 	request *provider.NormalizedRequest,
 	response *openairesponses.Response,
+	stream bool,
 ) {
-	h.handlers.finalizeTokenConsumption(ctx, request, chatUsageFromResponses(response))
+	usage := chatUsageFromResponses(response)
+	if usageHasTokenCounts(usage) {
+		h.handlers.observability.recordLLMUsage(ctx, responsesEndpointPath, usage, stream)
+	}
+	h.handlers.finalizeTokenConsumption(ctx, request, usage)
+}
+
+func (h *ResponsesHandlers) recordNativeResponsesProviderTime(
+	ctx context.Context,
+	start time.Time,
+	stream bool,
+) {
+	telemetry.RecordWithContext(
+		ctx,
+		h.handlers.observability.providerTime,
+		time.Since(start).Seconds(),
+		attribute.String("endpoint", responsesEndpointPath),
+		attribute.String("phase", "total"),
+		attribute.String("stream", boolLabel(stream)),
+	)
 }
 
 func chatUsageFromResponses(response *openairesponses.Response) *models.ChatCompletionUsage {

@@ -29,7 +29,6 @@ import (
 
 	"github.com/nats-io/nats.go"
 	zlog "github.com/rs/zerolog/log"
-	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
@@ -118,12 +117,19 @@ func NewNATSSynchronizer(
 	cfg NATSSyncConfig,
 	clusterName string,
 ) Synchronizer {
-	return &natsSynchronizer{
+	s := &natsSynchronizer{
 		publisher:   publisher,
 		drainer:     drainer,
 		cfg:         cfg,
 		clusterName: clusterName,
 	}
+	telemetry.RegisterRateLimitSynchronizerQueueLength(func() int64 {
+		if s.resultChan == nil {
+			return -1
+		}
+		return int64(len(s.resultChan))
+	})
+	return s
 }
 
 func EnsureNATSStream(js NATSJetStream, cfg NATSSyncConfig) error {
@@ -214,7 +220,6 @@ func handleNATSMessage(
 		telemetry.Record(
 			telemetry.PubSubConsumeDuration(),
 			time.Since(start).Seconds(),
-			attribute.String("subscription", subject),
 		)
 	}()
 
@@ -223,7 +228,6 @@ func handleNATSMessage(
 		telemetry.Add(
 			telemetry.PubSubConsumeFailures(),
 			1,
-			attribute.String("subscription", subject),
 		)
 		zlog.Error().Err(err).Msg("failed to unmarshal NATS rate limit event")
 		return
@@ -233,7 +237,6 @@ func handleNATSMessage(
 		telemetry.Add(
 			telemetry.PubSubConsumeFailures(),
 			1,
-			attribute.String("subscription", subject),
 		)
 		zlog.Error().Err(err).Msg("failed to handle NATS rate limit event")
 		return
@@ -243,7 +246,6 @@ func handleNATSMessage(
 		telemetry.Add(
 			telemetry.PubSubConsumeFailures(),
 			1,
-			attribute.String("subscription", subject),
 		)
 		zlog.Error().Err(err).Msg("failed to ack NATS rate limit event")
 	}
@@ -271,9 +273,8 @@ func (s *natsSynchronizer) Send(_ context.Context, rle *RateLimitEvent) error {
 		MustConsume: rle.MustConsume,
 	}
 	telemetry.Record(
-		telemetry.RateLimitPubsubQueueWaitTime(),
+		telemetry.RateLimitSynchronizerQueueWait(),
 		time.Since(queueStart).Seconds(),
-		attribute.String("cluster_name", s.clusterName),
 	)
 
 	return nil
@@ -310,9 +311,9 @@ func (s *natsSynchronizer) processor(i int) {
 				Float64("lag_seconds", lag).
 				Msg("dropping too-old NATS rate limit event")
 			telemetry.Add(
-				telemetry.RateLimitPublisherEventsDroppedOldMessage(),
+				telemetry.RateLimitSynchronizerEventsDropped(),
 				1,
-				attribute.String("cluster_name", s.clusterName),
+				telemetry.SynchronizerDropReasonOldMessage(),
 			)
 			continue
 		}
@@ -329,14 +330,12 @@ func (s *natsSynchronizer) processor(i int) {
 			telemetry.Add(
 				telemetry.PubSubPublishFailures(),
 				1,
-				attribute.String("topic", s.cfg.Subject),
 			)
 			continue
 		}
 		telemetry.Record(
-			telemetry.RateLimitPubsubPublishTime(),
+			telemetry.RateLimitSynchronizerPublishDuration(),
 			time.Since(publishStart).Seconds(),
-			attribute.String("cluster_name", s.clusterName),
 		)
 	}
 }

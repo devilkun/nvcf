@@ -50,17 +50,17 @@ type Reasoning struct {
 // Metadata represents key-value metadata
 type Metadata map[string]string
 
-// GroqTimingMetrics represents timing metrics for inference
-type GroqTimingMetrics struct {
+// ProviderTimingMetrics represents timing metrics for inference
+type ProviderTimingMetrics struct {
 	PromptTime     float64  `json:"prompt_time"`
 	CompletionTime float64  `json:"completion_time"`
 	TotalTime      float64  `json:"total_time"`
 	QueueTime      *float64 `json:"queue_time"`
 }
 
-// GroqMetadata represents Groq-specific metadata
-type GroqMetadata struct {
-	Metrics *GroqTimingMetrics `json:"metrics"`
+// ProviderResponseMetadata represents provider-specific metadata
+type ProviderResponseMetadata struct {
+	Metrics *ProviderTimingMetrics `json:"metrics"`
 }
 
 // ResponseUsage represents token usage information

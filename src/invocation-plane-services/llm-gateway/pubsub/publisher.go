@@ -23,7 +23,6 @@ import (
 	"fmt"
 
 	gcppubsub "cloud.google.com/go/pubsub/v2"
-	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
@@ -75,8 +74,7 @@ func (p *publisher) PublishProto(
 }
 
 func (p *publisher) publish(ctx context.Context, data []byte, orderingKey string) (string, error) {
-	attr := attribute.String("topic", p.topic.ID())
-	telemetry.Add(telemetry.PubSubPublishFailures(), 0, attr)
+	telemetry.Add(telemetry.PubSubPublishFailures(), 0)
 
 	result := p.topic.Publish(ctx, &gcppubsub.Message{
 		Data:        data,
@@ -92,7 +90,7 @@ func (p *publisher) publish(ctx context.Context, data []byte, orderingKey string
 	case <-result.Ready():
 		id, err := result.Get(ctx)
 		if err != nil {
-			telemetry.Add(telemetry.PubSubPublishFailures(), 1, attr)
+			telemetry.Add(telemetry.PubSubPublishFailures(), 1)
 			return "", err
 		}
 		return id, nil

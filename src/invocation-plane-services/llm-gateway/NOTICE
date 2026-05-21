@@ -75,10 +75,25 @@ License: Apache License 2.0
 https://github.com/nvidia-lpu/parsec
 
 ------------------------------------------------------------------------
-github.com/olric-data/olric v0.7.3 (replaced by github.com/max007-008/olric v0.0.0-20260422213820-d93417d6e8c8)
+github.com/olric-data/olric v0.7.3 (replaced by github.com/max007-008/olric v0.0.0-20260506001115-492943853c7b)
 License: Apache License 2.0
 Upstream: https://github.com/olric-data/olric
 Fork: https://github.com/max007-008/olric
+
+------------------------------------------------------------------------
+github.com/prometheus/client_golang v1.23.2
+License: Apache License 2.0
+https://github.com/prometheus/client_golang
+
+------------------------------------------------------------------------
+github.com/prometheus/common v0.67.5
+License: Apache License 2.0
+https://github.com/prometheus/common
+
+------------------------------------------------------------------------
+github.com/prometheus/otlptranslator v1.0.0
+License: Apache License 2.0
+https://github.com/prometheus/otlptranslator
 
 ------------------------------------------------------------------------
 github.com/rs/zerolog v1.34.0
@@ -122,6 +137,16 @@ https://github.com/open-telemetry/opentelemetry-go
 
 ------------------------------------------------------------------------
 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.42.0
+License: Apache License 2.0
+https://github.com/open-telemetry/opentelemetry-go
+
+------------------------------------------------------------------------
+go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.42.0
+License: Apache License 2.0
+https://github.com/open-telemetry/opentelemetry-go
+
+------------------------------------------------------------------------
+go.opentelemetry.io/otel/exporters/prometheus v0.64.0
 License: Apache License 2.0
 https://github.com/open-telemetry/opentelemetry-go
 

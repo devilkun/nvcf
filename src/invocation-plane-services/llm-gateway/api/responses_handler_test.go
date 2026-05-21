@@ -151,6 +151,22 @@ func TestCreateResponseReturnsBodySessionIDAndUsesItForAffinity(t *testing.T) {
 	}
 }
 
+func TestSetResponsesProxyContextHeadersSetsTargetRegionCompatibilityHeaders(t *testing.T) {
+	t.Parallel()
+
+	headers := http.Header{}
+	setResponsesProxyContextHeaders(headers, &requestctx.RequestContext{
+		TargetRegion: "us-west",
+	})
+
+	if got := headers.Get(headerResponsesRegion); got != "us-west" {
+		t.Fatalf("%s = %q, want us-west", headerResponsesRegion, got)
+	}
+	if got := headers.Get(headerResponsesLegacyRegion); got != "us-west" {
+		t.Fatalf("%s = %q, want us-west", headerResponsesLegacyRegion, got)
+	}
+}
+
 func TestCreateResponseReusesReturnedSessionIDForAffinity(t *testing.T) {
 	t.Parallel()
 

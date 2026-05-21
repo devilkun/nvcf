@@ -159,10 +159,12 @@ type Response struct {
 	Truncation         *string     `json:"truncation,omitempty"`
 
 	// Optional fields from ModelResponseProperties
-	Metadata    *Metadata     `json:"metadata,omitempty"`
-	Groq        *GroqMetadata `json:"groq"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	TopP        *float64      `json:"top_p,omitempty"`
+	Metadata         *Metadata                 `json:"metadata,omitempty"`
+	ProviderMetadata *ProviderResponseMetadata `json:"provider_metadata"`
+	// Deprecated: use ProviderMetadata. Kept for wire compatibility with existing clients.
+	Groq        *ProviderResponseMetadata `json:"groq"`
+	Temperature *float64                  `json:"temperature,omitempty"`
+	TopP        *float64                  `json:"top_p,omitempty"`
 	// Deprecated: User field is deprecated. Use SafetyIdentifier for safety/abuse detection
 	// and PromptCacheKey for caching optimization instead.
 	User             *string `json:"user"`
@@ -179,6 +181,32 @@ type Response struct {
 	Store             *bool              `json:"store,omitempty"`
 	TopLogprobs       *int               `json:"top_logprobs"`
 	MaxToolCalls      *int               `json:"max_tool_calls"`
+}
+
+func (r Response) MarshalJSON() ([]byte, error) {
+	type alias Response
+	r.syncProviderMetadata()
+	return json.Marshal(alias(r))
+}
+
+func (r *Response) UnmarshalJSON(data []byte) error {
+	type alias Response
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = Response(decoded)
+	r.syncProviderMetadata()
+	return nil
+}
+
+func (r *Response) syncProviderMetadata() {
+	if r.ProviderMetadata == nil {
+		r.ProviderMetadata = r.Groq
+	}
+	if r.Groq == nil {
+		r.Groq = r.ProviderMetadata
+	}
 }
 
 // Input represents polymorphic input (string or array of InputItem)

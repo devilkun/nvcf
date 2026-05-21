@@ -30,6 +30,8 @@ import (
 const (
 	GcpTraceIDKey = "logging.googleapis.com/trace"
 	GcpSpanIDKey  = "logging.googleapis.com/spanId"
+	TraceIDKey    = "trace_id"
+	SpanIDKey     = "span_id"
 )
 
 var (
@@ -61,23 +63,22 @@ func Logger(ctx context.Context) *zerolog.Logger {
 
 	spanContext := trace.SpanContextFromContext(ctx)
 	if !spanContext.IsValid() {
-		return logger
+		serviceLogger := logger.With().
+			Str("service", ServiceName()).
+			Logger()
+		return &serviceLogger
 	}
 
 	spanLogger := logger.With().
+		Str("service", ServiceName()).
+		Str(TraceIDKey, spanContext.TraceID().String()).
+		Str(SpanIDKey, spanContext.SpanID().String()).
+		Str(GcpTraceIDKey, spanContext.TraceID().String()).
 		Str(GcpSpanIDKey, spanContext.SpanID().String()).
 		Logger()
 	return &spanLogger
 }
 
 func LoggingSpanContext(ctx context.Context, logger zerolog.Logger) context.Context {
-	spanContext := trace.SpanContextFromContext(ctx)
-	if spanContext.HasTraceID() {
-		logger = logger.With().Str(
-			GcpTraceIDKey,
-			spanContext.TraceID().String(),
-		).Logger()
-	}
-
 	return logger.WithContext(ctx)
 }

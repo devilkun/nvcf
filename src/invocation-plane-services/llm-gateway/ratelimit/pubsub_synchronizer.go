@@ -24,8 +24,6 @@ import (
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 
 	orionpubsub "github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/pubsub"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
@@ -53,21 +51,12 @@ func NewPubSubSynchronizer(
 		clusterName: clusterName,
 	}
 
-	_, err := telemetry.Meter().Int64ObservableGauge(
-		"orion.pubsub.rate_limit_events.synchronizer_queue_length",
-		metric.WithDescription("Length of the golang channel for sending rate limit events to pubsub."),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			length := -1
-			if p.resultChan != nil {
-				length = len(p.resultChan)
-			}
-			o.Observe(int64(length))
-			return nil
-		}),
-	)
-	if err != nil {
-		zlog.Error().Err(err).Msg("failed to initialize observations on synchronizer queue length")
-	}
+	telemetry.RegisterRateLimitSynchronizerQueueLength(func() int64 {
+		if p.resultChan == nil {
+			return -1
+		}
+		return int64(len(p.resultChan))
+	})
 
 	return p
 }
@@ -98,9 +87,8 @@ func (s *pubSubSynchronizer) Send(ctx context.Context, rle *RateLimitEvent) erro
 	queueStart := time.Now()
 	s.resultChan <- &data
 	telemetry.Record(
-		telemetry.RateLimitPubsubQueueWaitTime(),
+		telemetry.RateLimitSynchronizerQueueWait(),
 		time.Since(queueStart).Seconds(),
-		attribute.String("cluster_name", s.clusterName),
 	)
 
 	return nil
@@ -145,9 +133,9 @@ func (s *pubSubSynchronizer) processor(i int) {
 				Float64("lag_seconds", lag).
 				Msg("dropping too-old rate limit event in publisher")
 			telemetry.Add(
-				telemetry.RateLimitPublisherEventsDroppedOldMessage(),
+				telemetry.RateLimitSynchronizerEventsDropped(),
 				1,
-				attribute.String("cluster_name", s.clusterName),
+				telemetry.SynchronizerDropReasonOldMessage(),
 			)
 			continue
 		}
@@ -159,9 +147,8 @@ func (s *pubSubSynchronizer) processor(i int) {
 			continue
 		}
 		telemetry.Record(
-			telemetry.RateLimitPubsubPublishTime(),
+			telemetry.RateLimitSynchronizerPublishDuration(),
 			time.Since(t).Seconds(),
-			attribute.String("cluster_name", s.clusterName),
 		)
 		zlog.Debug().
 			Str("request_id", data.RequestID).

@@ -20,9 +20,14 @@ package nvcf
 import (
 	"context"
 	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -153,6 +158,71 @@ func TestGRPCClientAuthorizeInvocationDoesNotFallbackRateLimitKey(t *testing.T) 
 	}
 }
 
+func TestNewClientPropagatesTraceContext(t *testing.T) {
+	oldPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTextMapPropagator(oldPropagator)
+	})
+
+	tracerProvider := sdktrace.NewTracerProvider()
+	t.Cleanup(func() {
+		_ = tracerProvider.Shutdown(context.Background())
+	})
+
+	invocationService := &stubInvocationService{
+		t:               t,
+		clientProjectID: "project-789",
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := grpc.NewServer()
+	llmgatewaypb.RegisterLlmGatewayServer(server, invocationService)
+
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	secretsPath := t.TempDir() + "/secrets.json"
+	if err := os.WriteFile(secretsPath, []byte(`{"nvcfApiToken":"service-token"}`), 0o600); err != nil {
+		t.Fatalf("write secrets: %v", err)
+	}
+
+	client, err := NewClient(Config{
+		Addr:        listener.Addr().String(),
+		SecretsPath: secretsPath,
+		Insecure:    true,
+		Timeout:     time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	ctx, span := tracerProvider.Tracer("test").Start(context.Background(), "test-parent")
+	defer span.End()
+
+	if _, err := client.AuthorizeInvocation(ctx, "client-token", "fn-123"); err != nil {
+		t.Fatalf("AuthorizeInvocation() error = %v", err)
+	}
+
+	if invocationService.traceparent == "" {
+		t.Fatal("traceparent metadata is empty")
+	}
+	if !strings.Contains(invocationService.traceparent, span.SpanContext().TraceID().String()) {
+		t.Fatalf("traceparent = %q, want trace id %s", invocationService.traceparent, span.SpanContext().TraceID())
+	}
+}
+
 type stubInvocationService struct {
 	llmgatewaypb.UnimplementedLlmGatewayServer
 
@@ -160,6 +230,7 @@ type stubInvocationService struct {
 	clientAuthID    string
 	clientNCAID     string
 	clientProjectID string
+	traceparent     string
 }
 
 func (s *stubInvocationService) AuthLlmInvocation(
@@ -180,6 +251,7 @@ func (s *stubInvocationService) AuthLlmInvocation(
 		routingKey := req.GetRoutingKey()
 		s.t.Fatalf("routing key = %q, want fn-123", routingKey)
 	}
+	s.traceparent = incomingMetadataValue(ctx, "traceparent")
 
 	clientAuthID := s.clientAuthID
 	if clientAuthID == "" {

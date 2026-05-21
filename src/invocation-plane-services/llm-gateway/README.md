@@ -68,7 +68,7 @@ Local Bazel cache setup is documented in the nvcf/nvcf umbrella's
 
 `llm-api-gateway` is a slimmed-down OpenAI-compatible gateway for routing chat
 and responses traffic onto NVCF functions. It was bootstrapped from
-`lpu-api-gateway`, but keeps only the pieces needed for HTTP serving, OpenAI
+earlier gateway code, but keeps only the pieces needed for HTTP serving, OpenAI
 request and response types, prompt templating, tokenization, telemetry, and
 rate limiting. Rate limit state is held in an embedded Olric node rather than
 an external Redis cluster.
@@ -133,7 +133,7 @@ the donor repo's org-centric API context.
 - `Authorization: Bearer ...` is treated as the caller principal for telemetry
   and is forwarded to NVCF gRPC auth when that adapter is configured.
 - `X-Request-ID` is accepted if present, otherwise the gateway generates one.
-- `X-Groq-Region` is forwarded into the request context as the target region.
+- `X-NVCF-Target-Region` is forwarded into the request context as the target region.
 
 Configured functions control the downstream `model`, prompt `template`,
 `tokenizer`, service tier, and per-function rate limits.

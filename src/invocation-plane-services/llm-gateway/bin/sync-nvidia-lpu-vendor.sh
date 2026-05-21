@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Populate nvidia-lpu-vendor/* from the module cache (full NVIDIA LPU module trees).
+# Populate nvidia-lpu-vendor/* from the module cache (full vendored gateway module trees).
 # Downloads each module explicitly so this works before replace targets exist.
 set -euo pipefail
 
