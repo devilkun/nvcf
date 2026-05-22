@@ -40,7 +40,7 @@ HEADER_SNIPPETS=(
 
 SKIP_DIR_NAMES=(
     .git .hg .svn .venv venv __pycache__ .pytest_cache
-    .mypy_cache .tox node_modules target vendor nvidia-lpu-vendor
+    .mypy_cache .tox node_modules target vendor
 )
 
 SKIP_FILE_NAMES=(sonar-project.properties)

@@ -90,7 +90,7 @@ Each component ships an `AGENTS.md` with detailed internals, data flows, and API
 - [`src/compute-plane-services/byoo-otel-collector/AGENTS.md`](../../src/compute-plane-services/byoo-otel-collector/AGENTS.md)
 - [`src/invocation-plane-services/http-invocation/AGENTS.md`](../../src/invocation-plane-services/http-invocation/AGENTS.md)
 - [`src/invocation-plane-services/grpc-proxy/AGENTS.md`](../../src/invocation-plane-services/grpc-proxy/AGENTS.md)
-- [`src/invocation-plane-services/llm-gateway/AGENTS.md`](../../src/invocation-plane-services/llm-gateway/AGENTS.md)
+- [`src/invocation-plane-services/llm-api-gateway/AGENTS.md`](../../src/invocation-plane-services/llm-api-gateway/AGENTS.md)
 - [`src/invocation-plane-services/ratelimiter/AGENTS.md`](../../src/invocation-plane-services/ratelimiter/AGENTS.md)
 - [`src/invocation-plane-services/nats-auth-callout/AGENTS.md`](../../src/invocation-plane-services/nats-auth-callout/AGENTS.md)
 - [`src/control-plane-services/function-autoscaler/AGENTS.md`](../../src/control-plane-services/function-autoscaler/AGENTS.md)

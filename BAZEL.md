@@ -15,7 +15,7 @@ patterns this repo already uses and the ones future phases will need:
 | `bazel-monorepo-bootstrap` | Re-bootstrapping or auditing root files (`MODULE.bazel`, `.bazelrc`, `tools/workspace_status.sh`, `ci/Dockerfile.bazel`) |
 | `bazel-go-gazelle` | Adding or maintaining Go subtrees (Phase 2) |
 | `bazel-oci-images` | Adding `rules_oci` images for new services |
-| `bazel-java-maven` | Onboarding Java services (e.g. `llm-gateway`) |
+| `bazel-java-maven` | Onboarding Java services (e.g. `llm-api-gateway`) |
 | `bazel-rust-crate-universe` | Onboarding Rust services (e.g. `parsec`) |
 | `bazel-gitlab-child-pipelines` | Wiring a new service into the Bazel CI flow |
 | `bazel-synthetic-import-strategy` | Anything touching `imports.yaml` synthetic-import subtrees |
