@@ -73,7 +73,7 @@ jobs:
           - id: grpc-proxy
             path: src/invocation-plane-services/grpc-proxy
           - id: nats-auth-callout
-            path: src/invocation-plane-services/nats-auth-callout
+            path: src/control-plane-services/nats-auth-callout
           - id: ratelimiter
             path: src/invocation-plane-services/ratelimiter
           - id: http-invocation
