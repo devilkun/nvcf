@@ -1,6 +1,8 @@
 # LLM Gateway
 
-The LLM Gateway handles OpenAI-compatible invocation for NVCF LLM functions in self-managed deployments. Use LLM functions when the workload exposes OpenAI-compatible model routes and NVCF should route requests by function and model.
+The LLM Gateway handles OpenAI-compatible invocation for NVCF LLM functions in
+self-managed deployments. Use LLM functions when requests should enter through
+the LLM invocation route and NVCF should route them by function and model.
 
 Clients call the LLM invocation hostname:
 

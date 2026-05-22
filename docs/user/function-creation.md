@@ -19,7 +19,10 @@ Additionally, Cloud Functions supports [Low Latency Streaming (LLS) functions](.
 
 ## LLM Functions
 
-Use an LLM function when the deployed workload exposes OpenAI-compatible model routes through the LLM invocation gateway. LLM functions use `functionType: "LLM"` and define model routing metadata under `models[].llmConfig`.
+Use an LLM function when requests should enter through the LLM invocation
+gateway and NVCF should route them by function and model. LLM functions use
+`functionType: "LLM"`, accept OpenAI-compatible request bodies, and define model
+routing metadata under `models[].llmConfig`.
 
 For the full request path, supported endpoints, native proxy behavior, and session stickiness details, see [LLM Gateway](./llm-gateway.md).
 

@@ -3,14 +3,18 @@
 NVCF supports several optional components that can enhance your GPU cluster's
 performance and capabilities. Each component has its own installation and configuration guide:
 
-## Low-Latency streaming
+## Low-Latency Streaming
 
-- [Lls Installation](lls-installation.md) — Required for streaming Cloud Functions using WebRTC
+- [LLS Installation](lls-installation.md) - Required for streaming Cloud Functions using WebRTC
+
+## LLM Functions
+
+- [LLM Function Enablement](./llm-function-enablement.md) - Required for `functionType: "LLM"` functions using the LLM invocation gateway
 
 ## NVCF Caches
 
-- [container-cache](./cluster-management/container-cache.md) — Accelerates container image pulls by caching layers locally
-- [gxcache](./cluster-management/gxcache.md) — Shader caching for simulation and rendering workloads
+- [container-cache](./cluster-management/container-cache.md) - Accelerates container image pulls by caching layers locally
+- [gxcache](./cluster-management/gxcache.md) - Shader caching for simulation and rendering workloads
 
 ## Physical Simulation Caches
 

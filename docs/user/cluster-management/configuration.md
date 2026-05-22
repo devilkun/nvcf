@@ -821,7 +821,7 @@ When `agentConfig.mergeConfig` is set, the Helm chart creates a ConfigMap called
 `agent-config-merge` containing the provided YAML. This ConfigMap is mounted into the NVCA
 pod and merged with the generated config at runtime.
 
-**Example values.yaml:**
+Example values:
 
 ```yaml
 agentConfig:
@@ -830,7 +830,22 @@ agentConfig:
       logLevel: debug
 ```
 
-**Apply via Helm:**
+Local LLM worker transport example:
+
+```yaml
+agentConfig:
+  mergeConfig: |
+    workload:
+      stargateQUICInsecure: true
+```
+
+`workload.stargateQUICInsecure: true` makes generated LLM workers pass
+`--quic-insecure` to the `stargate-client` sidecar. Use it only for local or
+isolated test clusters that run the LLM request router tunnel without TLS. For
+the full LLM addon setup, see
+[LLM Function Enablement](../llm-function-enablement.md).
+
+Apply via Helm:
 
 ```bash
 helm upgrade nvca-operator -n nvca-operator --create-namespace -i \
