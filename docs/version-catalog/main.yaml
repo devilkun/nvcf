@@ -12,11 +12,11 @@ registries:
     namespace: 0833294136851237/nvcf-ncp-staging
 stack:
   name: nvcf-self-managed-stack
-  version: 0.6.0-rc.36
+  version: 0.6.0-rc.37
   registry: staging
   gitlab_project_id: 182049
   package_name: ncp-deploy
-  artifacts_file: artifacts-0.6.0-rc.36.txt
+  artifacts_file: artifacts-0.6.0-rc.37.txt
 artifacts:
   - name: admin-token-issuer-proxy
     type: image
@@ -30,6 +30,22 @@ artifacts:
     type: image
     registry: staging
     version: 5.0.6-nv-1
+  - name: cert-manager-cainjector
+    type: image
+    registry: staging
+    version: v1.20.2
+  - name: cert-manager-controller
+    type: image
+    registry: staging
+    version: v1.20.2
+  - name: cert-manager-startupapicheck
+    type: image
+    registry: staging
+    version: v1.20.2
+  - name: cert-manager-webhook
+    type: image
+    registry: staging
+    version: v1.20.2
   - name: ess-api
     type: image
     registry: staging
@@ -54,6 +70,10 @@ artifacts:
     type: chart
     registry: staging
     version: 0.14.5
+  - name: helm-nvcf-cert-manager
+    type: chart
+    registry: staging
+    version: 0.1.0
   - name: helm-nvcf-ess-api
     type: chart
     registry: staging

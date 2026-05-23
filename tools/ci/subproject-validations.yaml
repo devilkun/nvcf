@@ -133,6 +133,13 @@ subprojects:
           auth:
             type: ci_var
             ci_var: NGC_DEVOPS_API_KEY
+      # Post-release Slack notification to #nv-nvcf-cicd, matching
+      # the legacy upstream's SLACK_CHANNEL_ID.
+      slack_channel: C08S6KLCEJH
+      # Per-service Sonarqube dashboard, preserving the legacy
+      # upstream's SONAR_PROJECT_KEY so existing dashboards keep
+      # receiving findings for the grpc-proxy subtree.
+      sonarqube_project_key: GPUSW_DGXC_nvcf-grpc-proxy_nvcf_grpc_proxy
   # nats-auth-callout is a native Bazel-built subtree (imports.yaml
   # authoritative_source: native). Single image-push target to
   # nvcr.io/0544956542906249 (nvcf-internal) via the shared
@@ -151,3 +158,10 @@ subprojects:
           auth:
             type: vault
             vault_key: nvcf-components
+      # Post-release notification to #nv-nvcf-cicd, matching the
+      # legacy upstream's SLACK_CHANNEL_ID. Posts via backstage-helper.
+      slack_channel: C08S6KLCEJH
+      # Per-service Sonarqube dashboard, preserving the legacy
+      # upstream's SONARQUBE_PROJECT_KEY so existing dashboards keep
+      # receiving findings for the nats-auth-callout subtree.
+      sonarqube_project_key: SW-Cloud_NVCF_NVCF_nvcf-nats-auth-callout-service

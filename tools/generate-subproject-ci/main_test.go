@@ -517,6 +517,97 @@ func TestRenderReleasePipelineEmitsPerServiceJobs(t *testing.T) {
 	}
 }
 
+func TestRenderReleasePipelineEmitsSlackAndSonarWhenConfigured(t *testing.T) {
+	cfg := configFile{
+		Version:     1,
+		DefaultTags: []string{"eks", "prod"},
+		Subprojects: []subproject{
+			{
+				ID:          "nats-auth-callout",
+				Path:        "src/control-plane-services/nats-auth-callout",
+				ChangePaths: []string{"src/control-plane-services/nats-auth-callout/**/*"},
+				Release: &releaseConfig{
+					ServiceName: "nvcf-nats-auth-callout-service",
+					ImagePushTargets: []releaseImagePushTarget{
+						{
+							Name:        "nvcf_internal",
+							BazelTarget: "//nvidia-internal:image_push_nvcf_internal",
+							Auth: releaseImagePushAuth{
+								Type:     "vault",
+								VaultKey: "nvcf-components",
+							},
+						},
+					},
+					SlackChannel:        "C08S6KLCEJH",
+					SonarqubeProjectKey: "SW-Cloud_NVCF_NVCF_nvcf-nats-auth-callout-service",
+				},
+			},
+		},
+	}
+
+	rendered, err := renderReleasePipeline(cfg, "tools/ci/subproject-validations.yaml")
+	if err != nil {
+		t.Fatalf("renderReleasePipeline: %v", err)
+	}
+
+	for _, want := range []string{
+		"nats-auth-callout-slack-notify:",
+		"SLACK_CHANNEL_ID: C08S6KLCEJH",
+		"backstage-helper.service.odp.nvidia.com/notify_channel",
+		"nats-auth-callout-sonarqube-analysis:",
+		"sonar-scanner",
+		"-Dsonar.projectKey=SW-Cloud_NVCF_NVCF_nvcf-nats-auth-callout-service",
+		"-Dsonar.sources=.",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered pipeline missing %q\n---\n%s\n---", want, rendered)
+		}
+	}
+}
+
+func TestRenderReleasePipelineSkipsSlackAndSonarWhenEmpty(t *testing.T) {
+	cfg := configFile{
+		Version:     1,
+		DefaultTags: []string{"eks", "prod"},
+		Subprojects: []subproject{
+			{
+				ID:          "grpc-proxy",
+				Path:        "src/invocation-plane-services/grpc-proxy",
+				ChangePaths: []string{"src/invocation-plane-services/grpc-proxy/**/*"},
+				Release: &releaseConfig{
+					ServiceName: "nvcf-grpc-proxy",
+					ImagePushTargets: []releaseImagePushTarget{
+						{
+							Name:        "kaze",
+							BazelTarget: "//nvidia-internal:image_push_kaze",
+							Auth: releaseImagePushAuth{
+								Type:     "vault",
+								VaultKey: "nvcf-grpc-proxy",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	rendered, err := renderReleasePipeline(cfg, "tools/ci/subproject-validations.yaml")
+	if err != nil {
+		t.Fatalf("renderReleasePipeline: %v", err)
+	}
+
+	for _, unwanted := range []string{
+		"grpc-proxy-slack-notify",
+		"grpc-proxy-sonarqube-analysis",
+		"backstage-helper.service.odp.nvidia.com",
+		"sonar-scanner",
+	} {
+		if strings.Contains(rendered, unwanted) {
+			t.Errorf("rendered pipeline should not include %q when SlackChannel and SonarqubeProjectKey are empty\n---\n%s\n---", unwanted, rendered)
+		}
+	}
+}
+
 func TestValidateReleaseRequiresServiceName(t *testing.T) {
 	cfg := configFile{
 		Version:     1,

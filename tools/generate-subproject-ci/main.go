@@ -423,6 +423,81 @@ semantic-release-{{ .ID }}:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes: *{{ .RulesAnchor }}
     - if: $CI_COMMIT_TAG =~ /^{{ .ServiceName }}-v/
+{{- if .SlackChannel }}
+
+# Slack release notification. Mirrors the legacy upstream's
+# slack-notification job from cds/nvcf-cicd-pipeline. Posts to the
+# backstage-helper notify_channel endpoint, which is the
+# NVIDIA-internal indirection that handles Slack auth -- no token
+# required in CI. Fires only on default-branch publishes after the
+# real release tag is created.
+{{ .ID }}-slack-notify:
+  # Snapshot is the only umbrella stage after publish, where
+  # semantic-release-<svc> lives. GitLab needs requires the
+  # depended job to be in an earlier stage (same-stage needs error
+  # with "not defined in current or prior stages"), so slack-notify
+  # has to sit later than publish.
+  stage: Snapshot
+  image: dockerhub.nvidia.com/curlimages/curl:8.10.1
+  needs:
+    - job: semantic-release-{{ .ID }}
+      artifacts: false
+      optional: true
+    - job: {{ .ID }}-image-push
+      artifacts: false
+      optional: true
+  tags: [eks, nvcf-cds, prod]
+  variables:
+    SLACK_CHANNEL_ID: {{ yamlValue .SlackChannel }}
+  script:
+    - |
+      SLACK_MESSAGE=":rocket: ${SERVICE_NAME:-{{ .ServiceName }}} release pipeline complete | tag: $(git describe --tags --match='{{ .ServiceName }}-v*' --abbrev=0 2>/dev/null || echo unknown) | sha: ${CI_COMMIT_SHORT_SHA} | <${CI_PIPELINE_URL}|pipeline ${CI_PIPELINE_ID}>"
+      printf '{"channel_id":"%s","message":"%s"}\n' "${SLACK_CHANNEL_ID}" "${SLACK_MESSAGE}" > /tmp/slack.json
+      curl -sSf -X POST 'https://backstage-helper.service.odp.nvidia.com/notify_channel?dry_run=false' \
+        -H 'accept: application/json' \
+        -H 'Content-Type: application/json' \
+        -d @/tmp/slack.json
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *{{ .RulesAnchor }}
+    - if: $CI_COMMIT_TAG =~ /^{{ .ServiceName }}-v/
+{{- end }}
+{{- if .SonarqubeProjectKey }}
+
+# Per-service Sonarqube analysis. Mirrors the legacy upstream's
+# SONARQUBE_PROJECT_KEY configuration so each native subtree keeps
+# its dedicated Sonar dashboard after archive. Reports findings only
+# for the subtree's tree (sonar.sources), against the legacy project
+# key. Runs alongside the umbrella's whole-repo sonarqube-analysis;
+# the two are complementary.
+{{ .ID }}-sonarqube-analysis:
+  stage: Prerequisites
+  image: sonarsource/sonar-scanner-cli:latest
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  tags: [eks, nvcf-cds, prod]
+  script:
+    - cd {{ .Path }}
+    - sonar-scanner
+      -Dsonar.qualitygate.wait=true
+      -Dsonar.host.url="${SONAR_HOST_URL}"
+      -Dsonar.token="${SONAR_TOKEN}"
+      -Dsonar.projectKey={{ yamlValue .SonarqubeProjectKey }}
+      -Dsonar.sources=.
+  allow_failure: true
+  rules:
+    - if: $SONARQUBE_ENABLED != 'true'
+      when: never
+    - if: $CI_MERGE_REQUEST_IID
+      changes: *{{ .RulesAnchor }}
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *{{ .RulesAnchor }}
+{{- end }}
 {{- end }}
 `
 
@@ -442,14 +517,16 @@ type releasePipelineView struct {
 }
 
 type releaseServiceView struct {
-	ID             string
-	ServiceName    string
-	Path           string
-	ChangePaths    []string
-	RulesAnchor    string
-	Targets        []releaseTargetView
-	HasVaultTarget bool
-	VaultKey       string
+	ID                  string
+	ServiceName         string
+	Path                string
+	ChangePaths         []string
+	RulesAnchor         string
+	Targets             []releaseTargetView
+	HasVaultTarget      bool
+	VaultKey            string
+	SlackChannel        string
+	SonarqubeProjectKey string
 }
 
 type releaseTargetView struct {
@@ -508,6 +585,20 @@ type subproject struct {
 type releaseConfig struct {
 	ServiceName      string                  `yaml:"service_name"`
 	ImagePushTargets []releaseImagePushTarget `yaml:"image_push_targets"`
+	// SlackChannel, if non-empty, emits an additional
+	// `<svc>-slack-notify` job that posts a release notification to
+	// the named Slack channel after `semantic-release-<svc>` creates
+	// the tag. Channel ID format is the Slack archives ID, e.g.
+	// `C08S6KLCEJH` for `#nv-nvcf-cicd`. Empty disables the job.
+	SlackChannel string `yaml:"slack_channel,omitempty"`
+	// SonarqubeProjectKey, if non-empty, emits an additional
+	// `<svc>-sonarqube-analysis` job that runs sonar-scanner against
+	// the service's subtree under the named SonarQube project key.
+	// Preserves the per-service Sonar dashboard each native cutover
+	// had pre-archive (legacy SONARQUBE_PROJECT_KEY env var). Empty
+	// disables the job; the umbrella's whole-tree sonarqube-analysis
+	// continues to scan everything regardless.
+	SonarqubeProjectKey string `yaml:"sonarqube_project_key,omitempty"`
 }
 
 // releaseImagePushTarget describes one registry the image gets pushed
@@ -917,11 +1008,13 @@ func renderReleasePipeline(cfg configFile, configPath string) (string, error) {
 		anchor := strings.ReplaceAll(sp.ID, "-", "_") + "_release_paths"
 
 		svc := releaseServiceView{
-			ID:          sp.ID,
-			ServiceName: sp.Release.ServiceName,
-			Path:        sp.Path,
-			ChangePaths: sp.ChangePaths,
-			RulesAnchor: anchor,
+			ID:                  sp.ID,
+			ServiceName:         sp.Release.ServiceName,
+			Path:                sp.Path,
+			ChangePaths:         sp.ChangePaths,
+			RulesAnchor:         anchor,
+			SlackChannel:        sp.Release.SlackChannel,
+			SonarqubeProjectKey: sp.Release.SonarqubeProjectKey,
 		}
 
 		for _, t := range sp.Release.ImagePushTargets {

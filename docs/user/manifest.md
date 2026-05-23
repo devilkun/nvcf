@@ -207,6 +207,11 @@ Additional components present in the current stack artifact manifest.
 
 | Type | Component Name | Full Path |
 | --- | --- | --- |
+| Image | cert-manager-cainjector | `nvcr.io/0833294136851237/nvcf-ncp-staging/cert-manager-cainjector:v1.20.2` |
+| Image | cert-manager-controller | `nvcr.io/0833294136851237/nvcf-ncp-staging/cert-manager-controller:v1.20.2` |
+| Image | cert-manager-startupapicheck | `nvcr.io/0833294136851237/nvcf-ncp-staging/cert-manager-startupapicheck:v1.20.2` |
+| Image | cert-manager-webhook | `nvcr.io/0833294136851237/nvcf-ncp-staging/cert-manager-webhook:v1.20.2` |
+| Chart (OCI) | helm-nvcf-cert-manager | `nvcr.io/0833294136851237/nvcf-ncp-staging/helm-nvcf-cert-manager:0.1.0` |
 | Chart (OCI) | helm-nvcf-nvct-api | `nvcr.io/0833294136851237/nvcf-ncp-staging/helm-nvcf-nvct-api:1.1.2` |
 | Image | nvcf-api-keys-service | `nvcr.io/0833294136851237/nvcf-ncp-staging/nvcf-api-keys-service:1.2.14` |
 | Image | nvcf-service-oss | `nvcr.io/0833294136851237/nvcf-ncp-staging/nvcf-service-oss:1.2.8` |
@@ -218,7 +223,7 @@ Helmfile and CLI resources for deployment.
 
 | Type | Component Name | Full Path |
 | --- | --- | --- |
-| Resource | nvcf-self-managed-stack | `nvcr.io/0833294136851237/nvcf-ncp-staging/nvcf-self-managed-stack:0.6.0-rc.36` |
+| Resource | nvcf-self-managed-stack | `nvcr.io/0833294136851237/nvcf-ncp-staging/nvcf-self-managed-stack:0.6.0-rc.37` |
 | Resource | nvcf-cli | `nvcr.io/0833294136851237/nvcf-ncp-staging/nvcf-cli:0.0.30` |
 
 {/* docs-version-sync:END manifest-artifact-registry-paths */}
