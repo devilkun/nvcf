@@ -113,7 +113,8 @@ service -> service: construct ALLOW / DISALLOW response and send gRPC response
 
 The service can be configured through environment variables:
 
-- `OAUTH2_ISSUER`: OAuth2 issuer URL for inbound JWT validation (JWKS discovery)
+- `OAUTH2_ISSUER`: Expected `iss` claim on inbound JWTs
+- `OAUTH2_JWKS_URL`: URL the validator fetches signing keys from (set explicitly so the binary can run against any OAuth2/OIDC provider, regardless of where it serves keys)
 - `AUDIENCE`: Expected JWT audience (`aud`) for inbound requests
 - `OAUTH2_PROVIDER_HOST`: Hostname for OAuth2 token endpoint when using client-credentials for the outbound NVCF gRPC client
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: Endpoint for OpenTelemetry traces

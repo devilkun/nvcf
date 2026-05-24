@@ -449,6 +449,7 @@ func startGrpcServer(t *testing.T, address string, bindPort int, memberlistPort 
 
 	rateLimiterConfig := ratelimiter.Config{
 		OAuth2Issuer:       "http://localhost:8081",
+		OAuth2JwksURL:      "http://localhost:8081/.well-known/jwks.json",
 		Audience:           "test-oauth2-client-id",
 		OAuth2ProviderHost: "localhost",
 		NvcfApiUrl:         "http://localhost:9091",

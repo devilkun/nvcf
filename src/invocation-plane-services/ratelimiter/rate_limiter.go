@@ -79,10 +79,14 @@ type FunctionRateLimitConfig struct {
 }
 
 type Config struct {
-	// OAuth2Issuer is the OAuth2 issuer URL for validating inbound gRPC JWTs
-	// (JWKS at {issuer}/.well-known/jwks.json).
+	// OAuth2Issuer is the expected `iss` claim string on inbound gRPC JWTs.
 	OAuth2Issuer string `mapstructure:"OAUTH2_ISSUER"`
-	Audience     string `mapstructure:"AUDIENCE"`
+	// OAuth2JwksURL is the URL the validator fetches signing keys from. It is
+	// set explicitly rather than derived from OAuth2Issuer so the binary can
+	// run against any OAuth2/OIDC provider, whether it serves keys at the
+	// standard `{issuer}/.well-known/jwks.json` path or at a different one.
+	OAuth2JwksURL string `mapstructure:"OAUTH2_JWKS_URL"`
+	Audience      string `mapstructure:"AUDIENCE"`
 	// OAuth2ProviderHost is the hostname of the OAuth2 authorization server used for client-credentials
 	// tokens when calling the NVCF API (see nvkit ProviderConfig.Host).
 	OAuth2ProviderHost       string `mapstructure:"OAUTH2_PROVIDER_HOST"`
@@ -707,7 +711,7 @@ func MakeGrpcServer(rateLimiter *RateLimiter, listener net.Listener, logger logg
 		zap.L().Error("Failed to parse OAuth2 issuer", zap.Error(err))
 		return nil, err
 	}
-	jwkUrl, err := url.Parse(rateLimiterConfig.OAuth2Issuer + "/.well-known/jwks.json")
+	jwkUrl, err := url.Parse(rateLimiterConfig.OAuth2JwksURL)
 	if err != nil {
 		return nil, err
 	}

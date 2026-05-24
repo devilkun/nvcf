@@ -164,7 +164,10 @@ func NewRootCommand() *cobra.Command {
 				c.SecretsPath = "vault/secrets.json"
 			}
 			if c.OAuth2Issuer == "" {
-				return fmt.Errorf("missing required OAUTH2_ISSUER (OAuth2 issuer URL for inbound JWT validation)")
+				return fmt.Errorf("missing required OAUTH2_ISSUER (expected JWT iss claim on inbound gRPC calls)")
+			}
+			if c.OAuth2JwksURL == "" {
+				return fmt.Errorf("missing required OAUTH2_JWKS_URL (URL the validator fetches signing keys from)")
 			}
 			if c.Audience == "" {
 				return fmt.Errorf("missing required audience")
