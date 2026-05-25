@@ -400,26 +400,60 @@ semantic-release-{{ .ID }}:
 {{- end }}
   script:
     - cd {{ .Path }}
+    # On MR pipelines do 'bazel build' (analyze + assemble image, no
+    # push). That still exercises the full auth setup and base image
+    # pull so docker-auth scoping bugs and base-image-availability bugs
+    # surface in the MR pipeline instead of post-merge. Default-branch
+    # and tag pipelines do 'bazel run' to actually push.
+    - |
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
+        BAZEL_PUSH_VERB=build
+      else
+        BAZEL_PUSH_VERB=run
+      fi
+      export BAZEL_PUSH_VERB
+      echo "[{{ .ID }}-image-push] bazel verb: ${BAZEL_PUSH_VERB}"
 {{- range .Targets }}
 {{- if eq .AuthType "vault" }}
     - |
       NGC_REGISTRY_HOST="${NGC_REGISTRY#https://}"
       NGC_REGISTRY_HOST="${NGC_REGISTRY_HOST#http://}"
       NGC_REGISTRY_HOST="${NGC_REGISTRY_HOST%%/*}"
-      printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${NGC_REGISTRY_HOST}" "${ {{- .Name | upper -}} _AUTH}" > ~/.docker/config.json
+{{- if .DockerAuthPath }}
+      # Scope the auth key to the push destination so rules_oci does
+      # not apply this token when pulling the base image (e.g. the
+      # public nvcr.io/nvidia/distroless/cc that Rust services use as
+      # their OCI base). rules_oci uses longest-prefix matching: a
+      # bare "nvcr.io" key matches every nvcr.io URL including the
+      # public distroless image, and the scoped NGC token's
+      # permissions 403 the public read.
+      DOCKER_AUTH_KEY={{ yamlValue .DockerAuthPath }}
+{{- else }}
+      DOCKER_AUTH_KEY="${NGC_REGISTRY_HOST}"
+{{- end }}
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${DOCKER_AUTH_KEY}" "${ {{- .Name | upper -}} _AUTH}" > ~/.docker/config.json
       chmod 600 ~/.docker/config.json
 {{- else if eq .AuthType "ci_var" }}
     - |
-      printf '{"auths":{"nvcr.io":{"auth":"%s"}}}\n' "${ {{- .Name | upper -}} _AUTH}" > ~/.docker/config.json
+{{- if .DockerAuthPath }}
+      DOCKER_AUTH_KEY={{ yamlValue .DockerAuthPath }}
+{{- else }}
+      DOCKER_AUTH_KEY=nvcr.io
+{{- end }}
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${DOCKER_AUTH_KEY}" "${ {{- .Name | upper -}} _AUTH}" > ~/.docker/config.json
       chmod 600 ~/.docker/config.json
 {{- end }}
-    - bazel run --stamp ${BAZEL_REMOTE_FLAGS} --disk_cache=$BAZEL_DISK_CACHE --repository_cache=$BAZEL_REPO_CACHE {{ .BazelTarget }}
+    - bazel ${BAZEL_PUSH_VERB} --stamp ${BAZEL_REMOTE_FLAGS} --disk_cache=$BAZEL_DISK_CACHE --repository_cache=$BAZEL_REPO_CACHE {{ .BazelTarget }}
 {{- end }}
   rules:
+    # Run on every MR pipeline whose change_paths touch this service.
+    # Script runs 'bazel build' (not 'run') in MR context so the build
+    # exercises base-image pull and the full auth setup without
+    # actually pushing. This catches docker-auth scoping bugs (the
+    # NVCF-10337 nvcr.io 403 bug) before merge, instead of post-merge
+    # on main.
     - if: $CI_MERGE_REQUEST_IID
       changes: *{{ .RulesAnchor }}
-      when: manual
-      allow_failure: true
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes: *{{ .RulesAnchor }}
     - if: $CI_COMMIT_TAG =~ /^{{ .ServiceName }}-v/
@@ -543,10 +577,11 @@ type releaseServiceView struct {
 }
 
 type releaseTargetView struct {
-	Name        string
-	BazelTarget string
-	AuthType    string
-	CIVar       string
+	Name           string
+	BazelTarget    string
+	AuthType       string
+	CIVar          string
+	DockerAuthPath string
 }
 
 type args struct {
@@ -621,6 +656,23 @@ type releaseImagePushTarget struct {
 	Name        string                 `yaml:"name"`
 	BazelTarget string                 `yaml:"bazel_target"`
 	Auth        releaseImagePushAuth   `yaml:"auth"`
+	// DockerAuthPath, if set, is written as the key in
+	// ~/.docker/config.json instead of the bare registry host. Use
+	// when the service's base image lives on the same registry as the
+	// push target (e.g. Rust services that pull `nvcr.io/nvidia/
+	// distroless/cc` while pushing to `nvcr.io/<org>/<image>`).
+	// rules_oci does longest-prefix matching on the auth keys; if the
+	// scoped token's key is just "nvcr.io" it gets applied to every
+	// nvcr.io pull including the public distroless base, and the
+	// token's scoped permissions 403 the public read.
+	//
+	// Format: full path without scheme, e.g.
+	//   `nvcr.io/ema5hzr4ziav/nvcf_autoscaling`
+	//   `nvcr.io/0651155215864979/ncp-dev/nvcf-function-autoscaler`
+	//
+	// Optional. Empty falls back to the host-only key (works for
+	// services whose base image isn't on the same registry).
+	DockerAuthPath string `yaml:"docker_auth_path,omitempty"`
 }
 
 // releaseImagePushAuth holds the credential source for one push
@@ -1032,10 +1084,11 @@ func renderReleasePipeline(cfg configFile, configPath string) (string, error) {
 
 		for _, t := range sp.Release.ImagePushTargets {
 			svc.Targets = append(svc.Targets, releaseTargetView{
-				Name:        t.Name,
-				BazelTarget: t.BazelTarget,
-				AuthType:    t.Auth.Type,
-				CIVar:       t.Auth.CIVar,
+				Name:           t.Name,
+				BazelTarget:    t.BazelTarget,
+				AuthType:       t.Auth.Type,
+				CIVar:          t.Auth.CIVar,
+				DockerAuthPath: t.DockerAuthPath,
 			})
 			if t.Auth.Type == "vault" && !svc.HasVaultTarget {
 				svc.HasVaultTarget = true

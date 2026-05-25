@@ -128,11 +128,13 @@ subprojects:
           auth:
             type: vault
             vault_key: nvcf-grpc-proxy
+          docker_auth_path: nvcr.io/nvidia/kaze/nvcf-grpc-proxy
         - name: ncp_dev
           bazel_target: //nvidia-internal:image_push_ncp_dev
           auth:
             type: ci_var
             ci_var: NGC_DEVOPS_API_KEY
+          docker_auth_path: nvcr.io/0651155215864979/ncp-dev/nvcf-grpc-proxy
       # Post-release Slack notification to #nv-nvcf-cicd, matching
       # the legacy upstream's SLACK_CHANNEL_ID.
       slack_channel: C08S6KLCEJH
@@ -157,11 +159,13 @@ subprojects:
           auth:
             type: vault
             vault_key: nvcf-rate-limiter
+          docker_auth_path: nvcr.io/nvidia/kaze/nvcf-ratelimiter
         - name: ncp_dev
           bazel_target: //nvidia-internal:image_push_ncp_dev
           auth:
             type: ci_var
             ci_var: NGC_DEVOPS_API_KEY
+          docker_auth_path: nvcr.io/0651155215864979/ncp-dev/nvcf-ratelimiter
       slack_channel: C08S6KLCEJH
       sonarqube_project_key: GPUSW_DGXC_nvcf-rate-limiter_nvcf_rate_limiter
   # http-invocation is a native Bazel-built subtree. Publishes to
@@ -183,11 +187,17 @@ subprojects:
           auth:
             type: vault
             vault_key: nvcf-invocation-service
+          # Scoped to the push destination so rules_oci does not apply
+          # this token to the public nvcr.io/nvidia/distroless/cc pull
+          # (the OCI base image for this Rust service). See the
+          # generator's DockerAuthPath field doc.
+          docker_auth_path: nvcr.io/0544956542906249/nvcf-dev/nvcf-invocation-service
         - name: ncp_dev
           bazel_target: //nvidia-internal:image_push_ncp_dev
           auth:
             type: ci_var
             ci_var: NGC_DEVOPS_API_KEY
+          docker_auth_path: nvcr.io/0651155215864979/ncp-dev/nvcf-invocation-service
       slack_channel: C08S6KLCEJH
   # function-autoscaler is a native Bazel-built subtree. Publishes to
   # legacy nvcr.io/ema5hzr4ziav/nvcf_autoscaling (vault key
@@ -208,11 +218,20 @@ subprojects:
           auth:
             type: vault
             vault_key: rs-autoscaler
+          # Scoped to the push destination so rules_oci does not apply
+          # this token to the public nvcr.io/nvidia/distroless/cc pull
+          # (the OCI base image for this Rust service). See the
+          # generator's DockerAuthPath field doc. Image name is
+          # `nvcf_autoscaling` (underscore) to match the pre-Bazel CI's
+          # DOCKER_IMAGE_NAME from the legacy nvcf-rust-ci-pipeline
+          # template; deploy manifests and dashboards pin this path.
+          docker_auth_path: nvcr.io/ema5hzr4ziav/nvcf_autoscaling
         - name: ncp_dev
           bazel_target: //nvidia-internal:image_push_ncp_dev
           auth:
             type: ci_var
             ci_var: NGC_DEVOPS_API_KEY
+          docker_auth_path: nvcr.io/0651155215864979/ncp-dev/nvcf-function-autoscaler
       slack_channel: C08S6KLCEJH
   # nats-auth-callout is a native Bazel-built subtree (imports.yaml
   # authoritative_source: native). Single image-push target to
@@ -232,6 +251,7 @@ subprojects:
           auth:
             type: vault
             vault_key: nvcf-components
+          docker_auth_path: nvcr.io/0544956542906249/nvcf-nats-auth-callout-service
       # Post-release notification to #nv-nvcf-cicd, matching the
       # legacy upstream's SLACK_CHANNEL_ID. Posts via backstage-helper.
       slack_channel: C08S6KLCEJH
