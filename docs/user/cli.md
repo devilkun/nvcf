@@ -482,7 +482,7 @@ All `function create` flags:
 | `--secrets` | Secrets in `name=value` format (repeatable) |
 | `--tags` | Comma-separated tags |
 | `--models` | Model artifacts in `name:version:uri` format (repeatable) |
-| `--llm-model` | LLM model config in `name=MODEL,uris=URI\|URI,routingMethod=round_robin\|power_of_two\|random,tokenRateLimit=LIMIT` format (repeatable) |
+| `--llm-model` | LLM model config in `name=MODEL,uris=URI\|URI,routingMethod=round_robin\|power_of_two\|groq_multiregion\|pulsar\|random,tokenRateLimit=LIMIT` format (repeatable) |
 | `--resources` | Resource artifacts in `name:version:uri` format (repeatable) |
 | `--helm-chart` | Helm chart specification |
 | `--helm-chart-service` | Helm chart service name |
@@ -530,7 +530,7 @@ LLM functions use `functionType: "LLM"` and define model routing metadata under 
 }
 ```
 
-For LLM models, `llmConfig.routingMethod` accepts `round_robin`, `power_of_two`, or `random`.
+For LLM models, `llmConfig.routingMethod` accepts `round_robin`, `power_of_two`, `groq_multiregion`, `pulsar`, or `random`.
 Supported LLM paths are `/v1/chat/completions`, `/v1/responses`, and `/v1/embeddings`.
 
 #### Deploy Function

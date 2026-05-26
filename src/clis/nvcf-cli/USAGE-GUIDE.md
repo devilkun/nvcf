@@ -812,8 +812,8 @@ curl -X POST https://api.nvcf.nvidia.com/v2/nvcf/accounts/nvcf-default/registry-
 ```
 
 For LLM models, `llmConfig.routingMethod` accepts the API/auth spellings
-`round_robin`, `power_of_two`, or `random`. The CLI validates these values
-before sending the create request.
+`round_robin`, `power_of_two`, `groq_multiregion`, `pulsar`, or `random`. The
+CLI validates these values before sending the create request.
 Supported LLM paths are `/v1/chat/completions`, `/v1/responses`, and `/v1/embeddings`.
 
 ### 5. List Functions

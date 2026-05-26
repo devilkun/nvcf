@@ -78,6 +78,24 @@ func TestParseLLMModelString(t *testing.T) {
 	}
 }
 
+func TestParseLLMModelStringAcceptsAdvancedRoutingMethods(t *testing.T) {
+	t.Parallel()
+
+	for _, routingMethod := range []string{"groq_multiregion", "pulsar"} {
+		t.Run(routingMethod, func(t *testing.T) {
+			t.Parallel()
+
+			model, err := parseLLMModelString("name=dummy-model,uris=/v1/chat/completions,routingMethod=" + routingMethod)
+			if err != nil {
+				t.Fatalf("parse llm model: %v", err)
+			}
+			if got := stringValue(model.LLMConfig.RoutingMethod); got != routingMethod {
+				t.Fatalf("routingMethod = %q, want %q", got, routingMethod)
+			}
+		})
+	}
+}
+
 func TestParseLLMModelStringRejectsInvalidRoutingMethod(t *testing.T) {
 	t.Parallel()
 
@@ -214,6 +232,24 @@ func TestParseLLMModelUpdateString(t *testing.T) {
 	}
 	if got := stringValue(update.LLMConfig.TokenRateLimit); got != "1000-M" {
 		t.Fatalf("tokenRateLimit = %q, want 1000-M", got)
+	}
+}
+
+func TestParseLLMModelUpdateStringAcceptsAdvancedRoutingMethods(t *testing.T) {
+	t.Parallel()
+
+	for _, routingMethod := range []string{"groq_multiregion", "pulsar"} {
+		t.Run(routingMethod, func(t *testing.T) {
+			t.Parallel()
+
+			update, err := parseLLMModelUpdateString("name=dummy-model,routingMethod=" + routingMethod)
+			if err != nil {
+				t.Fatalf("parse llm model update: %v", err)
+			}
+			if got := stringValue(update.LLMConfig.RoutingMethod); got != routingMethod {
+				t.Fatalf("routingMethod = %q, want %q", got, routingMethod)
+			}
+		})
 	}
 }
 

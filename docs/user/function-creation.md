@@ -60,7 +60,7 @@ The same configuration can be provided with CLI flags:
   --llm-model "name=dummy-model,uris=/v1/chat/completions|/v1/responses|/v1/embeddings,routingMethod=round_robin,tokenRateLimit=1000-M"
 ```
 
-`llmConfig.uris` lists the OpenAI-compatible paths handled by the model. Supported LLM paths are `/v1/chat/completions`, `/v1/responses`, and `/v1/embeddings`. `routingMethod` accepts `round_robin`, `power_of_two`, or `random`. `tokenRateLimit` uses the same rate limit format as function-level rate limits.
+`llmConfig.uris` lists the OpenAI-compatible paths handled by the model. Supported LLM paths are `/v1/chat/completions`, `/v1/responses`, and `/v1/embeddings`. `routingMethod` accepts `round_robin`, `power_of_two`, `groq_multiregion`, `pulsar`, or `random`. `tokenRateLimit` uses the same rate limit format as function-level rate limits.
 
 After creation, update per-model `routingMethod` or `tokenRateLimit` with `nvcf-cli function update --llm-model-update "name=<model>,routingMethod=<method>,tokenRateLimit=<limit>"` or JSON `modelUpdates`.
 

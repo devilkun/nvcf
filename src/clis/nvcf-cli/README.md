@@ -658,8 +658,9 @@ export NVCF_TOKEN="nvapi-your-function-creation-token"
 
 `--llm-model` accepts `name`, `uris`, `routingMethod`, and `tokenRateLimit`
 key/value fields. Separate multiple URIs with `|`. Valid routing
-methods are `round_robin`, `power_of_two`, and `random`; the CLI validates and
-sends these API/auth spellings in the create request.
+methods are `round_robin`, `power_of_two`, `groq_multiregion`, `pulsar`, and
+`random`; the CLI validates and sends these API/auth spellings in the create
+request.
 Supported LLM paths are `/v1/chat/completions`, `/v1/responses`, and `/v1/embeddings`.
 
 #### **Deploy a Function** *Uses `NVCF_TOKEN` (with `NVCF_API_KEY` fallback)*

@@ -65,7 +65,7 @@ Set `functionType` to `LLM` and define model routing metadata under `models[].ll
 | `/v1/responses` | Supports native Responses API requests. Streaming clients receive server-sent events (SSE). Non-streaming clients receive the terminal Responses JSON object. |
 | `/v1/embeddings` | Supports embeddings requests with string or string array input. |
 
-`llmConfig.routingMethod` accepts `round_robin`, `power_of_two`, or `random`.
+`llmConfig.routingMethod` accepts `round_robin`, `power_of_two`, `groq_multiregion`, `pulsar`, or `random`.
 
 `llmConfig.tokenRateLimit` applies a per-model token limit using the same rate limit format as function-level limits.
 
