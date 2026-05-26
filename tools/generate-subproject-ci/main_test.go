@@ -633,7 +633,7 @@ func TestValidateReleaseRequiresServiceName(t *testing.T) {
 	}
 }
 
-func TestValidateReleaseRequiresImagePushTargets(t *testing.T) {
+func TestValidateReleaseRequiresImagePushTargetsOrHelm(t *testing.T) {
 	cfg := configFile{
 		Version:     1,
 		DefaultTags: []string{"eks"},
@@ -647,8 +647,34 @@ func TestValidateReleaseRequiresImagePushTargets(t *testing.T) {
 		},
 	}
 	err := validateConfig(cfg)
-	if err == nil || !strings.Contains(err.Error(), "image_push_targets must not be empty") {
-		t.Fatalf("expected image_push_targets error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "must declare at least one of image_push_targets or helm") {
+		t.Fatalf("expected image_push_targets-or-helm error, got: %v", err)
+	}
+}
+
+func TestValidateReleaseAllowsHelmOnly(t *testing.T) {
+	cfg := configFile{
+		Version:     1,
+		DefaultTags: []string{"eks"},
+		Profiles:    map[string]profile{},
+		Subprojects: []subproject{
+			{
+				ID:   "svc",
+				Path: "p",
+				Release: &releaseConfig{
+					ServiceName: "nvcf-svc",
+					Helm: &helmConfig{
+						ChartPath: "deploy",
+						PushTargets: []helmPushTarget{
+							{Name: "ncp-dev", NGCPath: "0/x", NGCKeyVar: "NGC_DEVOPS_API_KEY"},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("helm-only release should validate, got: %v", err)
 	}
 }
 

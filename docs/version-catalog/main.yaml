@@ -12,11 +12,11 @@ registries:
     namespace: 0833294136851237/nvcf-ncp-staging
 stack:
   name: nvcf-self-managed-stack
-  version: 0.6.0-rc.38
+  version: 0.6.0-rc.39
   registry: staging
   gitlab_project_id: 182049
   package_name: ncp-deploy
-  artifacts_file: artifacts-0.6.0-rc.38.txt
+  artifacts_file: artifacts-0.6.0-rc.39.txt
 artifacts:
   - name: admin-token-issuer-proxy
     type: image

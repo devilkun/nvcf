@@ -366,6 +366,7 @@ semantic-release-{{ .ID }}:
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes: *{{ .RulesAnchor }}
+{{- if .Targets }}
 
 {{ .ID }}-image-push:
   extends:
@@ -527,6 +528,7 @@ semantic-release-{{ .ID }}:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes: *{{ .RulesAnchor }}
     - if: $CI_COMMIT_TAG =~ /^{{ .ServiceName }}-v/
+{{- end }}
 {{- if .SlackChannel }}
 
 # Slack release notification. Mirrors the legacy upstream's
@@ -1111,8 +1113,8 @@ func validateRelease(id string, rel *releaseConfig) error {
 	if strings.TrimSpace(rel.ServiceName) == "" {
 		return fmt.Errorf("subproject %q release.service_name must not be empty", id)
 	}
-	if len(rel.ImagePushTargets) == 0 {
-		return fmt.Errorf("subproject %q release.image_push_targets must not be empty", id)
+	if len(rel.ImagePushTargets) == 0 && rel.Helm == nil {
+		return fmt.Errorf("subproject %q release must declare at least one of image_push_targets or helm", id)
 	}
 	seenTargets := map[string]struct{}{}
 	for _, t := range rel.ImagePushTargets {
