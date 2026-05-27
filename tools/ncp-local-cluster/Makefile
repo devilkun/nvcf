@@ -115,7 +115,7 @@ ensure-context: ## Verify kubectl context matches the cluster, prompt to switch 
 		echo "OK kubectl context switched to $$EXPECTED_CTX"; \
 	fi
 
-start:
+start: ensure-docker-config
 	@echo "========== START CLUSTER =========="
 	@$(MAKE) ensure-cluster
 	@echo "Ensuring cluster $(CLUSTER_NAME) is ready..."
@@ -190,7 +190,7 @@ print-compute-clusters: validate-compute-clusters ## Print resolved compute clus
 	fi; \
 	echo "$$clusters" | xargs
 
-start-control-plane: ensure-docker-config ## Start the local control-plane k3d cluster
+start-control-plane: ## Start the local control-plane k3d cluster
 	@$(MAKE) CLUSTER_NAME=$(CONTROL_PLANE_CLUSTER_NAME) K3D_CONFIG_FILE=$(CONTROL_PLANE_CONFIG_FILE) start
 
 deploy-control-plane-addons: setup-gateway-api check-gateway-api validate-gateway deploy-control-plane-endpoints ## Deploy control-plane addons only
@@ -210,7 +210,7 @@ build-and-deploy-control-plane-cluster: clean build start-control-plane deploy-c
 destroy-control-plane: ## Destroy the local control-plane cluster
 	@$(MAKE) CLUSTER_NAME=$(CONTROL_PLANE_CLUSTER_NAME) destroy
 
-start-compute-plane: ensure-docker-config ## Start one local compute-plane k3d cluster
+start-compute-plane: ## Start one local compute-plane k3d cluster
 	@$(MAKE) CLUSTER_NAME=$(COMPUTE_CLUSTER_NAME) K3D_CONFIG_FILE=$(COMPUTE_PLANE_CONFIG_FILE) start
 
 deploy-compute-plane-addons: deploy-compute-control-plane-endpoints configure-compute-control-plane-dns deploy-csi-smb wait-for-csi-smb deploy-fake-gpu-operator wait-for-fake-gpu-operator validate-deployment cleanup-sample ## Deploy compute-plane addons only
@@ -525,7 +525,7 @@ uninstall-kube-state-metrics: ## Uninstall kube-state-metrics from the cluster
 	@echo "OK Kube-state-metrics uninstalled"
 
 # -- Main composite target --
-build-and-deploy-cluster: clean build start deploy-csi-smb wait-for-csi-smb deploy-fake-gpu-operator wait-for-fake-gpu-operator validate-deployment cleanup-sample setup-gateway-api check-gateway-api validate-gateway
+build-and-deploy-cluster: ensure-docker-config clean build start deploy-csi-smb wait-for-csi-smb deploy-fake-gpu-operator wait-for-fake-gpu-operator validate-deployment cleanup-sample setup-gateway-api check-gateway-api validate-gateway
 	@echo "========== COMPLETED =========="
 	@echo "Cluster $(CLUSTER_NAME) is up and ready to use."
 	@echo "OK Context is k3d-$(CLUSTER_NAME)"

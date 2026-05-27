@@ -37,6 +37,51 @@ run_make() {
   make --no-print-directory -s -C "$ROOT_DIR" "$@"
 }
 
+assert_missing_docker_config_blocks_target() {
+  local target="$1"
+  local missing_config_root
+  local missing_config_bin
+  local missing_config_output
+
+  missing_config_root="$(mktemp -d)"
+  missing_config_bin="$(mktemp -d)"
+  missing_config_output="$(mktemp)"
+  cp "$ROOT_DIR/Makefile" "$missing_config_root/Makefile"
+  cat >"$missing_config_bin/k3d" <<'EOF'
+#!/usr/bin/env bash
+echo "k3d should not be called before docker config validation" >&2
+exit 42
+EOF
+  cat >"$missing_config_bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+echo "kubectl should not be called before docker config validation" >&2
+exit 42
+EOF
+  cat >"$missing_config_bin/go" <<'EOF'
+#!/usr/bin/env bash
+echo "go should not be called before docker config validation" >&2
+exit 42
+EOF
+  chmod +x "$missing_config_bin/k3d" "$missing_config_bin/kubectl" "$missing_config_bin/go"
+  if PATH="$missing_config_bin:$PATH" make --no-print-directory -s -C "$missing_config_root" "$target" >"$missing_config_output" 2>&1; then
+    cat "$missing_config_output" >&2
+    rm -rf "$missing_config_root" "$missing_config_bin"
+    rm -f "$missing_config_output"
+    fail "${target} should fail when secrets/docker-config.json is missing"
+  fi
+  if ! grep -q "secrets/docker-config.json is required" "$missing_config_output"; then
+    cat "$missing_config_output" >&2
+    rm -rf "$missing_config_root" "$missing_config_bin"
+    rm -f "$missing_config_output"
+    fail "${target} must check docker config before invoking build or cluster tooling"
+  fi
+  rm -rf "$missing_config_root" "$missing_config_bin"
+  rm -f "$missing_config_output"
+}
+
+assert_missing_docker_config_blocks_target start
+assert_missing_docker_config_blocks_target build-and-deploy-cluster
+
 print_directory_clusters="$(MAKEFLAGS=--print-directory; export MAKEFLAGS; run_make print-compute-clusters)"
 assert_eq "ncp-local-compute-1" "$print_directory_clusters" "print-directory compute cluster output"
 if ! grep -q '\$(MAKE) --no-print-directory -s print-compute-clusters' "$ROOT_DIR/Makefile"; then
@@ -104,11 +149,11 @@ fi
 if ! grep -q 'deploy-compute-control-plane-endpoints configure-compute-control-plane-dns' "$ROOT_DIR/Makefile"; then
   fail "compute DNS must be configured after alias Services exist"
 fi
-if ! grep -q 'CONTROL_PLANE_LB_HTTP_PORT="$(CONTROL_PLANE_HTTP_PORT)"' "$ROOT_DIR/Makefile"; then
-  fail "Makefile must pass CONTROL_PLANE_HTTP_PORT as CONTROL_PLANE_LB_HTTP_PORT to endpoint configuration"
+if ! grep -q 'CONTROL_PLANE_LB_HTTP_PORT=80' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass the control-plane HTTP container port to endpoint configuration"
 fi
-if ! grep -q 'CONTROL_PLANE_LB_NATS_PORT="$(CONTROL_PLANE_NATS_PORT)"' "$ROOT_DIR/Makefile"; then
-  fail "Makefile must pass CONTROL_PLANE_NATS_PORT as CONTROL_PLANE_LB_NATS_PORT to endpoint configuration"
+if ! grep -q 'CONTROL_PLANE_LB_NATS_PORT=4222' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass the control-plane NATS container port to endpoint configuration"
 fi
 dns_target="$(awk '/^configure-compute-control-plane-dns:/{show=1} /^deploy-compute-control-plane-endpoints:/{show=0} show{print}' "$ROOT_DIR/Makefile")"
 if grep -q 'CLUSTER_NAME' <<<"$dns_target"; then
@@ -186,7 +231,7 @@ if ! grep -q 'scripts/render-sample.sh' "$ROOT_DIR/Makefile"; then
 fi
 
 tmp_output="$(mktemp)"
-if "$ROOT_DIR/scripts/render-sample.sh" --dry-run >"$tmp_output" 2>&1; then
+if SAMPLE_IMAGE= SAMPLE_NGC_ORG=ngc-org SAMPLE_NGC_TEAM=ngc-team "$ROOT_DIR/scripts/render-sample.sh" --dry-run >"$tmp_output" 2>&1; then
   cat "$tmp_output" >&2
   rm -f "$tmp_output"
   fail "sample render must fail when ngc-org/ngc-team placeholders are not replaced"
