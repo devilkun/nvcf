@@ -63,6 +63,19 @@ Generated blocks are marked with comments such as:
 
 Keep the marker comments intact.
 
+## Local preview
+
+Render the docs locally with Fern in a Docker container. Serves on `http://localhost:3000`:
+
+```bash
+docker run --rm -it \
+  -v "$(pwd):/workspace" \
+  -w /workspace \
+  -p 3000:3000 \
+  node:20-alpine \
+  sh -c "npm install -g fern-api && fern docs dev"
+```
+
 ## Validation
 
 Run the narrow version check after catalog or generated block changes:

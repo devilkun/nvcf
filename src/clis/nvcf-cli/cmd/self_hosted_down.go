@@ -388,7 +388,7 @@ func runDownComputePlaneForCluster(c *cobra.Command, ctx context.Context, sink p
 	}
 	defer closeDeleter()
 
-	if err := teardown.Unregister(ctx, deleter, icmsURL, unregisterClusterID); err != nil {
+	if err := teardown.Unregister(ctx, deleter, icmsURL, downNCAID, unregisterClusterID); err != nil {
 		return fmt.Errorf("unregister cluster: %w", err)
 	}
 	_ = sink.Emit(ctx, progress.PhaseCompleted{

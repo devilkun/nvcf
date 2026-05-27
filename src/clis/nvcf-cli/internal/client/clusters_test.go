@@ -270,17 +270,35 @@ func TestListClusters(t *testing.T) {
 }
 
 func TestDeleteCluster(t *testing.T) {
-	t.Run("sends correct request", func(t *testing.T) {
+	t.Run("uses account-scoped endpoint", func(t *testing.T) {
+		var receivedPath string
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedPath = r.URL.Path
 			assert.Equal(t, "DELETE", r.Method)
-			assert.Contains(t, r.URL.Path, "/v1/nvca/clusters/cl-delete")
 			w.WriteHeader(http.StatusNoContent)
 		}))
 		defer server.Close()
 
 		c := newTestClient(server.Client())
-		err := c.DeleteCluster(context.Background(), server.URL, "cl-delete")
+		err := c.DeleteCluster(context.Background(), server.URL, "nca-test", "cl-delete")
 		assert.NoError(t, err)
+		// SIS rejects /v1/nvca/clusters/{id} with 404; the canonical route is
+		// the account-scoped DELETE /v1/accounts/{ncaId}/clusters/{clusterId}.
+		assert.Equal(t, "/v1/accounts/nca-test/clusters/cl-delete", receivedPath)
+	})
+
+	t.Run("escapes path segments", func(t *testing.T) {
+		var receivedEscapedPath string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedEscapedPath = r.URL.EscapedPath()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+
+		c := newTestClient(server.Client())
+		err := c.DeleteCluster(context.Background(), server.URL, "nca/with/slash", "cl id")
+		assert.NoError(t, err)
+		assert.Equal(t, "/v1/accounts/nca%2Fwith%2Fslash/clusters/cl%20id", receivedEscapedPath)
 	})
 
 	t.Run("handles error response", func(t *testing.T) {
@@ -291,7 +309,7 @@ func TestDeleteCluster(t *testing.T) {
 		defer server.Close()
 
 		c := newTestClient(server.Client())
-		err := c.DeleteCluster(context.Background(), server.URL, "cl-missing")
+		err := c.DeleteCluster(context.Background(), server.URL, "nca-test", "cl-missing")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "SIS API error 404")
 	})
@@ -305,7 +323,7 @@ func TestDeleteCluster(t *testing.T) {
 		defer server.Close()
 
 		c := newTestClient(server.Client())
-		err := c.DeleteCluster(context.Background(), server.URL, "cl-host-test")
+		err := c.DeleteCluster(context.Background(), server.URL, "nca-test", "cl-host-test")
 		assert.NoError(t, err)
 		assert.NotEmpty(t, receivedHost)
 	})

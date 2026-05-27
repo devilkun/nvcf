@@ -27,7 +27,7 @@ navigation:
       - section: Standalone Deployment
         skip-slug: true
         contents:
-          - page: Overview
+          - page: Standalone Deployment Overview
             path: ../../docs/user/standalone-deployment.md
           - page: Prerequisites
             path: ../../docs/user/standalone-prerequisites.md
@@ -124,8 +124,23 @@ navigation:
         path: ../../docs/user/helm-functions.md
       - page: Streaming Functions
         path: ../../docs/user/streaming-functions.md
+      - page: Configure Autoscaling
+        path: ../../docs/user/configure-autoscaling.md
       - page: CLI
         path: ../../docs/user/cli.md
+
+  - section: Function Autoscaling
+    skip-slug: true
+    contents:
+      - page: Function Autoscaling Overview
+        path: ../../docs/user/autoscaling/index.md
+      - page: Architecture
+        path: ../../docs/user/autoscaling/architecture.md
+      - page: Operations
+        path: ../../docs/user/autoscaling/operations.md
+      - page: Observability
+        path: ../../docs/user/autoscaling/observability.md
+        slug: autoscaler-observability
 
   - section: Observability
     skip-slug: true
@@ -137,7 +152,7 @@ navigation:
       - section: Metrics
         skip-slug: true
         contents:
-          - page: Overview
+          - page: Metrics Overview
             path: ../../docs/user/metrics/metrics-index.md
           - page: Cassandra
             path: ../../docs/user/metrics/cassandra/metrics.md

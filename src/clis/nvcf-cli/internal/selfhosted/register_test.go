@@ -201,6 +201,37 @@ func TestClusterClientAdapter_RegisterExistingUpdatesJWKS(t *testing.T) {
 	assert.Equal(t, "https://issuer.example.com", *gotUpdate.OIDCIssuer)
 }
 
+// TestClusterClientAdapter_DeleteCluster_EmptyClientIDFailsLoud verifies that
+// an unset NCA ID is rejected up front. Without the guard, SIS would answer
+// 404 for /v1/accounts//clusters/{id} and clusterDeleteNotFound would treat
+// that as "already gone", leaving the row live while the caller sees success.
+func TestClusterClientAdapter_DeleteCluster_EmptyClientIDFailsLoud(t *testing.T) {
+	var requested bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = true
+		t.Fatalf("adapter should not issue a request when ClientID is empty (got %s %s)", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+
+	cfg := &client.Config{
+		AuthType:       client.AuthTypeBearer,
+		Token:          "admin-token",
+		ClientID:       "",
+		BaseHTTPURL:    server.URL,
+		BaseGRPCURL:    "localhost:1",
+		DefaultTimeout: time.Second,
+	}
+	inner, err := client.NewClient(cfg)
+	require.NoError(t, err)
+	defer inner.Close()
+
+	adapter := &clusterClientAdapter{inner: inner, sisURL: server.URL, cfg: cfg}
+	err = adapter.DeleteCluster(context.Background(), "cl-zombie")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "NCA ID")
+	assert.False(t, requested, "no HTTP request should be issued when ClientID is empty")
+}
+
 // TestLoadKubeConfigFn_SeamIsReplaceable verifies that loadKubeConfigFn is a
 // package-level variable that callers can replace in tests without touching a
 // real kubeconfig file.

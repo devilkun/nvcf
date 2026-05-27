@@ -226,7 +226,7 @@ func (a *clusterClientAdapter) DeleteClusterByName(ctx context.Context, ncaID, n
 		if cl.ClusterID == "" {
 			return deleted, fmt.Errorf("cluster %q has empty cluster ID", name)
 		}
-		if err := a.inner.DeleteCluster(ctx, a.sisURL, cl.ClusterID); err != nil {
+		if err := a.inner.DeleteCluster(ctx, a.sisURL, ncaID, cl.ClusterID); err != nil {
 			if clusterDeleteNotFound(err) {
 				continue
 			}
@@ -241,7 +241,17 @@ func (a *clusterClientAdapter) DeleteCluster(ctx context.Context, clusterID stri
 	if clusterID == "" {
 		return nil
 	}
-	if err := a.inner.DeleteCluster(ctx, a.sisURL, clusterID); err != nil {
+	// Reject empty NCA ID up front. An empty ClientID would build
+	// /v1/accounts//clusters/{id}, which SIS answers with 404, and
+	// clusterDeleteNotFound would then swallow that as "already gone"
+	// while the row is still live.
+	if a.cfg.ClientID == "" {
+		return fmt.Errorf("delete cluster %s: NCA ID (ClientID) is not configured", clusterID)
+	}
+	// The adapter routes DeleteCluster through the account-scoped SIS endpoint
+	// using cfg.ClientID as the NCA ID. Callers that need a different account
+	// (multi-tenant install scenarios) should add a ncaID arg to ClusterClient.
+	if err := a.inner.DeleteCluster(ctx, a.sisURL, a.cfg.ClientID, clusterID); err != nil {
 		if clusterDeleteNotFound(err) {
 			return nil
 		}

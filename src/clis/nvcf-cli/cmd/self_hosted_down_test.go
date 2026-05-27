@@ -218,7 +218,7 @@ type fakeClusterDeleter struct {
 	deletedIDs  []string
 }
 
-func (f *fakeClusterDeleter) DeleteCluster(_ context.Context, _, clusterID string) error {
+func (f *fakeClusterDeleter) DeleteCluster(_ context.Context, _, _, clusterID string) error {
 	f.deleteCalls++
 	f.deletedIDs = append(f.deletedIDs, clusterID)
 	return f.deleteErr

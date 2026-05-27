@@ -107,10 +107,12 @@ func initClusterRegistrationCmds() {
 	_ = clusterRotateCmd.MarkFlagRequired(clusterFlagClusterID)
 
 	clusterDeleteCmd.Flags().String(clusterFlagClusterID, "", "Cluster UUID (required)")
+	clusterDeleteCmd.Flags().String(clusterFlagNcaID, "", "NCA/tenant ID (required)")
 	clusterDeleteCmd.Flags().Bool("force", false, "Skip confirmation prompt")
 	clusterDeleteCmd.Flags().Bool("ignore-missing", false, "Exit 0 when the cluster row is already gone (useful for `down` re-runs)")
 	addClusterICMSURLFlags(clusterDeleteCmd)
 	_ = clusterDeleteCmd.MarkFlagRequired(clusterFlagClusterID)
+	_ = clusterDeleteCmd.MarkFlagRequired(clusterFlagNcaID)
 }
 
 func addClusterICMSURLFlags(cmd *cobra.Command) {
@@ -708,6 +710,7 @@ func runClusterRotate(cmd *cobra.Command, args []string) error {
 
 func runClusterDelete(cmd *cobra.Command, args []string) error {
 	clusterID, _ := cmd.Flags().GetString(clusterFlagClusterID)
+	ncaID, _ := cmd.Flags().GetString(clusterFlagNcaID)
 	force, _ := cmd.Flags().GetBool("force")
 	ignoreMissing, _ := cmd.Flags().GetBool("ignore-missing")
 
@@ -744,7 +747,7 @@ func runClusterDelete(cmd *cobra.Command, args []string) error {
 
 	logging.Info("Deleting cluster '%s' from ICMS at %s...", clusterID, icmsURL)
 
-	if err := c.DeleteCluster(ctx, icmsURL, clusterID); err != nil {
+	if err := c.DeleteCluster(ctx, icmsURL, ncaID, clusterID); err != nil {
 		// --ignore-missing: 404 → silent 0-exit; other errors still bubble up.
 		// Heuristic: ICMS DeleteCluster returns errors that wrap "not found"
 		// or "404" in their message when the row is already gone.

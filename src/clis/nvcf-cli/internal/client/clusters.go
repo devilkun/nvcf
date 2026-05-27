@@ -143,9 +143,12 @@ func (c *Client) ListClusters(ctx context.Context, sisURL, ncaID string) ([]SISC
 	return result, nil
 }
 
-// DeleteCluster deletes a cluster registration from SIS
-func (c *Client) DeleteCluster(ctx context.Context, sisURL, clusterID string) error {
-	endpoint := fmt.Sprintf("/v1/nvca/clusters/%s", url.PathEscape(clusterID))
+// DeleteCluster deletes a cluster registration from SIS using the
+// account-scoped endpoint DELETE /v1/accounts/{ncaId}/clusters/{clusterId}.
+// The legacy /v1/nvca/clusters/{clusterId} route is not a valid SIS path and
+// returns 404.
+func (c *Client) DeleteCluster(ctx context.Context, sisURL, ncaID, clusterID string) error {
+	endpoint := fmt.Sprintf("/v1/accounts/%s/clusters/%s", url.PathEscape(ncaID), url.PathEscape(clusterID))
 
 	resp, err := c.makeSISRequest(ctx, "DELETE", sisURL, endpoint, nil)
 	if err != nil {
