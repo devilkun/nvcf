@@ -87,6 +87,7 @@ go_test(
         "rate_limit_accounting_test.go",
         "responses_handler_test.go",
         "session_affinity_test.go",
+        "token_count_test.go",
     ],
     embed = [":api"],
     deps = [

@@ -61,6 +61,7 @@ alias(
 go_test(
     name = "telemetry_test",
     srcs = [
+        "auth_metrics_test.go",
         "metrics_test.go",
         "olric_collector_test.go",
     ],

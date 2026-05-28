@@ -20,6 +20,7 @@ package telemetry
 import (
 	"context"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -84,6 +85,9 @@ func InitializeMetrics() {
 	_ = RateLimitSynchronizerQueueWait()
 	_ = RateLimitSynchronizerQueueLength()
 	_ = RateLimitSynchronizerEventsDropped()
+	_ = authRequestsTotal()
+	_ = authRequestDuration()
+	preInitAuthMetrics()
 }
 
 func Add(
@@ -334,6 +338,111 @@ func RateLimitSynchronizerEventsDropped() otelmetric.Int64Counter {
 		metricPrefix+"rate_limit_synchronizer_events_dropped_total",
 		otelmetric.WithDescription("Number of rate limit events dropped before publishing."),
 	))
+}
+
+// canonicalGRPCStatuses is the bounded set of gRPC status names the auth
+// metrics will tag. The 17 entries are the standard gRPC codes; "Other" is
+// the fallback bucket for any non-canonical status returned by
+// status.Code(err).String() (for example "Code(42)" when an upstream
+// produces an out-of-range code). canonicalGRPCStatus() clamps unknown
+// inputs into this set so label cardinality stays bounded.
+var canonicalGRPCStatuses = map[string]struct{}{
+	"OK":                 {},
+	"Canceled":           {},
+	"Unknown":            {},
+	"InvalidArgument":    {},
+	"DeadlineExceeded":   {},
+	"NotFound":           {},
+	"AlreadyExists":      {},
+	"PermissionDenied":   {},
+	"ResourceExhausted":  {},
+	"FailedPrecondition": {},
+	"Aborted":            {},
+	"OutOfRange":         {},
+	"Unimplemented":      {},
+	"Internal":           {},
+	"Unavailable":        {},
+	"DataLoss":           {},
+	"Unauthenticated":    {},
+	"Other":              {},
+}
+
+// canonicalGRPCStatus returns the input if it names a standard gRPC status,
+// otherwise "Other". status.Code(err).String() yields "Code(<n>)" for any
+// non-canonical code; clamping prevents the auth metrics from growing an
+// unbounded label set when an upstream returns an unexpected status.
+func canonicalGRPCStatus(grpcCode string) string {
+	if _, ok := canonicalGRPCStatuses[grpcCode]; ok {
+		return grpcCode
+	}
+	return "Other"
+}
+
+// authResultLabel returns the result attribute used on auth metrics:
+// "ok" for codes.OK, "error" otherwise.
+func authResultLabel(grpcCode string) string {
+	if grpcCode == "OK" {
+		return "ok"
+	}
+	return "error"
+}
+
+// authRequestsTotal counts AuthLlmInvocation gRPC calls from the gateway to
+// NVCF API, labelled by result (ok|error) and the gRPC status code string.
+// Used for the auth error-rate alert (NVCFSRE-6851 AC1). Unexported so the
+// only emission path is RecordAuthInvocation, which clamps grpc_status.
+func authRequestsTotal() otelmetric.Int64Counter {
+	return must.Get(Meter().Int64Counter(
+		metricPrefix+"auth_requests_total",
+		otelmetric.WithDescription("Total AuthLlmInvocation gRPC calls from the gateway to NVCF API."),
+	))
+}
+
+// authRequestDuration records latency of AuthLlmInvocation gRPC calls from the
+// gateway to NVCF API, labelled by result. Buckets reuse the project default
+// (DurationBuckets) which already covers the 100ms p99 alert threshold from
+// NVCFSRE-6851 AC2. Unexported so the only emission path is
+// RecordAuthInvocation.
+func authRequestDuration() otelmetric.Float64Histogram {
+	return must.Get(Meter().Float64Histogram(
+		metricPrefix+"auth_request_duration_seconds",
+		otelmetric.WithUnit("s"),
+		otelmetric.WithDescription("Duration of AuthLlmInvocation gRPC calls from the gateway to NVCF API."),
+		otelmetric.WithExplicitBucketBoundaries(DurationBuckets...),
+	))
+}
+
+// RecordAuthInvocation emits the auth-path metrics for a single
+// AuthLlmInvocation call. grpcCode is the string form of the call's gRPC
+// status code (typically status.Code(err).String()). Non-canonical codes are
+// clamped via canonicalGRPCStatus to keep label cardinality bounded.
+func RecordAuthInvocation(ctx context.Context, elapsed time.Duration, grpcCode string) {
+	code := canonicalGRPCStatus(grpcCode)
+	result := authResultLabel(code)
+	authRequestsTotal().Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String("result", result),
+		attribute.String("grpc_status", code),
+	))
+	authRequestDuration().Record(ctx, elapsed.Seconds(), otelmetric.WithAttributes(
+		attribute.String("result", result),
+	))
+}
+
+// preInitAuthMetrics emits a zero sample for every entry in
+// canonicalGRPCStatuses (the 17 standard gRPC codes plus the "Other"
+// fallback) so PromQL absent() and rate() work on the very first scrape.
+// Required by the umbrella's observability rules.
+func preInitAuthMetrics() {
+	ctx := context.Background()
+	counter := authRequestsTotal()
+	for code := range canonicalGRPCStatuses {
+		counter.Add(ctx, 0,
+			otelmetric.WithAttributes(
+				attribute.String("result", authResultLabel(code)),
+				attribute.String("grpc_status", code),
+			),
+		)
+	}
 }
 
 func DropReasonSameCluster() attribute.KeyValue {

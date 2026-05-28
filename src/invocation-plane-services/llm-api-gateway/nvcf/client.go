@@ -32,8 +32,11 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	llmgatewaypb "github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/nvcf/pb"
+
+	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 const (
@@ -177,10 +180,12 @@ func (c *GRPCClient) AuthorizeInvocation(
 			)
 		}
 	}
+	start := time.Now()
 	resp, err := c.client.AuthLlmInvocation(callCtx, &llmgatewaypb.AuthLlmInvokeRequest{
 		ClientAuthorizationToken: clientAuthorizationToken,
 		RoutingKey:               functionID,
 	})
+	telemetry.RecordAuthInvocation(ctx, time.Since(start), status.Code(err).String())
 	if err != nil {
 		return nil, err
 	}
