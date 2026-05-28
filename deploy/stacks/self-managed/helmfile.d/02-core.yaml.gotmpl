@@ -121,7 +121,7 @@ releases:
 
   - name: reval
     chart: nvcf/helm-reval
-    version: 1.3.7
+    version: 1.3.8
     namespace: nvcf
     values:
       - ../global.yaml.gotmpl
@@ -179,7 +179,7 @@ releases:
   # --- Gateway API Ingress ---
   - name: ingress
     chart: nvcf/nvcf-gateway-routes
-    version: 1.12.0-nvcf-10204.1
+    version: 1.13.0
     needs:
       - nvcf/notary-service
       - api-keys/api-keys

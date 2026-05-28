@@ -25,7 +25,7 @@ nats:
     image:
       registry: docker.io
       repository: synadia/nats-server
-      tag: 2.11.10-alpine3.22
+      tag: 2.11.17-alpine3.22
       pullPolicy: IfNotPresent
     env:
       NKEY_USER_KEY:
@@ -66,7 +66,7 @@ nats:
     image:
       registry: docker.io
       repository: natsio/nats-server-config-reloader
-      tag: 0.20.0
+      tag: 0.23.0
       pullPolicy: IfNotPresent
   natsBox:
     enabled: true
