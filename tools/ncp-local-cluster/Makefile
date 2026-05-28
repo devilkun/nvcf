@@ -525,7 +525,7 @@ uninstall-kube-state-metrics: ## Uninstall kube-state-metrics from the cluster
 	@echo "OK Kube-state-metrics uninstalled"
 
 # -- Main composite target --
-build-and-deploy-cluster: ensure-docker-config clean build start deploy-csi-smb wait-for-csi-smb deploy-fake-gpu-operator wait-for-fake-gpu-operator validate-deployment cleanup-sample setup-gateway-api check-gateway-api validate-gateway
+build-and-deploy-cluster: ensure-docker-config clean build start deploy-csi-smb wait-for-csi-smb deploy-fake-gpu-operator wait-for-fake-gpu-operator setup-gateway-api check-gateway-api validate-gateway validate-deployment cleanup-sample
 	@echo "========== COMPLETED =========="
 	@echo "Cluster $(CLUSTER_NAME) is up and ready to use."
 	@echo "OK Context is k3d-$(CLUSTER_NAME)"

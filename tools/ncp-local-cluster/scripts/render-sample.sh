@@ -58,9 +58,14 @@ if [ -n "${SAMPLE_IMAGE:-}" ]; then
 else
   if [ "$sample_org" = "ngc-org" ] || [ "$sample_team" = "ngc-team" ]; then
     echo "ERROR: replace the sample image NGC placeholders before deploying." >&2
-    echo "Set SAMPLE_NGC_ORG and SAMPLE_NGC_TEAM, for example:" >&2
+    echo "Set SAMPLE_NGC_ORG and SAMPLE_NGC_TEAM to an NGC org and team" >&2
+    echo "that your NGC API key can pull from, for example:" >&2
     echo "  SAMPLE_NGC_ORG=my-org SAMPLE_NGC_TEAM=my-team make deploy-sample" >&2
     echo "Or set SAMPLE_IMAGE to a full image path for another registry." >&2
+    echo "" >&2
+    echo "This step validates that the kubelet credential provider can pull" >&2
+    echo "private images from nvcr.io. It is optional for the self-managed" >&2
+    echo "stack install; the cluster is usable without it." >&2
     exit 1
   fi
   sample_image="${sample_registry}/${sample_org}/${sample_team}/${sample_name}"
