@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "cli",
+    srcs = ["cli.go"],
+    importpath = "github.com/NVIDIA/nvcf/src/compute-plane-services/byoo-otel-collector/internal/cli",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/logger",
+        "//internal/metrics",
+        "//internal/otelcollector",
+        "//internal/otelconfig",
+        "//internal/secrets",
+        "@com_github_spf13_cobra//:cobra",
+        "@com_github_spf13_pflag//:pflag",
+    ],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":cli",
+    visibility = ["//:__subpackages__"],
+)

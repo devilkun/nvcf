@@ -2,6 +2,87 @@
 
 # BYO Observability OpenTelemetry Collector
 
+## Build with Bazel
+
+100% Bazel build and image publish. The legacy `docker-build-push`
+jobs from the `cds-components/docker-build-push` template are
+disabled in `.gitlab-ci.yml`; the Bazel lanes below are the single
+source of truth for upstream CI image build and publish.
+
+```shell
+# Build the wrapper Go binary.
+bazel build //cmd/byoo-otel-collector:byoo-otel-collector
+
+# Build the collector binary (genrule-wrapped `go build` against the
+# checked-in otelcol/ module; see Why below).
+bazel build //otelcol:otelcol-contrib-bin
+
+# Build the two multi-arch OCI images.
+bazel build //:byoo-otel-collector-image_index
+bazel build //:nvcf-otel-collector-image
+
+# Run unit tests with auto-retry on timing-sensitive failures.
+bazel test //cmd/byoo-otel-collector/... //internal/... --flaky_test_attempts=3
+
+# Push to internal NGC registries (CI runs this on default-branch and
+# tag pipelines). DOCKER_CONFIG must point at a docker config.json
+# containing the right NGC token for each target.
+bazel run //nvidia-internal:image_push_byoo_nv_cf_prd
+bazel run //nvidia-internal:image_push_byoo_ncp_dev
+bazel run //nvidia-internal:image_push_nvcf_otel_collector_nv_cf_prd
+bazel run //nvidia-internal:image_push_nvcf_otel_collector_ncp_dev
+```
+
+### Regenerating the collector source tree
+
+`otelcol/` is the output of the OpenTelemetry Collector Builder
+(`ocb`) applied to `otel-collector-build.yaml`. It is checked in to
+give reviewers a real diff on OpenTelemetry version bumps -- the
+same generated-and-committed pattern the upstream OpenTelemetry
+ecosystem uses. The `dist.module` field in `otel-collector-build.yaml`
+pins the generated module's identity so the diff stays clean across
+regenerations.
+
+```shell
+# For a coordinated OpenTelemetry Collector version bump across all
+# `gomod:` entries, use the dedicated upgrade helper which edits the
+# YAML and then regenerates otelcol/ in one pass.
+./scripts/update-collector-version.sh
+
+# For ad-hoc edits (adding or removing components without changing
+# the OpenTelemetry release line), edit otel-collector-build.yaml
+# directly and then re-run the regenerator.
+./scripts/regenerate-otelcol.sh
+
+# Drift detector. CI runs this on every MR to fail when
+# otel-collector-build.yaml has been edited without regenerating
+# otelcol/.
+./tools/ci/check-otelcol-generated
+```
+
+### Why the collector binary uses a genrule rather than go_binary
+
+`//otelcol:otelcol-contrib-bin` is a `genrule` that shells out to
+`go build` against the checked-in `otelcol/` module (see
+`otelcol/BUILD.bazel` for the full rationale). The collector's
+transitive dep graph (>250 Go modules) includes packages
+(`github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes`
+and several internal contrib helpers) whose Gazelle-generated
+`BUILD.bazel` files reference `@rules_go` from a resolution context
+where it is not visible. The fix -- per-module
+`go_deps.gazelle_override` declarations in `MODULE.bazel` -- is
+undefined-timeline work without a clean upstream precedent in the
+OpenTelemetry Bazel community. The genrule trades Bazel's per-package
+dep tracking for forward progress: the binary lives inside Bazel's
+output graph and flows through to `oci_image` + `oci_push` cleanly.
+
+Cache contract: Bazel rebuilds the genrule when any input
+(`otelcol/**/*.go`, `go.mod`, `go.sum`) changes. The genrule uses
+`local = True` + `tags = ["no-sandbox"]` so it can resolve `go` from
+`$PATH` and write to the standard Go module cache. The wrapper
+binary, in contrast, is a regular `go_binary` and benefits from full
+Bazel hermeticity + nvcfbarn remote-cache reuse.
+
 A containerized Go application that provides a complete observability solution by orchestrating three functional components: it generates OpenTelemetry Collector configurations, extracts and manages secrets from ESS (Encrypted Secret Store), and runs a custom-built OpenTelemetry Collector binary.
 
 The BYOO collector container handles receiving OTLP telemetry (logs, metrics, traces) from applications, collecting platform metrics, processing and exporting telemetry to various backends, with support for both Kubernetes and VM deployments.

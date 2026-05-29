@@ -23,14 +23,14 @@ case "$install_method" in
     ;;
 esac
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "${SCRIPT_DIR}/utils/utils.sh" ]; then
-    echo "Error: utils.sh not found in ${SCRIPT_DIR}/utils"
+if [ ! -f "${DEPLOY_SCRIPT_DIR}/utils/utils.sh" ]; then
+    echo "Error: utils.sh not found in ${DEPLOY_SCRIPT_DIR}/utils"
     exit 1
 fi
 
-source "$SCRIPT_DIR/utils/utils.sh"
+source "$DEPLOY_SCRIPT_DIR/utils/utils.sh"
 
 if ! check_kubernetes; then
     log_error "kubernetes check failed"
@@ -43,12 +43,13 @@ if ! check_helm; then
 fi
 
 if [ "${install_method}" = "$INSTALL_METHOD_HELM" ]; then
-    log_info "Installing jwker for helm deployment..."
-    if ! "${SCRIPT_DIR}/install_deps.sh"; then
-        log_error "Failed to install jwker"
+    log_info "Checking jwker availability for helm deployment..."
+    jwker_path="$(command -v jwker)"
+    if [ -z "$jwker_path" ]; then
+        log_error "jwker is not available in the init image. Use an nvcf-openbao-migrations image that includes jwker."
         exit 1
     fi
-    log_success "Successfully installed jwker"
+    log_success "jwker available at $jwker_path"
 fi
 
 # Helper function to get root token

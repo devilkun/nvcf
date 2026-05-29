@@ -10,6 +10,8 @@ This repository ships:
 - The job entrypoint (`entrypoint.sh`)
 - Numbered shell migrations under `migrations/` that run in order against an OpenBao leader
 - Helper utilities under `migrations/utils/`
+- The `jwker` CLI used by the install pipeline to convert Kubernetes JWKS material to PEM
+- Verified `jwker` and `kubectl` binaries copied from downloader stages
 - Optional addons under `addons/` (e.g., LLS / TURN secret rotation)
 - An example Kubernetes Job manifest (`job.yaml`)
 
@@ -39,6 +41,7 @@ The shipped `job.yaml` sets a default placeholder value for this variable so the
 ## Building the container
 
 The `Dockerfile` uses the public upstream OpenBao image (`openbao/openbao:2.5.1`) as the base. To use a different base, edit the `FROM` line directly.
+`kubectl` defaults to `v1.31.0`; pass `KUBECTL_VERSION` only when intentionally changing that pinned version.
 
 ```bash
 docker build \

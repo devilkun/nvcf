@@ -19,6 +19,7 @@
 # - bash
 # - kubectl
 # - jq
+# - jwker
 {{- $serverFullname := include "nvcf-openbao.serverFullname" . }}
 apiVersion: batch/v1
 kind: Job
@@ -107,5 +108,3 @@ data:
     {{- .Files.Get "scripts/utils.sh" | nindent 4 }}
   log.sh: |-
     {{- .Files.Get "scripts/log.sh" | nindent 4 }}
-  install_deps.sh: |-
-    {{- .Files.Get "scripts/install_deps.sh" | nindent 4 }}
