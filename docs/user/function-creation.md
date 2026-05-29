@@ -17,90 +17,18 @@ Functions can be created in one of two ways:
 
 Additionally, Cloud Functions supports [Low Latency Streaming (LLS) functions](./streaming-functions.md) for video, audio, and data streaming via WebRTC.
 
-## LLM Functions
+For LLM functions, see [LLM Gateway](./llm-gateway.md#function-configuration) for OpenAI-compatible model route configuration.
 
-Use an LLM function when requests should enter through the LLM invocation
-gateway and NVCF should route them by function and model. LLM functions use
-`functionType: "LLM"`, accept OpenAI-compatible request bodies, and define model
-routing metadata under `models[].llmConfig`.
+## Invocation Types
 
-For the full request path, supported endpoints, native proxy behavior, and session stickiness details, see [LLM Gateway](./llm-gateway.md).
-
-![LLM invocation path](images/nvcf-llm-invocation-path.svg)
-
-LLM requests must already be OpenAI-compatible when they reach the gateway. NVCF does not render Hugging Face chat templates or tokenize prompts for the function.
-
-```json
-{
-  "name": "sample-llm-function",
-  "containerImage": "nvcr.io/example/openai-compatible:latest",
-  "inferenceUrl": "/",
-  "inferencePort": 8000,
-  "functionType": "LLM",
-  "models": [
-    {
-      "name": "dummy-model",
-      "llmConfig": {
-        "uris": ["/v1/chat/completions", "/v1/responses", "/v1/embeddings"],
-        "routingMethod": "round_robin",
-        "tokenRateLimit": "1000-S"
-      }
-    }
-  ]
-}
-```
-
-The same configuration can be provided with CLI flags:
-
-```bash
-./nvcf-cli function create \
-  --name "sample-llm-function" \
-  --image "nvcr.io/example/openai-compatible:latest" \
-  --inference-url "/" \
-  --inference-port 8000 \
-  --function-type LLM \
-  --llm-model "name=dummy-model,uris=/v1/chat/completions|/v1/responses|/v1/embeddings,routingMethod=round_robin,tokenRateLimit=1000-S"
-```
-
-`llmConfig.uris` lists the OpenAI-compatible paths handled by the model. Supported LLM paths are `/v1/chat/completions`, `/v1/responses`, and `/v1/embeddings`. `routingMethod` accepts `round_robin`, `power_of_two`, `groq_multiregion`, `pulsar`, or `random`. `tokenRateLimit` applies a per-model token limit in `<value>-<unit>` format. Supported units are `S` (seconds), `M` (minutes), `H` (hours), `D` (days), and `W` (weeks). Use `1000-S` for a single limit, or `1000-S,5000-M,100000-H,500000-D,1000000-W` for a combined limit with distinct units. Use JSON input for combined limits because inline CLI model specs use commas as field separators.
-
-After creation, update per-model `routingMethod` or `tokenRateLimit` with `nvcf-cli function update --llm-model-update "name=<model>,routingMethod=<method>,tokenRateLimit=<limit>"` or JSON `modelUpdates`.
-
-Note: LLM functions do not use the normal function invocation hostname or path.
-Send requests to the LLM invocation route, such as `https://llm.invocation.<domain>/v1/chat/completions`, and set `model` to `<function-id>/<model-name>`.
-The CLI `function invoke` command detects LLM functions automatically. Pass `--inference-url` with the OpenAI-compatible path and `--model-name <model-name>` so the CLI can set the OpenAI `model` value to `<function-id>/<model-name>`.
-
-After deployment, invoke chat completions through the LLM invocation route:
-
-```bash
-curl -sS -X POST "https://llm.invocation.<domain>/v1/chat/completions" \
-  -H "Authorization: Bearer ${NVCF_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "<function-id>/dummy-model",
-    "stream": true,
-    "messages": [
-      {
-        "role": "user",
-        "content": "Write a one sentence summary of NVCF."
-      }
-    ]
-  }'
-```
-
-The OpenAI `model` value uses the format `<function-id>/<model-name>` so the gateway can select the target function and model.
-
-Embeddings use the same model format:
-
-```bash
-curl -sS -X POST "https://llm.invocation.<domain>/v1/embeddings" \
-  -H "Authorization: Bearer ${NVCF_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "<function-id>/dummy-model",
-    "input": "NVCF embeddings check"
-  }'
-```
+- [Generic HTTP function invocation](./generic-http-function-invocation.md):
+  Invoke HTTP functions through the standard invocation route.
+- [gRPC function invocation](./grpc-function-invocation.md): Invoke gRPC
+  functions through the Gateway TCP listener.
+- [LLM invocation](./llm-gateway.md#endpoint-behavior): Invoke
+  OpenAI-compatible LLM functions through `llm.invocation.<domain>`.
+- [LLS/WebRTC client connection](./streaming-functions.md#connecting-to-a-streaming-function-with-a-client):
+  Connect browser or proxy clients to streaming functions.
 
 ## Best Practices
 
