@@ -109,6 +109,7 @@ func TestLoadRejectsInvalidRequiredValues(t *testing.T) {
 		{name: "prefix with separator", env: map[string]string{EnvSourceDir: "/records", EnvBackend: "objectstore", EnvSegmentPrefix: "nested/prefix"}},
 		{name: "http objectstore endpoint", env: map[string]string{EnvSourceDir: "/records", EnvBackend: "objectstore", EnvObjectStoreEndpoint: "http://minio.internal:9000"}},
 		{name: "schemeless objectstore endpoint", env: map[string]string{EnvSourceDir: "/records", EnvBackend: "objectstore", EnvObjectStoreEndpoint: "minio.internal:9000"}},
+		{name: "hostless objectstore endpoint", env: map[string]string{EnvSourceDir: "/records", EnvBackend: "objectstore", EnvObjectStoreEndpoint: "https://"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -130,6 +131,36 @@ func TestLoadAcceptsAnHTTPSObjectStoreEndpoint(t *testing.T) {
 	}
 	if cfg.ObjectStore.Endpoint != "https://minio.internal:9000" {
 		t.Fatalf("endpoint = %q, want the configured https endpoint", cfg.ObjectStore.Endpoint)
+	}
+}
+
+func TestLoadParsesObjectStoreDryRun(t *testing.T) {
+	cfg, _, err := Load(testLookup(map[string]string{
+		EnvSourceDir:         "/records",
+		EnvBackend:           "objectstore",
+		EnvObjectStoreDryRun: "true",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.ObjectStore.DryRun {
+		t.Fatal("ObjectStore.DryRun = false, want true")
+	}
+}
+
+func TestLoadDefaultsObjectStoreDryRunToFalse(t *testing.T) {
+	cfg, warnings, err := Load(testLookup(map[string]string{
+		EnvSourceDir: "/records",
+		EnvBackend:   "objectstore",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", warnings)
+	}
+	if cfg.ObjectStore.DryRun {
+		t.Fatal("ObjectStore.DryRun = true, want false by default")
 	}
 }
 
