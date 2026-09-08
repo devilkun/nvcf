@@ -8,6 +8,12 @@ navigation:
   - page: Quickstart
     path: ../../docs/user/quickstart.md
 
+  - section: Release Notes
+    skip-slug: true
+    contents:
+      - page: Release Notes Overview
+        path: ../../docs/user/release-notes/index.md
+
   - section: Before You Deploy
     skip-slug: true
     contents:
@@ -25,19 +31,10 @@ navigation:
         path: ../../docs/user/image-mirroring.md
       - page: Helmfile Installation
         path: ../../docs/user/helmfile-installation.md
-      - section: Standalone Deployment
-        skip-slug: true
-        contents:
-          - page: Standalone Deployment Overview
-            path: ../../docs/user/standalone-deployment.md
-          - page: Prerequisites
-            path: ../../docs/user/standalone-prerequisites.md
-          - page: Infrastructure
-            path: ../../docs/user/standalone-infrastructure.md
-          - page: Core Services
-            path: ../../docs/user/standalone-core-services.md
-          - page: Gateway
-            path: ../../docs/user/standalone-gateway.md
+      - page: gRPC Invocation Enablement
+        path: ../../docs/user/grpc-invocation-enablement.md
+      - page: CSP End-to-End Example
+        path: ../../docs/user/csp-end-to-end-example-installation.md
 
   - section: GPU Cluster Setup
     skip-slug: true
@@ -46,14 +43,22 @@ navigation:
         path: ../../docs/user/cluster-management/index.md
       - page: Self-Managed Clusters
         path: ../../docs/user/cluster-management/self-managed.md
+      - page: Nsight Profiling
+        path: ../../docs/user/cluster-management/nsight-profiling.md
 
   - section: Configuration
     skip-slug: true
     contents:
+      - page: NVCF UI
+        path: ../../docs/user/nvcf-ui.md
       - page: Optional Enhancements
         path: ../../docs/user/optional-enhancements.md
+      - page: Pod Disruption Budgets
+        path: ../../docs/user/pod-disruption-budgets.md
       - page: LLM Function Enablement
         path: ../../docs/user/llm-function-enablement.md
+      - page: LLM Request Router Load Balancing
+        path: ../../docs/user/llm-request-router-load-balancing.md
       - page: Gateway Routing
         path: ../../docs/user/gateway-routing.md
       - page: Third-Party Registries
@@ -62,8 +67,14 @@ navigation:
         path: ../../docs/user/registry-allowlist.md
       - page: Cluster Configuration
         path: ../../docs/user/cluster-management/configuration.md
+      - page: Multi-Tenancy
+        path: ../../docs/user/cluster-management/multi-tenancy.md
       - page: KAI Scheduler
         path: ../../docs/user/cluster-management/kai-scheduler.md
+      - page: Gang Scheduling
+        path: ../../docs/user/cluster-management/gang-scheduling.md
+      - page: Topology-Aware Scheduling
+        path: ../../docs/user/cluster-management/topology-aware-scheduling.md
       - section: Low Latency Streaming
         skip-slug: true
         contents:
@@ -72,6 +83,8 @@ navigation:
       - section: NVCF Caches
         skip-slug: true
         contents:
+          - page: Helm Model Caching
+            path: ../../docs/user/cluster-management/model-cache.md
           - page: Container Cache
             path: ../../docs/user/cluster-management/container-cache.md
           - page: GXCache
@@ -127,6 +140,12 @@ navigation:
         path: ../../docs/user/configure-autoscaling.md
       - page: CLI
         path: ../../docs/user/cli.md
+      - page: Task Creation
+        path: ../../docs/user/task-creation.md
+      - page: Container-Based Task Creation
+        path: ../../docs/user/container-tasks.md
+      - page: Helm-Based Task Creation
+        path: ../../docs/user/helm-tasks.md
 
   - section: Function Autoscaling
     skip-slug: true
@@ -195,6 +214,8 @@ navigation:
         path: ../../docs/user/runbooks/index.md
       - page: Key Rotation
         path: ../../docs/user/runbooks/control-plane-key-rotation-mek.md
+      - page: Transport TLS Rotation
+        path: ../../docs/user/runbooks/transport-tls-rotation.md
       - section: Cache Runbooks
         skip-slug: true
         contents:
@@ -220,7 +241,8 @@ navigation:
             href: https://docs.omniverse.nvidia.com/ovcaches/ucc/3.0/runbooks/network-bandwidth-saturation.html
           - link: UCC Upstream S3 Connections
             href: https://docs.omniverse.nvidia.com/ovcaches/ucc/3.0/runbooks/upstream-s3-connections.html
-
+      - page: Quota Management
+        path: ../../docs/user/runbooks/update-nvcf-account-quota-limits.md
   - section: Reference
     skip-slug: true
     contents:
@@ -242,6 +264,8 @@ navigation:
     contents:
       - page: Architecture Overview
         path: ../../docs/dev/architecture.md
+      - page: Storage-Agnostic Cache Architecture
+        path: ../../docs/dev/sdd-storage-agnostic-cache-architecture.md
       - section: Local Development
         skip-slug: true
         contents:

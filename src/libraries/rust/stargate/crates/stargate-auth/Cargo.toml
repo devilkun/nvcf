@@ -28,8 +28,12 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+# `form` enables RequestBuilder::form for the client-credentials token POST.
+reqwest = { workspace = true, features = ["form"] }
 sonic-rs = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 tempfile = { workspace = true }

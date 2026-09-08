@@ -72,8 +72,17 @@ go test -run '^TestMultiClusterUp$' -timeout 60m -v
 NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   go test -run '^TestSingleClusterHelmfile$' -timeout 90m -v
 
+# Focused single-cluster Helmfile feature for the documented public Docker Hub
+# NATS reloader and API bootstrap Alpine Kubernetes utility image. The feature
+# installs the dependency group, ESS API, NATS auth callout, and API rather
+# than unrelated services. The broad cleanup mode
+# removes any stale single- or multi-cluster ncp-local topology first.
+BDD_CLEANUP_MODE=topology-multi \
+  NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
+  go test -run '^TestSingleClusterHelmfileUpstreamImages$' -timeout 90m -v
+
 # Multi-cluster Helmfile feature: control-plane install on
-# k3d-ncp-local-cp followed by register-cluster + install-nvca-operator
+# k3d-ncp-local-cp followed by compute-plane register-cluster + install
 # on k3d-ncp-local-compute-1. Same secrets as the single-cluster
 # Helmfile feature.
 NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
@@ -96,10 +105,12 @@ EKS_CONTEXT=<ctx> EKS_CLUSTER_NAME=<name> EKS_REGION=<region> \
   go test -run '^TestSingleClusterEKSHelmfile$' -timeout 120m -v
 
 # Multi-cluster EKS Helmfile feature: control plane on EKS_CONTEXT, then
-# register + NVCA + function smoke on a separate compute EKS cluster
-# (EKS_COMPUTE_CONTEXT). Uses HELMFILE_ENV=eks-bdd-multi to isolate its
-# environment, secrets, and CLI-config files from the single-cluster EKS
-# feature (eks-bdd).
+# register + NVCA + function and task execution on a separate compute EKS
+# cluster (EKS_COMPUTE_CONTEXT). The feature derives a nip.io wildcard domain
+# from the provisioned NLB so worker-facing Gateway hostnames resolve without
+# requiring a preconfigured DNS zone. The task smoke expects
+# task-simple-sample:local in the sample NGC repository unless
+# NVCT_BDD_TASK_IMAGE names another published image.
 EKS_CONTEXT=<cp-ctx> EKS_COMPUTE_CONTEXT=<compute-ctx> \
   EKS_COMPUTE_CLUSTER_NAME=<compute-name> EKS_REGION=<region> \
   NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
@@ -153,6 +164,29 @@ If a new step is genuinely needed:
   invocations resolve.
 - For the Helmfile feature: `NGC_API_KEY`, `SAMPLE_NGC_ORG`,
   `SAMPLE_NGC_TEAM` env vars set.
+- For the upstream-image feature: outbound cluster access to
+  `docker.io/natsio` and `docker.io/alpine`.
+
+The focused upstream-image feature also requires the gitignored
+`tools/ncp-local-cluster/secrets/docker-config.json` used by the kubelet
+credential-provider mount. Create it from a Docker config with valid NGC
+credentials before running:
+
+```sh
+mkdir -p tools/ncp-local-cluster/secrets
+cp "$HOME/.docker/config.json" \
+  tools/ncp-local-cluster/secrets/docker-config.json
+
+printf '%s' "$NGC_API_KEY" | \
+  HELM_REGISTRY_CONFIG="$PWD/tools/ncp-local-cluster/secrets/docker-config.json" \
+  helm registry login nvcr.io --username '$oauthtoken' --password-stdin
+```
+
+The feature supplies the same file to Helm through `HELM_REGISTRY_CONFIG` for
+the remaining private NGC charts. It is a durable local cluster prerequisite,
+not a suite-authored artifact: deleting it while k3d is running breaks the
+bind mount and can make Docker recreate the path as a directory. The NGC key
+must have pull access to `SAMPLE_NGC_ORG/SAMPLE_NGC_TEAM`.
 
 Live runs write every command's argv, stdout, and stderr to
 `tests/bdd/out/<run-id>/logs/` for post-mortem inspection.
@@ -172,8 +206,8 @@ the suite immediately.
 | Mode | What it destroys | Command equivalent |
 |------|------------------|--------------------|
 | unset (default) | Nothing | (no cleanup) |
-| `stack-single` | Stack-owned helm releases + namespaces on `k3d-ncp-local`; `out/*.yaml` artifacts | `tests/bdd/scripts/destroy-stack.sh single` |
-| `stack-multi` | Stack-owned releases on every `ncp-local-compute-*` then `ncp-local-cp`; `out/*.yaml` artifacts | `tests/bdd/scripts/destroy-stack.sh multi` |
+| `stack-single` | Stack-owned helm releases + namespaces on `k3d-ncp-local`; stack `out/` handoff yaml, Helmfile render trees, and compute registration values | `tests/bdd/scripts/destroy-stack.sh single` |
+| `stack-multi` | Stack-owned releases and namespaces on every `ncp-local-compute-*` then `ncp-local-cp` (including worker namespaces such as `nvca-operator` created on the control-plane cluster); same generated artifacts | `tests/bdd/scripts/destroy-stack.sh multi` |
 | `topology-single` | The `ncp-local` k3d cluster (and everything in it) | `make -C tools/ncp-local-cluster destroy CLUSTER_NAME=ncp-local` |
 | `topology-multi` | Every `ncp-local*` k3d cluster on the host | `make -C tools/ncp-local-cluster destroy-all-ncp-local` |
 
@@ -212,9 +246,13 @@ Governing rule:
   `envoy-gateway-system` installed by
   `tools/ncp-local-cluster/scripts/setup-gateway-api.sh`,
   `cert-manager`, the local fake GPU operator) are intentionally
-  off-limits and survive every stack cleanup. `out/*.yaml` handoff
-  files are removed so later `file ... should exist` assertions
-  cannot pass against stale artifacts.
+  off-limits and survive every stack cleanup. Generated stack
+  artifacts are removed so later `file ... should exist` assertions
+  cannot pass against stale files: root-level `out/*.yaml` handoff
+  files, Helmfile `--output-dir` render trees under each stack
+  `out/` directory, and compute registration values under
+  `deploy/stacks/nvcf-compute-plane/registration/`. Ad-hoc non-yaml
+  notes at the `out/` root are left in place.
 - For the nonlocal (EKS) cleanup script
   `tests/bdd/scripts/destroy-nonlocal-stack.sh`, the gateway
   ownership boundary is different: the EKS Helmfile feature

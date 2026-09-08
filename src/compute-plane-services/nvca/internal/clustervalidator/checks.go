@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -63,13 +64,61 @@ func checkPrerequisites(ctx context.Context, client kubernetes.Interface, state 
 	}
 	printInfo(log, fmt.Sprintf("  Total nodes: %s", state.TotalNodes))
 
+	// Report the container runtime(s) across nodes so operators can confirm
+	// runtime compatibility during pre-flight. Diagnostic only — it does not
+	// affect the verdict.
+	if err == nil && len(nodes.Items) > 0 {
+		state.ContainerRuntime = summarizeContainerRuntimes(nodes.Items)
+		printInfo(log, fmt.Sprintf("  Container runtime: %s", state.ContainerRuntime))
+	}
+
 	return nil
+}
+
+// summarizeContainerRuntimes returns a deterministic, human-readable summary of
+// the container runtime versions across nodes. When every node reports the same
+// runtime it returns just that value (e.g. "containerd://1.7.27"); for a
+// mixed-runtime cluster it lists each distinct runtime with its node count
+// (e.g. "containerd://1.7.27 (2), cri-o://1.30.0 (1)"). A node with an empty
+// ContainerRuntimeVersion is reported as "unknown".
+func summarizeContainerRuntimes(nodes []corev1.Node) string {
+	if len(nodes) == 0 {
+		return "unknown"
+	}
+
+	counts := make(map[string]int, len(nodes))
+	for i := range nodes {
+		runtime := nodes[i].Status.NodeInfo.ContainerRuntimeVersion
+		if runtime == "" {
+			runtime = "unknown"
+		}
+		counts[runtime]++
+	}
+
+	runtimes := make([]string, 0, len(counts))
+	for runtime := range counts {
+		runtimes = append(runtimes, runtime)
+	}
+	sort.Strings(runtimes)
+
+	if len(runtimes) == 1 {
+		return runtimes[0]
+	}
+
+	parts := make([]string, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		parts = append(parts, fmt.Sprintf("%s (%d)", runtime, counts[runtime]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // checkControlPlaneHealth verifies cluster health using three signals:
 //  1. /readyz — canonical API-server health (works on every distribution).
-//  2. Data-plane pods (coredns, kube-proxy) — Critical when missing; these
-//     run as workloads on every distribution and affect cluster networking.
+//  2. Data-plane capabilities — DNS resolution of kubernetes.default.svc
+//     and HTTPS routing to kubernetes.default.svc/readyz via the in-cluster
+//     ClusterIP. Both must succeed; pod-presence detection (CoreDNS vs
+//     kube-dns, kube-proxy vs Cilium vs OVN-Kubernetes vs k3s-embedded)
+//     is diagnostic only and does not affect the verdict.
 //  3. Control-plane pods (kube-apiserver, etcd, scheduler, controller-manager)
 //     — informational only. Visible on self-hosted, hidden on managed K8s
 //     (EKS, GKE, AKS) where the cloud provider runs them. /readyz already
@@ -104,34 +153,55 @@ func checkControlPlaneHealth(ctx context.Context, client kubernetes.Interface, s
 		podsHealthy = false
 	}
 
-	// ── 2. Data-plane pods — Critical if missing on any distribution ──
-	// k3s and rke2 embed kube-proxy in the server binary rather than running
-	// it as a DaemonSet pod, so skip the kube-proxy pod check on those
-	// distributions. coredns still runs as a workload on k3s/rke2 and is
-	// required regardless.
+	// ── 2. Data-plane capabilities ──
+	// Capability-based: probe what we actually depend on (DNS resolves,
+	// service-routing reaches the API ClusterIP) rather than pod-name
+	// patterns that vary per distribution. The pod-prefix detection
+	// (CoreDNS vs kube-dns; kube-proxy vs Cilium eBPF vs OVN-Kubernetes
+	// vs embedded-in-k3s) is kept only as a diagnostic line so the
+	// operator can see WHAT is implementing each capability, but the
+	// verdict comes from the capability probes themselves.
 	log.Info("")
-	log.Info("Cluster Service Pods (kube-system):")
-	dataPlanePods := []string{"coredns", "kube-proxy"}
-	if isEmbeddedKubeProxyDistro(state.K8sVersion) {
-		dataPlanePods = []string{"coredns"}
-		printInfo(log, "Detected k3s/rke2 — skipping kube-proxy pod check (embedded in server binary)")
+	log.Info("Data-Plane Capabilities:")
+
+	if probeDNSFn(ctx) {
+		printSuccess(log, "  DNS resolution: kubernetes.default.svc resolved")
+	} else {
+		printError(log, "  DNS resolution: failed to resolve kubernetes.default.svc")
+		podsHealthy = false
 	}
+
+	if probeAPIServiceIPFn(ctx) {
+		printSuccess(log, "  Service routing: kubernetes.default.svc reached via ClusterIP")
+	} else {
+		printError(log, "  Service routing: failed to reach kubernetes.default.svc")
+		podsHealthy = false
+	}
+
+	// ── 3. Pod-presence diagnostics (informational only) ──
 	pods, err := client.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		printError(log, fmt.Sprintf("Failed to list kube-system pods: %v", err))
-		podsHealthy = false
+		printWarning(log, fmt.Sprintf("Could not list kube-system pods for diagnostics: %v", err))
 	} else {
-		for _, prefix := range dataPlanePods {
-			count := countRunningPods(pods.Items, prefix)
-			if count > 0 {
-				printSuccess(log, fmt.Sprintf("  %s: %d instance(s) running", prefix, count))
-			} else {
-				printWarning(log, fmt.Sprintf("  %s: Not found or not running", prefix))
-				podsHealthy = false
-			}
+		log.Info("")
+		log.Info("Diagnostics (informational — does not affect verdict):")
+
+		if dnsProvider := detectDNSProvider(pods.Items); dnsProvider != "" {
+			printInfo(log, fmt.Sprintf("  DNS provider: %s", dnsProvider))
+		} else {
+			printInfo(log, "  DNS provider: not recognised (capability probe above is authoritative)")
+		}
+		if routingImpl := detectServiceRoutingImpl(state.K8sVersion, pods.Items); routingImpl != "" {
+			printInfo(log, fmt.Sprintf("  Service routing implementation: %s", routingImpl))
+		} else {
+			printInfo(log, "  Service routing implementation: not recognised "+
+				"(capability probe above is authoritative)")
 		}
 
-		// ── 3. Control-plane pods — diagnostic only ──
+		// Control-plane pods — diagnostic only, same as before. Tells the
+		// operator whether the control plane runs as visible workloads
+		// (self-hosted) or is hidden by a managed K8s provider (EKS, GKE,
+		// AKS). /readyz from block 1 is the authoritative health signal.
 		log.Info("")
 		log.Info("Control Plane Pods (kube-system) [diagnostic only]:")
 		controlPlanePods := []string{
@@ -147,10 +217,6 @@ func checkControlPlaneHealth(ctx context.Context, client kubernetes.Interface, s
 				printInfo(log, fmt.Sprintf("  %s: not visible (managed by cloud provider?)", prefix))
 			}
 		}
-		// Only claim "managed control plane" when we have a positive signal
-		// from a cloud-provider node label. Otherwise (all four pods missing
-		// AND no managed-cluster label), the cluster is likely self-hosted
-		// with a broken control plane — don't mislead the operator.
 		if allHidden {
 			if provider := detectManagedClusterProvider(ctx, client); provider != "" {
 				printInfo(log, fmt.Sprintf(
@@ -218,7 +284,11 @@ func checkControlPlaneHealth(ctx context.Context, client kubernetes.Interface, s
 		printError(log, "Some control plane components may need attention")
 		state.ControlPlaneHealthy = false
 		state.Recommendations = append(state.Recommendations,
-			"Fix control plane issues: check /readyz, coredns, kube-proxy, and node status")
+			"Fix control plane issues: verify /readyz, in-cluster DNS resolution "+
+				"(kubernetes.default.svc) and service routing "+
+				"(https://kubernetes.default.svc/readyz). "+
+				"See the 'Data-Plane Capabilities' and 'Diagnostics' sections above "+
+				"for which probe failed and which provider/router was detected.")
 	}
 }
 
@@ -230,6 +300,71 @@ func checkControlPlaneHealth(ctx context.Context, client kubernetes.Interface, s
 func isEmbeddedKubeProxyDistro(version string) bool {
 	v := strings.ToLower(version)
 	return strings.Contains(v, "+k3s") || strings.Contains(v, "+rke2")
+}
+
+// probeDNSFn and probeAPIServiceIPFn indirect the network probes so tests
+// can swap them with stubs. Production code points them at the real probe
+// functions in connectivity.go.
+var (
+	probeDNSFn          = probeInClusterDNS
+	probeAPIServiceIPFn = probeKubernetesAPIServiceIP
+)
+
+// detectDNSProvider inspects kube-system pods and returns a short name for
+// the cluster's DNS provider when recognised. Diagnostic only — the
+// authoritative DNS health signal comes from probeInClusterDNS.
+//
+// Known providers:
+//   - CoreDNS: pod prefix "coredns" (vanilla, kubeadm, EKS, AKS, k3s)
+//   - kube-dns: pod prefix "kube-dns" (GKE's managed default)
+//   - OpenShift DNS: namespace openshift-dns hosts dns-default-*; this
+//     function only sees kube-system pods, so OpenShift returns "" here
+//     and the capability probe is authoritative.
+func detectDNSProvider(pods []corev1.Pod) string {
+	switch {
+	case countRunningPods(pods, "coredns") > 0:
+		return "CoreDNS"
+	case countRunningPods(pods, "kube-dns") > 0:
+		return "kube-dns"
+	}
+	return ""
+}
+
+// detectServiceRoutingImpl inspects the K8s version and kube-system pods
+// to identify the cluster's kube-proxy implementation. Diagnostic only —
+// the authoritative routing health signal comes from
+// probeKubernetesAPIServiceIP.
+//
+// Recognised implementations:
+//   - kube-proxy DaemonSet (vanilla / kubeadm / EKS / AKS / GKE classic)
+//   - kube-proxy embedded in the server binary (k3s / rke2)
+//   - Cilium with kubeProxyReplacement (GKE Dataplane V2, custom Cilium)
+//   - OVN-Kubernetes (OpenShift 4.x default)
+func detectServiceRoutingImpl(k8sVersion string, pods []corev1.Pod) string {
+	switch {
+	case isEmbeddedKubeProxyDistro(k8sVersion):
+		return "kube-proxy embedded in server binary (k3s/rke2)"
+	case hasCiliumPods(pods):
+		return "Cilium eBPF (kube-proxy replacement)"
+	case countRunningPods(pods, "ovnkube-node") > 0:
+		return "OVN-Kubernetes"
+	case countRunningPods(pods, "kube-proxy") > 0:
+		return "kube-proxy DaemonSet"
+	}
+	return ""
+}
+
+// hasCiliumPods returns true when at least one Running pod in the slice
+// carries the canonical Cilium agent label k8s-app=cilium. Same signal
+// used by checkNetworkPolicies for CNI detection.
+func hasCiliumPods(pods []corev1.Pod) bool {
+	for i := range pods {
+		if pods[i].Status.Phase == corev1.PodRunning &&
+			pods[i].Labels["k8s-app"] == "cilium" {
+			return true
+		}
+	}
+	return false
 }
 
 // detectManagedClusterProvider scans node labels for well-known
@@ -709,6 +844,13 @@ func checkConfigurableReachability(state *ValidationState, cfg *ReachabilityConf
 	hasCritical := false
 	allCriticalOK := true
 
+	// Per-endpoint results for the metrics pipeline. The agent emits one
+	// Prometheus gauge per entry; the map key becomes the `endpoint=...`
+	// label value.
+	if state.EndpointResults == nil {
+		state.EndpointResults = make(map[string]EndpointResult, len(cfg.Endpoints))
+	}
+
 	for _, ep := range cfg.Endpoints {
 		target := toEndpoint(ep)
 		display := target.DisplayAddr()
@@ -730,6 +872,7 @@ func checkConfigurableReachability(state *ValidationState, cfg *ReachabilityConf
 		// indistinguishable from a real connectivity failure.
 		if reason := unprobableReason(target); reason != "" {
 			allOK = false
+			state.EndpointResults[ep.Name] = EndpointResult{Reachable: false, Critical: ep.Critical}
 			msg := fmt.Sprintf("  %s: %s — %s (treated as unreachable)", ep.Name, display, reason)
 			if ep.Critical {
 				allCriticalOK = false
@@ -741,9 +884,11 @@ func checkConfigurableReachability(state *ValidationState, cfg *ReachabilityConf
 		}
 
 		if TestEndpoint(target) {
+			state.EndpointResults[ep.Name] = EndpointResult{Reachable: true, Critical: ep.Critical}
 			printSuccess(log, fmt.Sprintf("  %s: %s - Reachable", ep.Name, display))
 		} else {
 			allOK = false
+			state.EndpointResults[ep.Name] = EndpointResult{Reachable: false, Critical: ep.Critical}
 			if ep.Critical {
 				allCriticalOK = false
 				printError(log, fmt.Sprintf("  %s: %s - Not Reachable (critical)", ep.Name, display))
@@ -762,7 +907,7 @@ func checkConfigurableReachability(state *ValidationState, cfg *ReachabilityConf
 	if allOK {
 		printSuccess(log, "All endpoint reachability checks passed")
 	} else if !allCriticalOK {
-		printError(log, "Some critical endpoints are not reachable")
+		printError(log, "One or more critical endpoints are not reachable")
 		// Don't assume egress is the cause — DNS resolution failures (typo
 		// in hostname) and wrong-environment URLs (e.g. prod endpoint on a
 		// staging cluster) look identical to a real egress block here.
@@ -773,9 +918,9 @@ func checkConfigurableReachability(state *ValidationState, cfg *ReachabilityConf
 				"staging vs. production URL), and (2) cluster egress permits "+
 				"traffic to it (NetworkPolicy, firewall, proxy).")
 	} else {
-		printWarning(log, "Some endpoints are not reachable (non-critical)")
+		printWarning(log, "One or more endpoints are not reachable (non-critical)")
 		state.Warnings = append(state.Warnings,
-			"Reachability: Some endpoints are not reachable")
+			"Reachability: One or more endpoints not reachable")
 	}
 }
 

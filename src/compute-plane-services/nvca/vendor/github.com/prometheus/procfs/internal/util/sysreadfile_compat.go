@@ -15,7 +15,6 @@
 // limitations under the License.
 
 //go:build (linux && appengine) || (!linux && !darwin)
-// +build linux,appengine !linux,!darwin
 
 package util
 

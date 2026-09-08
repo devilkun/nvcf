@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -24,45 +26,11 @@ use anyhow::{Context, bail};
 use super::render::{StargatePod, render_stargate_external_services};
 use super::run::BenchmarkK8sRun;
 
-pub fn apply(run: &BenchmarkK8sRun) -> anyhow::Result<()> {
-    Kubectl::default().apply(run)
-}
-
-pub fn delete(run: &BenchmarkK8sRun) -> anyhow::Result<()> {
-    Kubectl::default().delete(run)
-}
-
-pub fn collect_logs(run: &BenchmarkK8sRun) -> anyhow::Result<()> {
-    Kubectl::default().collect_logs(run)
-}
-
-pub fn delete_backend_pod(run: &BenchmarkK8sRun, backend_index: usize) -> anyhow::Result<()> {
-    Kubectl::default().delete_backend_pod(run, backend_index)
-}
-
-pub fn scale_backend(
-    run: &BenchmarkK8sRun,
-    backend_index: usize,
-    replicas: u32,
-) -> anyhow::Result<()> {
-    Kubectl::default().scale_backend(run, backend_index, replicas)
-}
-
-pub fn wait_ready(run: &BenchmarkK8sRun, backend_count: usize) -> anyhow::Result<()> {
-    Kubectl::default().wait_ready(run, backend_count)
-}
-
-pub fn stargate_metrics_endpoints(run: &BenchmarkK8sRun) -> anyhow::Result<Vec<String>> {
-    Kubectl::default().stargate_metrics_endpoints(run)
-}
-
-pub(super) fn resolve_nodeport_host() -> anyhow::Result<String> {
-    Kubectl::default().resolve_nodeport_host()
-}
-
 #[derive(Clone, Debug)]
-pub(super) struct Kubectl {
+pub(crate) struct Kubectl {
     program: PathBuf,
+    #[cfg(test)]
+    base_args: Vec<OsString>,
 }
 
 impl Default for Kubectl {
@@ -75,35 +43,79 @@ impl Kubectl {
     pub(super) fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            #[cfg(test)]
+            base_args: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_args<I, A>(program: impl Into<PathBuf>, args: I) -> Self
+    where
+        I: IntoIterator<Item = A>,
+        A: Into<OsString>,
+    {
+        Self {
+            program: program.into(),
+            base_args: args.into_iter().map(Into::into).collect(),
         }
     }
 
     fn command(&self) -> Command {
-        Command::new(&self.program)
+        let command = Command::new(&self.program);
+        #[cfg(test)]
+        let command = {
+            let mut command = command;
+            command.args(&self.base_args);
+            command
+        };
+        command
     }
 
-    pub(super) fn apply(&self, run: &BenchmarkK8sRun) -> anyhow::Result<()> {
+    fn command_with_args(&self, args: &[&str]) -> Command {
+        let mut command = self.command();
+        command.args(args);
+        command
+    }
+
+    fn run_status(
+        mut command: Command,
+        start_error: impl FnOnce() -> String,
+        failure: impl FnOnce() -> String,
+    ) -> anyhow::Result<()> {
+        let status = command.status().with_context(start_error)?;
+        if !status.success() {
+            bail!(failure());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply(&self, run: &BenchmarkK8sRun) -> anyhow::Result<()> {
         self.wait_for_namespace_reuse(&run.stargate_ns, Duration::from_secs(60))?;
         self.wait_for_namespace_reuse(&run.backends_ns, Duration::from_secs(60))?;
-        self.kubectl_apply(&run.run_dir.join("k8s-stargate-manifest.yaml"), || {
-            format!("stargate resources for {}", run.algorithm_name)
-        })
+        self.kubectl_file_action(
+            "apply",
+            &run.run_dir.join("k8s-stargate-manifest.yaml"),
+            &[],
+            || format!("stargate resources for {}", run.algorithm_name),
+        )
     }
 
-    pub(super) fn delete(&self, run: &BenchmarkK8sRun) -> anyhow::Result<()> {
+    pub(crate) fn delete(&self, run: &BenchmarkK8sRun) -> anyhow::Result<()> {
         for path in [
             run.run_dir.join("k8s-backends-manifest.yaml"),
             run.run_dir.join("stargate-external-services.yaml"),
             run.run_dir.join("k8s-stargate-manifest.yaml"),
         ] {
-            self.kubectl_delete(&path, || {
-                format!("k8s benchmark resources for {}", run.algorithm_name)
-            })?;
+            if path.exists() {
+                self.kubectl_file_action("delete", &path, &["--ignore-not-found=true"], || {
+                    format!("k8s benchmark resources for {}", run.algorithm_name)
+                })?;
+            }
         }
         Ok(())
     }
 
-    pub(super) fn collect_logs(&self, run: &BenchmarkK8sRun) -> anyhow::Result<()> {
+    pub(crate) fn collect_logs(&self, run: &BenchmarkK8sRun) -> anyhow::Result<()> {
         let logs_dir = run.run_dir.join("logs");
         fs::create_dir_all(&logs_dir)
             .with_context(|| format!("failed to create logs dir {}", logs_dir.display()))?;
@@ -112,19 +124,19 @@ impl Kubectl {
         self.collect_namespace_snapshot(&logs_dir, "backends", &run.backends_ns)?;
         self.collect_labeled_logs(&logs_dir, "stargate", &run.stargate_ns, "app=stargate")?;
         for backend_index in 0.. {
-            let inference_selector = format!("app=backend-{backend_index}-inference-server");
-            let client_selector = format!("app=backend-{backend_index}-pylon");
+            let inference_server = format!("backend-{backend_index}-inference-server");
+            let pylon = format!("backend-{backend_index}-pylon");
             let inference = self.collect_labeled_logs(
                 &logs_dir,
-                &format!("backend-{backend_index}-inference-server"),
+                &inference_server,
                 &run.backends_ns,
-                &inference_selector,
+                &format!("app={inference_server}"),
             )?;
             let client = self.collect_labeled_logs(
                 &logs_dir,
-                &format!("backend-{backend_index}-pylon"),
+                &pylon,
                 &run.backends_ns,
-                &client_selector,
+                &format!("app={pylon}"),
             )?;
             if !inference && !client {
                 break;
@@ -133,99 +145,50 @@ impl Kubectl {
         Ok(())
     }
 
-    pub(super) fn delete_backend_pod(
+    pub(crate) fn delete_backend_pod(
         &self,
         run: &BenchmarkK8sRun,
         backend_index: usize,
     ) -> anyhow::Result<()> {
-        let upstream_index = run
-            .backend_upstream_indices
-            .get(backend_index)
-            .copied()
-            .with_context(|| format!("unknown benchmark backend index {backend_index}"))?;
+        let upstream_index = backend_upstream_index(run, backend_index)?;
         let selector = format!("app=backend-{upstream_index}-inference-server");
-        let status = self
-            .command()
-            .arg("-n")
-            .arg(&run.backends_ns)
-            .arg("delete")
-            .arg("pod")
-            .arg("-l")
-            .arg(&selector)
-            .status()
-            .with_context(|| format!("failed to delete backend pod for backend-{backend_index}"))?;
-        if !status.success() {
-            bail!("kubectl delete pod failed for selector {selector}");
-        }
-        Ok(())
+        Self::run_status(
+            self.command_with_args(&["-n", &run.backends_ns, "delete", "pod", "-l", &selector]),
+            || format!("failed to delete backend pod for backend-{backend_index}"),
+            || format!("kubectl delete pod failed for selector {selector}"),
+        )
     }
 
-    pub(super) fn scale_backend(
+    pub(crate) fn scale_backend(
         &self,
         run: &BenchmarkK8sRun,
         backend_index: usize,
         replicas: u32,
     ) -> anyhow::Result<()> {
-        let upstream_index = run
-            .backend_upstream_indices
-            .get(backend_index)
-            .copied()
-            .with_context(|| format!("unknown benchmark backend index {backend_index}"))?;
+        let upstream_index = backend_upstream_index(run, backend_index)?;
         let deployment = format!("deployment/backend-{upstream_index}-inference-server");
-        let status = self
-            .command()
-            .arg("-n")
-            .arg(&run.backends_ns)
-            .arg("scale")
-            .arg(&deployment)
-            .arg(format!("--replicas={replicas}"))
-            .status()
-            .with_context(|| format!("failed to scale {deployment}"))?;
-        if !status.success() {
-            bail!("kubectl scale failed for {deployment}");
-        }
-        Ok(())
+        let replicas = format!("--replicas={replicas}");
+        Self::run_status(
+            self.command_with_args(&["-n", &run.backends_ns, "scale", &deployment, &replicas]),
+            || format!("failed to scale {deployment}"),
+            || format!("kubectl scale failed for {deployment}"),
+        )
     }
 
-    fn kubectl_apply(
+    fn kubectl_file_action(
         &self,
+        action: &str,
         path: &Path,
+        extra_args: &[&str],
         description: impl FnOnce() -> String,
     ) -> anyhow::Result<()> {
-        let status = self
-            .command()
-            .arg("apply")
-            .arg("-f")
-            .arg(path)
-            .status()
-            .context("failed to run kubectl apply")?;
-        if !status.success() {
-            bail!("kubectl apply failed for {}", description());
-        }
-        Ok(())
-    }
-
-    fn kubectl_delete(
-        &self,
-        path: &Path,
-        description: impl FnOnce() -> String,
-    ) -> anyhow::Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-
-        let status = self
-            .command()
-            .arg("delete")
-            .arg("-f")
-            .arg(path)
-            .arg("--ignore-not-found=true")
-            .status()
-            .context("failed to run kubectl delete")?;
-        if !status.success() {
-            bail!("kubectl delete failed for {}", description());
-        }
-        Ok(())
+        let mut command = self.command();
+        command.arg(action).arg("-f").arg(path).args(extra_args);
+        Self::run_status(
+            command,
+            || format!("failed to run kubectl {action}"),
+            || format!("kubectl {action} failed for {}", description()),
+        )
     }
 
     fn collect_namespace_snapshot(
@@ -234,36 +197,18 @@ impl Kubectl {
         name: &str,
         namespace: &str,
     ) -> anyhow::Result<()> {
-        write_kubectl_output(
-            logs_dir.join(format!("{name}-pods.txt")),
-            self.command()
-                .arg("-n")
-                .arg(namespace)
-                .arg("get")
-                .arg("pods")
-                .arg("-o")
-                .arg("wide")
-                .output(),
-        )?;
-        write_kubectl_output(
-            logs_dir.join(format!("{name}-describe-pods.txt")),
-            self.command()
-                .arg("-n")
-                .arg(namespace)
-                .arg("describe")
-                .arg("pods")
-                .output(),
-        )?;
-        write_kubectl_output(
-            logs_dir.join(format!("{name}-events.txt")),
-            self.command()
-                .arg("-n")
-                .arg(namespace)
-                .arg("get")
-                .arg("events")
-                .arg("--sort-by=.lastTimestamp")
-                .output(),
-        )?;
+        for (suffix, args) in [
+            ("pods", &["get", "pods", "-o", "wide"][..]),
+            ("describe-pods", &["describe", "pods"]),
+            ("events", &["get", "events", "--sort-by=.lastTimestamp"]),
+        ] {
+            write_kubectl_output(
+                logs_dir.join(format!("{name}-{suffix}.txt")),
+                self.command_with_args(&["-n", namespace])
+                    .args(args)
+                    .output(),
+            )?;
+        }
         Ok(())
     }
 
@@ -280,15 +225,8 @@ impl Kubectl {
         }
         write_kubectl_output(
             logs_dir.join(format!("{name}.log")),
-            self.command()
-                .arg("-n")
-                .arg(namespace)
-                .arg("logs")
-                .arg("-l")
-                .arg(selector)
-                .arg("--all-containers=true")
-                .arg("--prefix=true")
-                .arg("--tail=-1")
+            self.command_with_args(&["-n", namespace, "logs", "-l", selector])
+                .args(["--all-containers=true", "--prefix=true", "--tail=-1"])
                 .output(),
         )?;
         Ok(true)
@@ -296,38 +234,29 @@ impl Kubectl {
 
     fn pods_for_selector(&self, namespace: &str, selector: &str) -> anyhow::Result<Vec<String>> {
         let output = self
-            .command()
-            .arg("-n")
-            .arg(namespace)
-            .arg("get")
-            .arg("pods")
-            .arg("-l")
-            .arg(selector)
-            .arg("-o")
+            .command_with_args(&["-n", namespace, "get", "pods", "-l", selector, "-o"])
             .arg("jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
             .output()
             .with_context(|| format!("failed to query pods for selector {selector}"))?;
         if !output.status.success() {
             return Ok(Vec::new());
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect())
+        Ok(kubectl_output_lines(&output.stdout))
     }
 
-    pub(super) fn wait_ready(
+    pub(crate) fn wait_ready(
         &self,
         run: &BenchmarkK8sRun,
         backend_count: usize,
     ) -> anyhow::Result<()> {
         self.rollout("statefulset", "stargate", &run.stargate_ns)?;
         self.apply_stargate_external_services(run)?;
-        self.kubectl_apply(&run.run_dir.join("k8s-backends-manifest.yaml"), || {
-            format!("backend resources for {}", run.algorithm_name)
-        })?;
+        self.kubectl_file_action(
+            "apply",
+            &run.run_dir.join("k8s-backends-manifest.yaml"),
+            &[],
+            || format!("backend resources for {}", run.algorithm_name),
+        )?;
         for backend_index in &run.upstream_backend_indices {
             self.rollout(
                 "deployment",
@@ -345,19 +274,20 @@ impl Kubectl {
         Ok(())
     }
 
-    pub(super) fn stargate_metrics_endpoints(
+    pub(crate) fn stargate_metrics_endpoints(
         &self,
         run: &BenchmarkK8sRun,
     ) -> anyhow::Result<Vec<String>> {
         let output = self
-            .command()
-            .arg("-n")
-            .arg(&run.stargate_ns)
-            .arg("get")
-            .arg("services")
-            .arg("-l")
-            .arg("benchmark.stargate/role=pod-metrics")
-            .arg("-o")
+            .command_with_args(&[
+                "-n",
+                &run.stargate_ns,
+                "get",
+                "services",
+                "-l",
+                "benchmark.stargate/role=pod-metrics",
+                "-o",
+            ])
             .arg("jsonpath={range .items[*]}{.metadata.name}{\" \"}{.spec.ports[0].nodePort}{\"\\n\"}{end}")
             .output()
             .context("failed to query per-stargate metrics services")?;
@@ -418,29 +348,30 @@ impl Kubectl {
         fs::write(&manifest_path, manifest)
             .with_context(|| format!("failed to write {}", manifest_path.display()))?;
 
-        let status = self
-            .command()
-            .arg("apply")
-            .arg("-f")
-            .arg(&manifest_path)
-            .status()
-            .context("failed to apply stargate external services")?;
-        if !status.success() {
-            bail!("kubectl apply failed for stargate external services");
-        }
-        Ok(())
+        self.apply_external_services_manifest(&manifest_path)
+    }
+
+    fn apply_external_services_manifest(&self, manifest_path: &Path) -> anyhow::Result<()> {
+        let mut command = self.command();
+        command.arg("apply").arg("-f").arg(manifest_path);
+        Self::run_status(
+            command,
+            || "failed to apply stargate external services".to_string(),
+            || "kubectl apply failed for stargate external services".to_string(),
+        )
     }
 
     fn list_stargate_pods(&self, run: &BenchmarkK8sRun) -> anyhow::Result<Vec<StargatePod>> {
         let output = self
-            .command()
-            .arg("-n")
-            .arg(&run.stargate_ns)
-            .arg("get")
-            .arg("pods")
-            .arg("-l")
-            .arg("app=stargate")
-            .arg("-o")
+            .command_with_args(&[
+                "-n",
+                &run.stargate_ns,
+                "get",
+                "pods",
+                "-l",
+                "app=stargate",
+                "-o",
+            ])
             .arg("jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
             .output()
             .context("failed to query stargate pods")?;
@@ -448,44 +379,33 @@ impl Kubectl {
             bail!("kubectl get pods failed while querying stargate pods");
         }
 
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                Ok(StargatePod {
-                    name: line.to_string(),
-                })
-            })
-            .collect()
+        Ok(kubectl_output_lines(&output.stdout)
+            .into_iter()
+            .map(|line| StargatePod { name: line })
+            .collect())
     }
 
     fn rollout(&self, kind: &str, name: &str, namespace: &str) -> anyhow::Result<()> {
-        let status = self
-            .command()
-            .arg("-n")
-            .arg(namespace)
-            .arg("rollout")
-            .arg("status")
-            .arg(format!("{kind}/{name}"))
-            .arg("--timeout=180s")
-            .status()
-            .with_context(|| format!("failed waiting for rollout of {kind}/{name}"))?;
-        if !status.success() {
-            bail!("rollout failed for {kind}/{name} in namespace {namespace}");
-        }
-        Ok(())
+        let resource = format!("{kind}/{name}");
+        Self::run_status(
+            self.command_with_args(&[
+                "-n",
+                namespace,
+                "rollout",
+                "status",
+                &resource,
+                "--timeout=180s",
+            ]),
+            || format!("failed waiting for rollout of {kind}/{name}"),
+            || format!("rollout failed for {kind}/{name} in namespace {namespace}"),
+        )
     }
 
     fn wait_for_namespace_reuse(&self, namespace: &str, timeout: Duration) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
             let output = self
-                .command()
-                .arg("get")
-                .arg("namespace")
-                .arg(namespace)
-                .arg("-o")
+                .command_with_args(&["get", "namespace", namespace, "-o"])
                 .arg("jsonpath={.status.phase}")
                 .output()
                 .with_context(|| format!("failed to query namespace {namespace}"))?;
@@ -513,17 +433,16 @@ impl Kubectl {
         &self,
         host_override: Option<String>,
     ) -> anyhow::Result<String> {
-        if let Some(host) = host_override {
-            let host = host.trim();
-            if !host.is_empty() {
-                return Ok(host.to_string());
-            }
+        if let Some(host) = host_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+        {
+            return Ok(host.to_string());
         }
 
         let context = self
-            .command()
-            .arg("config")
-            .arg("current-context")
+            .command_with_args(&["config", "current-context"])
             .output()
             .context("failed to query current kubectl context")?;
         if context.status.success()
@@ -532,24 +451,22 @@ impl Kubectl {
             return Ok("127.0.0.1".to_string());
         }
 
-        let external = self.query_first_node_address("ExternalIP")?;
-        if let Some(address) = external {
-            return Ok(address);
+        for address_type in ["ExternalIP", "InternalIP"] {
+            if let Some(address) = self.query_first_node_address(address_type)? {
+                return Ok(address);
+            }
         }
-
-        let internal = self.query_first_node_address("InternalIP")?;
-        internal.ok_or_else(|| anyhow::anyhow!("failed to resolve Kubernetes node address for NodePort access; set STARGATE_BENCH_NODE_HOST"))
+        bail!(
+            "failed to resolve Kubernetes node address for NodePort access; set STARGATE_BENCH_NODE_HOST"
+        )
     }
 
     fn query_first_node_address(&self, address_type: &str) -> anyhow::Result<Option<String>> {
+        let jsonpath = format!(
+            "jsonpath={{.items[0].status.addresses[?(@.type==\"{address_type}\")].address}}"
+        );
         let output = self
-            .command()
-            .arg("get")
-            .arg("nodes")
-            .arg("-o")
-            .arg(format!(
-                "jsonpath={{.items[0].status.addresses[?(@.type==\"{address_type}\")].address}}"
-            ))
+            .command_with_args(&["get", "nodes", "-o", &jsonpath])
             .output()
             .with_context(|| format!("failed to query Kubernetes node {address_type} address"))?;
         if !output.status.success() {
@@ -558,6 +475,22 @@ impl Kubectl {
         let address = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok((!address.is_empty()).then_some(address))
     }
+}
+
+fn backend_upstream_index(run: &BenchmarkK8sRun, backend_index: usize) -> anyhow::Result<usize> {
+    run.backend_upstream_indices
+        .get(backend_index)
+        .copied()
+        .with_context(|| format!("unknown benchmark backend index {backend_index}"))
+}
+
+fn kubectl_output_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn write_kubectl_output(
@@ -579,4 +512,22 @@ fn write_kubectl_output(
         text.push('\n');
     }
     fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_service_apply_spawn_failure_preserves_specific_context() {
+        let tempdir = tempfile::tempdir().expect("tempdir should create");
+        let error = Kubectl::new(tempdir.path().join("missing-kubectl"))
+            .apply_external_services_manifest(&tempdir.path().join("services.yaml"))
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to apply stargate external services"
+        );
+    }
 }

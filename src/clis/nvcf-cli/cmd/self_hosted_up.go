@@ -35,7 +35,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 
 	corev1 "k8s.io/api/core/v1"
@@ -149,7 +148,7 @@ func runSelfHostedUp(c *cobra.Command, _ []string) error {
 	// + ambient state (NO_COLOR / TERM / CI / TTY size).
 	// Cluster/Target/Stack populate the bubbletea Model header for TTY modes;
 	// they are ignored by the plain, JSONL, and accessible renderers.
-	// selfHostedStack is the flag value (before resolution); resolved.Path is
+	// selfHostedControlPlaneStack is the flag value (before resolution); resolved.Path is
 	// not yet available here, so the flag string is the best we have.
 	sink, kind, err := progress.SelectRenderer(c.ErrOrStderr(), progress.RenderOpts{
 		JSON:                selfHostedJSON,
@@ -157,7 +156,7 @@ func runSelfHostedUp(c *cobra.Command, _ []string) error {
 		Accessible:          selfHostedAccessible,
 		Cluster:             upClusterName,
 		Target:              upRegion,
-		Stack:               selfHostedStack,
+		Stack:               selfHostedControlPlaneStack,
 		ControlPlaneContext: selfHostedControlPlaneContext, // M+9.E: split-cluster header
 		ComputePlaneContext: selfHostedComputePlaneContext, // M+9.E: split-cluster header
 	})
@@ -247,6 +246,10 @@ func (r *selfHostedUpRun) run() error {
 	if err != nil {
 		return err
 	}
+	computeStackPath, err := r.resolveComputeStack()
+	if err != nil {
+		return err
+	}
 	if upPlanOnly {
 		return r.emitPlanOnly(resolved.Path)
 	}
@@ -261,11 +264,11 @@ func (r *selfHostedUpRun) run() error {
 	if err := r.checkControlPlane(); err != nil {
 		return err
 	}
-	registration, err := r.registerCluster(resolved.Path)
+	registration, err := r.registerCluster(computeStackPath)
 	if err != nil {
 		return err
 	}
-	if err := r.applyComputePlane(resolved.Path, registration); err != nil {
+	if err := r.applyComputePlane(computeStackPath, registration); err != nil {
 		return err
 	}
 	return r.emitFinalHealth(registration)
@@ -370,8 +373,8 @@ func (r *selfHostedUpRun) emitInstallLockWarning(detail string) {
 func (r *selfHostedUpRun) resolveStack() (*selfhosted.ResolvedStack, error) {
 	p2Start := r.emitPhase(2, upPhaseResolve)
 	resolved, err := selfhosted.ResolveStack(r.ctx, selfhosted.StackOptions{
-		Source:        selfHostedStack,
-		BuiltInOCIRef: builtInStackOCI(),
+		Source:        selfHostedControlPlaneStack,
+		BuiltInOCIRef: builtInControlPlaneStackOCI(),
 	})
 	if err != nil {
 		r.emitFailure(selfhosted.Failure{Phase: selfhosted.PhaseResolve, Err: err}, p2Start)
@@ -382,6 +385,17 @@ func (r *selfHostedUpRun) resolveStack() (*selfhosted.ResolvedStack, error) {
 		return nil, r.emitCancellation(3, upPhaseRender)
 	}
 	return resolved, nil
+}
+
+func (r *selfHostedUpRun) resolveComputeStack() (string, error) {
+	computeResolved, err := selfhosted.ResolveStack(r.ctx, selfhosted.StackOptions{
+		Source:        selfHostedComputePlaneStack,
+		BuiltInOCIRef: builtInComputePlaneStackOCI(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("resolve compute-plane stack: %w", err)
+	}
+	return computeResolved.Path, nil
 }
 
 func (r *selfHostedUpRun) emitPlanOnly(stackPath string) error {
@@ -434,6 +448,7 @@ func (r *selfHostedUpRun) applyControlPlane(stackPath string) error {
 
 func (r *selfHostedUpRun) writeControlPlaneProfile(stackPath string) error {
 	path, err := writeControlPlaneProfile(controlPlaneProfileWriteRequest{
+		Ctx:                 r.ctx,
 		StackPath:           stackPath,
 		ClusterName:         upClusterName,
 		NCAID:               upNCAID,
@@ -443,6 +458,7 @@ func (r *selfHostedUpRun) writeControlPlaneProfile(stackPath string) error {
 		ComputePlaneContext: selfHostedComputePlaneContext,
 		ICMSURL:             resolveICMSURL(selfHostedICMSURL),
 		NATSURL:             selfHostedNATSURL,
+		SourceRootCA:        true,
 	})
 	if err != nil {
 		wrapped := fmt.Errorf("writing control-plane profile: %w", err)
@@ -544,14 +560,15 @@ func (r *selfHostedUpRun) createClusterRegistration(stackPath string, p6Start ti
 			})
 		}
 	}
-	resp, err := cc.RegisterCluster(r.ctx, selfhosted.RegisterRequest{
+	registerReq := selfhosted.RegisterRequest{
 		ClusterName:    upClusterName,
 		NCAID:          registration.NCAID,
 		Region:         registration.Region,
 		JWKS:           jwks,
 		OIDCIssuer:     oidcIssuer,
 		IdentitySource: registration.IdentitySource,
-	})
+	}
+	resp, err := r.registerClusterWithRetry(cc, registerReq)
 	if err != nil {
 		wrapped := fmt.Errorf("cluster register: %w", err)
 		r.emitFailure(selfhosted.Failure{Phase: selfhosted.PhaseRegister, Err: wrapped, HTTPStatus: httpStatusFromErr(err)}, p6Start)
@@ -560,6 +577,71 @@ func (r *selfHostedUpRun) createClusterRegistration(stackPath string, p6Start ti
 	registration.ClusterID = resp.ClusterID
 	registration.ClusterGroupID = resp.ClusterGroupID
 	return registration, r.writeRegistrationValues(stackPath, icmsURL, registration, p6Start)
+}
+
+// registerClusterWithRetry implements the SRD §9.4 one-shot 401 auto-remint
+// contract for the register phase: if SIS returns 401, clear the cached token
+// (preserving the OIDC fingerprint), re-mint via init, and retry the register
+// call exactly once. The second 401 (or any non-401 error) is returned to the
+// caller so the existing phase_failed emission path handles it.
+//
+// The retry is suppressed when --token=$JWT was supplied: the operator chose
+// the token explicitly and a silent re-mint would invalidate that intent.
+// Per SRD §9.4 final paragraph, no HTTP 429 backoff is applied here — API Keys
+// rate-limiting is handled by authGatePhase5.
+func (r *selfHostedUpRun) registerClusterWithRetry(cc selfhosted.ClusterClient, req selfhosted.RegisterRequest) (*selfhosted.RegisterResponse, error) {
+	resp, err := cc.RegisterCluster(r.ctx, req)
+	if err == nil {
+		return resp, nil
+	}
+	if !isHTTP401Err(err) {
+		return nil, err
+	}
+	if selfHostedToken != "" {
+		// Operator supplied --token=$JWT; do not silently re-mint and override
+		// their explicit choice. Surface the 401 to the existing failure path.
+		return nil, err
+	}
+	_ = r.sink.Emit(r.ctx, progress.LastProgress{
+		Num:     6,
+		Detail:  "register returned 401; clearing cached token and retrying after re-init",
+		At:      time.Now().UTC(),
+		Context: kubectxFor(6),
+	})
+	sm := state.NewStateManager()
+	if loadErr := sm.Load(); loadErr == nil {
+		sm.ClearTokens()
+		_ = sm.Save()
+	}
+	if remintErr := runSelfHostedInit(r.ctx); remintErr != nil {
+		return nil, fmt.Errorf("re-mint admin token after 401: %w", remintErr)
+	}
+	retryCC, err := newClusterClientForSelfHosted(resolveICMSURL(selfHostedICMSURL))
+	if err != nil {
+		return nil, fmt.Errorf("rebuild cluster client after token re-mint: %w", err)
+	}
+	defer retryCC.Close()
+	return retryCC.RegisterCluster(r.ctx, req)
+}
+
+// isHTTP401Err returns true when err looks like an HTTP 401 from the SIS
+// client. httpStatusFromErr does not recognize the client's "SIS API error %d"
+// format, so we match both that shape and the generic "401" token explicitly.
+func isHTTP401Err(err error) bool {
+	if err == nil {
+		return false
+	}
+	if httpStatusFromErr(err) == 401 {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "SIS API error 401") {
+		return true
+	}
+	if strings.Contains(msg, " 401 ") || strings.HasSuffix(msg, " 401") {
+		return true
+	}
+	return false
 }
 
 func (r *selfHostedUpRun) writeRegistrationValues(stackPath, icmsURL string, registration upClusterRegistration, p6Start time.Time) error {
@@ -592,19 +674,16 @@ func (r *selfHostedUpRun) applyComputePlane(stackPath string, registration upClu
 		return r.handleHelmfilePhaseError(7, upPhaseApplyComputePlane, selfhosted.PhaseApplyCompute, "prepare image pull secrets", err, p7Start)
 	}
 	cancelWatcher, watcherDone := startWatcher(r.ctx, r.sink, 7, upPhaseApplyComputePlane, computePlaneNamespaces())
-	helmfileFile, selector := computePlaneTarget(stackPath)
 	err := selfhosted.Render(selfhosted.RenderOptions{
 		StackPath:       stackPath,
-		HelmfileFile:    helmfileFile,
 		Env:             selfHostedEnv,
 		Apply:           true,
-		Selector:        selector,
 		HelmRuntimeMode: r.helmRuntimeMode,
 		KubeContext:     kubectxFor(7), // M+9.E: compute-plane context in split mode
 		Stdout:          r.helmfileStdout,
 		Stderr:          r.helmfileStderr,
 		Ctx:             r.ctx,
-		ExtraEnv:        append(registration.computePlaneEnv(), "NVCF_NVCA_VALUES_FILE="+nvcaValuesPath(stackPath, upClusterName)),
+		ExtraEnv:        registration.computePlaneEnv(filepath.Join(stackPath, "out")),
 	})
 	stopWatcher(cancelWatcher, watcherDone)
 	if err != nil {
@@ -985,7 +1064,7 @@ func (r *selfHostedUpRun) emitFinalFailure() {
 	})
 }
 
-func (r upClusterRegistration) computePlaneEnv() []string {
+func (r upClusterRegistration) computePlaneEnv(outputDir string) []string {
 	return []string{
 		"CLUSTER_NAME=" + upClusterName,
 		"CLUSTER_ID=" + r.ClusterID,
@@ -993,6 +1072,9 @@ func (r upClusterRegistration) computePlaneEnv() []string {
 		"IDENTITY_SOURCE=" + r.IdentitySource,
 		"NCA_ID=" + r.NCAID,
 		"CLUSTER_REGION=" + r.Region,
+		// The compute-plane Helmfile reads its registration handoff from
+		// $OUTPUT_DIR/$CLUSTER_NAME-register-values.yaml.
+		"OUTPUT_DIR=" + outputDir,
 	}
 }
 
@@ -1242,11 +1324,6 @@ func selfHostedInitArgs() []string {
 // requiring a real HTTP server. Production callers use auth.Probe directly.
 var authProbe = auth.Probe
 
-// stdinIsTerminal is a package-level seam so tests can simulate TTY / non-TTY
-// stdin without manipulating the actual file descriptor. Production callers
-// resolve to term.IsTerminal against os.Stdin.
-var stdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
-
 // authGatePhase5 implements the M+8.G decision tree:
 //  1. Probe control-plane fingerprint from config.BaseHTTPURL.
 //  2. Load cached SelfHostedAuth from state.
@@ -1265,15 +1342,6 @@ func authGatePhase5(ctx context.Context, sink progress.EventSink, _ time.Time) e
 	}
 	if !selfHostedRefreshToken && tryUseCachedAdminToken(ctx, sink, fp) {
 		return nil
-	}
-	// REQ-8: with no cached token usable, the next step would prompt via
-	// `nvcf-cli init`. Bail with a clear, actionable error when --non-interactive
-	// is set or stdin is not a TTY, rather than letting init block on a stdin read
-	// in CI.
-	if selfHostedNonInter || !stdinIsTerminal() {
-		return fmt.Errorf("admin token required but cannot prompt " +
-			"(--non-interactive set or stdin is not a TTY); " +
-			"pass --token=$JWT or run `nvcf-cli init` interactively first")
 	}
 	_ = sink.Emit(ctx, progress.LastProgress{
 		Num:    5,

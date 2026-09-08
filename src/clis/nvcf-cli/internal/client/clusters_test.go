@@ -54,7 +54,7 @@ func TestMakeSISRequestPreservesSISHostWithAPIHostOverride(t *testing.T) {
 		Transport: newHostHeaderTransport("base.different.example", "api.different.example", false, server.Client().Transport),
 	})
 
-	resp, err := c.makeSISRequest(context.Background(), "POST", server.URL, "/v1/accounts/test-nca/clusters", map[string]string{"clusterName": "test"})
+	resp, err := c.makeICMSRequest(context.Background(), "POST", server.URL, "/v1/accounts/test-nca/clusters", map[string]string{"clusterName": "test"})
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -77,7 +77,7 @@ func TestMakeSISRequestOverridesHostHeaderWithICMSHostConfig(t *testing.T) {
 	c := newTestClient(server.Client())
 	c.config = &Config{ICMSHost: "sis.bare-elb.example.com"}
 
-	resp, err := c.makeSISRequest(context.Background(), "GET", server.URL, "/v1/accounts/nca-1/clusters", nil)
+	resp, err := c.makeICMSRequest(context.Background(), "GET", server.URL, "/v1/accounts/nca-1/clusters", nil)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -145,7 +145,7 @@ func TestRegisterCluster(t *testing.T) {
 		resp, err := c.RegisterCluster(context.Background(), server.URL, "nca-1", req)
 		assert.Nil(t, resp)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "SIS API error 403")
+		assert.Contains(t, err.Error(), "ICMS API error 403")
 	})
 
 	t.Run("omits nil optional fields from JSON", func(t *testing.T) {
@@ -215,7 +215,7 @@ func TestUpdateClusterJWKS(t *testing.T) {
 
 		err := c.UpdateClusterJWKS(context.Background(), server.URL, "cl-789", req)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "SIS API error 500")
+		assert.Contains(t, err.Error(), "ICMS API error 500")
 	})
 }
 
@@ -226,7 +226,7 @@ func TestListClusters(t *testing.T) {
 			assert.Contains(t, r.URL.Path, "/v1/accounts/test-nca/clusters")
 			assert.Equal(t, "application/json", r.Header.Get("Accept"))
 
-			resp := []SISCluster{
+			resp := []ICMSCluster{
 				{ClusterID: "cl-1", ClusterName: "cluster-a", ClusterGroupID: "cg-1"},
 				{ClusterID: "cl-2", ClusterName: "cluster-b", ClusterGroupID: "cg-2"},
 			}
@@ -271,7 +271,7 @@ func TestListClusters(t *testing.T) {
 		clusters, err := c.ListClusters(context.Background(), server.URL, "bad-nca")
 		assert.Nil(t, clusters)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "SIS API error 403")
+		assert.Contains(t, err.Error(), "ICMS API error 403")
 	})
 
 	t.Run("sets Host header from SIS URL", func(t *testing.T) {
@@ -288,6 +288,81 @@ func TestListClusters(t *testing.T) {
 		_, err := c.ListClusters(context.Background(), server.URL, "host-test-nca")
 		assert.NoError(t, err)
 		assert.NotEmpty(t, receivedHost)
+	})
+
+	t.Run("parses optional enrichment fields when present", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			// Field names here must match the real SIS contract
+			// (sis-openapi.yaml), not the Go struct field names, or a
+			// json-tag mismatch like the one this test previously masked
+			// (tag said "clusterStatus", SIS actually sends "status") goes
+			// undetected.
+			w.Write([]byte(`[{"clusterId":"cl-1","clusterName":"a","nvcaVersion":"2.30.4","status":"ACTIVE","nvcaLastConnected":"2026-05-30T10:00:00Z"}]`))
+		}))
+		defer server.Close()
+
+		c := newTestClient(server.Client())
+		clusters, err := c.ListClusters(context.Background(), server.URL, "nca")
+		require.NoError(t, err)
+		require.Len(t, clusters, 1)
+		assert.Equal(t, "2.30.4", clusters[0].NVCAVersion)
+		assert.Equal(t, "ACTIVE", clusters[0].ClusterStatus)
+		assert.Equal(t, "2026-05-30T10:00:00Z", clusters[0].NVCALastConnected)
+	})
+
+	t.Run("decodes status from a realistic SIS response payload", func(t *testing.T) {
+		// Regression test: this mirrors the shape of a real SIS
+		// GET /v1/accounts/{ncaId}/clusters response (minus fields
+		// ICMSCluster doesn't model), including nested objects and other
+		// top-level fields that must not interfere with decoding "status".
+		const sisResponse = `[
+			{
+				"clusterName": "ncp-local-compute-1",
+				"clusterGroupName": "ncp-local-compute-1",
+				"ncaId": "nvcf-default",
+				"cloudProvider": "ON-PREM",
+				"nvcaVersion": "3.0.3",
+				"clusterId": "1da98b57-af43-4ce5-a732-53d1f060f372",
+				"clusterGroupId": "7c12fe3a-0092-40cb-a71e-ef07d7fdf4d4",
+				"status": "READY",
+				"clusterSource": "ngc-managed",
+				"nvcaLastConnected": "2026-08-12T10:09:21.673Z",
+				"k8sVersion": "v1.30.2+k3s2",
+				"gpuUsage": {"H100": {"capacity": 256, "allocated": 3, "available": 253}}
+			}
+		]`
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(sisResponse))
+		}))
+		defer server.Close()
+
+		c := newTestClient(server.Client())
+		clusters, err := c.ListClusters(context.Background(), server.URL, "nvcf-default")
+		require.NoError(t, err)
+		require.Len(t, clusters, 1)
+		assert.Equal(t, "READY", clusters[0].ClusterStatus)
+		assert.Equal(t, "3.0.3", clusters[0].NVCAVersion)
+		assert.Equal(t, "2026-08-12T10:09:21.673Z", clusters[0].NVCALastConnected)
+	})
+
+	t.Run("leaves enrichment fields empty when absent", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`[{"clusterId":"cl-1","clusterName":"a"}]`))
+		}))
+		defer server.Close()
+
+		c := newTestClient(server.Client())
+		clusters, err := c.ListClusters(context.Background(), server.URL, "nca")
+		require.NoError(t, err)
+		require.Len(t, clusters, 1)
+		assert.Empty(t, clusters[0].NVCAVersion)
+		assert.Empty(t, clusters[0].ClusterStatus)
 	})
 }
 
@@ -333,7 +408,7 @@ func TestDeleteCluster(t *testing.T) {
 		c := newTestClient(server.Client())
 		err := c.DeleteCluster(context.Background(), server.URL, "nca-test", "cl-missing")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "SIS API error 404")
+		assert.Contains(t, err.Error(), "ICMS API error 404")
 	})
 
 	t.Run("sets Host header from SIS URL", func(t *testing.T) {

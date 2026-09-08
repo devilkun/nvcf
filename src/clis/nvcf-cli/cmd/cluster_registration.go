@@ -86,6 +86,9 @@ func initClusterRegistrationCmds() {
 	clusterCmd.AddCommand(clusterRegisterCmd)
 	clusterCmd.AddCommand(clusterRotateCmd)
 	clusterCmd.AddCommand(clusterDeleteCmd)
+	clusterCmd.AddCommand(clusterListRegisteredCmd)
+	clusterListRegisteredCmd.Flags().String(clusterFlagNcaID, "nvcf-default", "NCA/tenant ID")
+	addClusterICMSURLFlags(clusterListRegisteredCmd)
 
 	// Register flags
 	clusterRegisterCmd.Flags().String("name", "", "Cluster name (required)")
@@ -502,6 +505,20 @@ func runClusterRegister(cmd *cobra.Command, args []string) error {
 			if lookupErr != nil {
 				return fmt.Errorf("cluster already exists but failed to look up IDs: %w", lookupErr)
 			}
+			// Refresh JWKS + OIDC issuer on the existing cluster row. ICMS's
+			// create-on-conflict returns 400 without touching the row, so the
+			// row keeps whatever JWKS was there or none. NVCA then fails to
+			// validate PSATs against a stale or missing JWKS. The same call
+			// is already made by the orchestrator path in
+			// internal/selfhosted/register.go.
+			updateReq := &client.UpdateClusterJWKSRequest{
+				JWKS:       jwks,
+				OIDCIssuer: &issuer,
+			}
+			if updateErr := c.UpdateClusterJWKS(ctx, icmsURL, clusterID, updateReq); updateErr != nil {
+				return fmt.Errorf("failed to refresh JWKS on existing cluster %s: %w", clusterID, updateErr)
+			}
+			logging.Success("Refreshed JWKS for existing cluster %s", clusterID)
 			printRegistrationOutput(name, clusterGroupID, clusterID, ncaID, region, issuer, identitySource, icmsURL, natsURL)
 			return nil
 		}

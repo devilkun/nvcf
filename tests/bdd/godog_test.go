@@ -29,6 +29,7 @@ import (
 
 	"github.com/cucumber/godog"
 
+	"nvcf-bdd/dsl"
 	"nvcf-bdd/harness"
 	"nvcf-bdd/steps"
 )
@@ -47,6 +48,16 @@ func (f *fakeRunner) Run(_ context.Context, command string) (harness.Result, err
 		return result, nil
 	}
 	return harness.Result{ExitCode: 0}, nil
+}
+
+// RunWithSensitiveStdin records only the command. Sensitive input must never
+// enter wiring-test diagnostics or command assertions.
+func (f *fakeRunner) RunWithSensitiveStdin(
+	ctx context.Context,
+	command,
+	_ string,
+) (harness.Result, error) {
+	return f.Run(ctx, command)
 }
 
 // RunWithTTY records and resolves identically to Run; the fake does not
@@ -116,8 +127,15 @@ controlPlane:
     reval: reval.localhost
     nats: nats.localhost
     invocation: invocation.localhost
+managementTls:
+  trustMode: bundle
+  caBundlePem: test-ca-bundle
+transportTls:
+  trustMode: bundle
+  trustBundleFingerprint: sha256:test-fingerprint
+  trustBundlePem: test-ca-bundle
 `
-	writeArtifact(t, repoRoot, "control-plane-profile.yaml", body)
+	writeArtifact(t, repoRoot, "self-managed", "control-plane-profile.yaml", body)
 }
 
 // writeMulticlusterProfileHandoffArtifact seeds the profile that the
@@ -150,13 +168,20 @@ controlPlane:
     reval: reval.localhost
     nats: nats.localhost
     invocation: invocation.localhost
+managementTls:
+  trustMode: bundle
+  caBundlePem: test-ca-bundle
+transportTls:
+  trustMode: bundle
+  trustBundleFingerprint: sha256:test-fingerprint
+  trustBundlePem: test-ca-bundle
 `
-	writeArtifact(t, repoRoot, "control-plane-profile.yaml", body)
+	writeArtifact(t, repoRoot, "self-managed", "control-plane-profile.yaml", body)
 }
 
 // writeMulticlusterComputeRegisterValues seeds the per-compute-cluster
 // register-values handoff the multi-cluster install scenario reads.
-func writeMulticlusterComputeRegisterValues(t *testing.T, repoRoot, cluster string) {
+func writeMulticlusterComputeRegisterValues(t *testing.T, repoRoot, stackDir, cluster string) {
 	t.Helper()
 	body := `clusterName: ` + cluster + `
 clusterID: 99999999-aaaa-bbbb-cccc-dddddddddddd
@@ -169,7 +194,8 @@ selfManaged:
   revalServiceURL: http://reval.localhost:8080
   natsURL: nats://nats.localhost:4222
 `
-	writeArtifact(t, repoRoot, cluster+"-register-values.yaml", body)
+	writeArtifact(t, repoRoot, stackDir, cluster+"-register-values.yaml", body)
+	writeRegistrationArtifact(t, repoRoot, stackDir, cluster+"-register-values.yaml", body)
 }
 
 // writeSingleClusterComputeRegisterValues seeds the register-values
@@ -178,7 +204,7 @@ selfManaged:
 // hostnames in single-cluster topology (worker and CP share the same
 // k3d cluster, so the in-cluster URLs are the directly reachable
 // ones). The multi-cluster equivalent in writeMulticlusterComputeRegisterValues
-// uses the compute-reachable .test hostnames instead.
+// uses compute-reachable gateway hostnames instead.
 func writeSingleClusterComputeRegisterValues(t *testing.T, repoRoot string) {
 	t.Helper()
 	body := `clusterName: ncp-local
@@ -192,38 +218,38 @@ selfManaged:
   revalServiceURL: http://reval.nvcf.svc.cluster.local:8080
   natsURL: nats://nats.nats-system.svc.cluster.local:4222
 `
-	writeArtifact(t, repoRoot, "ncp-local-register-values.yaml", body)
+	writeArtifact(t, repoRoot, "nvcf-compute-plane", "ncp-local-register-values.yaml", body)
+	writeRegistrationArtifact(t, repoRoot, "nvcf-compute-plane", "ncp-local-register-values.yaml", body)
 }
 
-// writeHelmfileRegisterValues seeds the register-values handoff the
-// single-cluster-helmfile.feature register scenario reads. The stack
-// Makefile passes CLUSTER_NAME separately to helmfile, so the file
-// produced by `make register-cluster` does not carry clusterName at
-// the top level and the selfManaged URLs use the compute-reachable
-// localhost hostnames.
+// writeHelmfileRegisterValues seeds the compute-plane register-values handoff
+// the single-cluster-helmfile.feature register scenario reads. Profile-driven
+// registration records clusterName and selects in-cluster endpoints when the
+// compute target is the control-plane cluster.
 func writeHelmfileRegisterValues(t *testing.T, repoRoot string) {
 	t.Helper()
-	body := `clusterID: 11111111-2222-3333-4444-555555555555
+	body := `clusterName: ncp-local
+clusterID: 11111111-2222-3333-4444-555555555555
 clusterGroupID: aaaa-bbbb-cccc-dddd
 ncaID: nvcf-default
 region: us-west-1
 selfManaged:
   identitySource: psat
-  icmsServiceURL: http://sis.localhost:8080
-  revalServiceURL: http://reval.localhost:8080
-  natsURL: nats://nats.localhost:4222
+  icmsServiceURL: http://api.sis.svc.cluster.local:8080
+  revalServiceURL: http://reval.nvcf.svc.cluster.local:8080
+  natsURL: nats://nats.nats-system.svc.cluster.local:4222
 `
-	writeArtifact(t, repoRoot, "ncp-local-register-values.yaml", body)
+	writeArtifact(t, repoRoot, "nvcf-compute-plane", "ncp-local-register-values.yaml", body)
+	writeRegistrationArtifact(t, repoRoot, "nvcf-compute-plane", "ncp-local-register-values.yaml", body)
 }
 
-// seedStackSecretsTemplate writes a minimal stand-in for
-// deploy/stacks/self-managed/secrets/secrets.yaml.template at the
-// suite's RepoRoot. The body is not a faithful copy of the real
-// stack template (which has a richer schema with several placeholders
-// across openbao and api blocks); it only carries the single
-// REPLACE_WITH_BASE64_DOCKER_CREDENTIAL token the feature substitutes,
-// which is sufficient to exercise the I copy and I substitute steps
-// against a fake CommandRunner.
+// seedStackSecretsTemplate writes minimal stand-ins for the split stack
+// templates under deploy/stacks/self-managed/secrets/secrets.yaml.template at
+// the suite's RepoRoot. The body is not a faithful copy of the real
+// stack templates (which have richer schemas with several placeholders);
+// it only carries the single REPLACE_WITH_BASE64_DOCKER_CREDENTIAL token
+// the self-managed secrets step renders, which is sufficient to exercise
+// the file preparation path against a fake CommandRunner.
 func seedStackSecretsTemplate(t *testing.T, repoRoot string) {
 	t.Helper()
 	templatePath := filepath.Join(repoRoot, "deploy", "stacks", "self-managed", "secrets", "secrets.yaml.template")
@@ -235,11 +261,22 @@ func seedStackSecretsTemplate(t *testing.T, repoRoot string) {
 	}
 }
 
-func writeArtifact(t *testing.T, repoRoot, name, body string) {
+func writeArtifact(t *testing.T, repoRoot, stackDir, name, body string) {
 	t.Helper()
-	dir := filepath.Join(repoRoot, "deploy", "stacks", "self-managed", "out")
+	dir := filepath.Join(repoRoot, "deploy", "stacks", stackDir, "out")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir handoff: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func writeRegistrationArtifact(t *testing.T, repoRoot, stackDir, name, body string) {
+	t.Helper()
+	dir := filepath.Join(repoRoot, "deploy", "stacks", stackDir, "registration")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir registration handoff: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
@@ -255,6 +292,8 @@ func writeArtifact(t *testing.T, repoRoot, name, body string) {
 func TestSingleClusterUpFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
 	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
 	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
 		// Conflict precheck: the feature asserts the conflicting
 		// multi-cluster control-plane is absent. Mimic k3d v5 "not
@@ -265,6 +304,8 @@ func TestSingleClusterUpFeatureFileWiresToSteps(t *testing.T) {
 	writeProfileHandoffArtifact(t, suite.Config.RepoRoot)
 	writeSingleClusterComputeRegisterValues(t, suite.Config.RepoRoot)
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
 
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-up.feature")
@@ -290,9 +331,9 @@ func TestSingleClusterUpFeatureFileWiresToSteps(t *testing.T) {
 
 // TestSingleClusterUpOneClickFeatureFileWiresToSteps runs the
 // self-hosted up one-click feature against a fake CommandRunner. The
-// helm-list canned outputs carry --kube-context k3d-ncp-local so the
-// control-plane and nvca-operator json-rows assertions have something to
-// parse; the conflict-precheck k3d-get returns exit 1.
+// helm-list canned output carries --kube-context k3d-ncp-local so the
+// control-plane and nvca-operator assertions have something to parse;
+// the conflict-precheck k3d-get returns exit 1.
 func TestSingleClusterUpOneClickFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
 	t.Setenv("NGC_API_KEY", "test-key")
@@ -300,12 +341,17 @@ func TestSingleClusterUpOneClickFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
 	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
 		"helm list --all-namespaces --kube-context k3d-ncp-local -o json": {ExitCode: 0, Stdout: helmListAllNamespacesJSON()},
-		"helm list -n nvca-operator --kube-context k3d-ncp-local -o json": {ExitCode: 0, Stdout: helmListNVCAJSON()},
+		"kubectl --context k3d-ncp-local get configmap/nvcf-api-remote-config -n nvcf -o yaml": {
+			ExitCode: 0,
+			Stdout:   "data:\n  nvcf-api.yaml: |\n    nvcf:\n      sidecars:\n        llm-router-client-image: nvcr.io/test-org/test-team/pylon:test\n",
+		},
 		// Conflict precheck: feature asserts the multi-cluster
 		// control-plane is absent.
 		"k3d cluster get ncp-local-cp": {ExitCode: 1},
 	}))
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
 
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-up-oneclick.feature")
@@ -333,7 +379,7 @@ func TestSingleClusterUpOneClickFeatureFileWiresToSteps(t *testing.T) {
 // TestMultiClusterUpFeatureFileWiresToSteps runs multi-cluster-up.feature
 // against a fake CommandRunner, exercising the same handler chain as
 // the live run. The seeded handoff artifacts use the split-cluster
-// nvcf-control-plane.test hostnames that the install command produces.
+// service-DNS hostnames that the install command produces.
 func TestMultiClusterUpFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
 	t.Setenv("NGC_API_KEY", "test-key")
@@ -345,8 +391,10 @@ func TestMultiClusterUpFeatureFileWiresToSteps(t *testing.T) {
 		"k3d cluster get ncp-local": {ExitCode: 1},
 	}))
 	writeMulticlusterProfileHandoffArtifact(t, suite.Config.RepoRoot)
-	writeMulticlusterComputeRegisterValues(t, suite.Config.RepoRoot, "ncp-local-compute-1")
+	writeMulticlusterComputeRegisterValues(t, suite.Config.RepoRoot, "nvcf-compute-plane", "ncp-local-compute-1")
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	seedHelmfileLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDMultiFixture(t, suite.Config.RepoRoot)
 
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "multi-cluster-up.feature")
@@ -374,28 +422,83 @@ func TestMultiClusterUpFeatureFileWiresToSteps(t *testing.T) {
 // single-cluster-helmfile.feature against a fake runner. The fixture
 // the feature copies from is seeded into the wiring suite's RepoRoot
 // so the I copy / I update yaml chain has a real source file. The
-// fake runner is pre-loaded with canned JSON for the `helm list` step
-// so the json-rows assertion has something to parse.
+// fake runner is pre-loaded with canned JSON for the Helm release assertion.
 func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
+	const vanityInvokeScript = `IFS= read -r api_key || [ -n "$api_key" ]; exec curl --silent --show-error --fail-with-body --header "Authorization: Bearer ${api_key}" "$@"`
+	const selectedFunctionStatusCommand = `/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml status --json`
+	const selectedFunctionStatusJSON = `{"currentFunction":{"hasFunction":true,"functionId":"function-1","versionId":"version-1"}}`
+	vanityInvokeCommand := dsl.BuildCommand(
+		"/bin/sh", "-c", vanityInvokeScript, "vanity-gateway-request",
+		"--request", "POST",
+		"--header", "Host: vanity.localhost",
+		"--header", "Content-Type: application/json",
+		"--data", `{"message":"bdd-vanity-echo","repeats":1}`,
+		"--retry", "24",
+		"--retry-all-errors",
+		"--retry-delay", "5",
+		"--retry-max-time", "120",
+		"--max-time", "120",
+		"http://127.0.0.1:8080/bdd/echo",
+	)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	t.Setenv("NGC_API_KEY", "test-key")
 	t.Setenv("SAMPLE_NGC_ORG", "test-org")
 	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
 	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
 	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
 	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
-		"helm list --all-namespaces -o json": {ExitCode: 0, Stdout: helmListAllNamespacesJSON()},
-		"helm list -n nvca-operator -o json": {ExitCode: 0, Stdout: helmListNVCAJSON()},
+		"helm list --all-namespaces --kube-context k3d-ncp-local -o json": {ExitCode: 0, Stdout: helmListAllNamespacesWithVanityJSON()},
+		"kubectl --context k3d-ncp-local get configmap/nvcf-api-remote-config -n nvcf -o yaml": {
+			ExitCode: 0,
+			Stdout:   "data:\n  nvcf-api.yaml: |\n    nvcf:\n      sidecars:\n        llm-router-client-image: nvcr.io/test-org/test-team/pylon:test\n",
+		},
 		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-echo\",\"repeats\":1}' --timeout 120 --poll-duration 5": {
 			ExitCode: 0,
 			Stdout:   "Function invocation completed!\n\nResponse:\n{\"rawResponse\":\"bdd-echo\"}\n",
+		},
+		selectedFunctionStatusCommand: {
+			ExitCode: 0,
+			Stdout:   selectedFunctionStatusJSON,
+		},
+		vanityInvokeCommand: {
+			ExitCode: 0,
+			Stdout:   "Function invocation completed!\n\nResponse:\n{\"rawResponse\":\"bdd-vanity-echo\"}\n",
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke" +
+			" --grpc --grpc-plaintext --grpc-service Echo --grpc-method EchoMessage" +
+			" --request-body '{\"message\":\"bdd-grpc-echo\"}' --timeout 120 --poll-duration 5": {
+			ExitCode: 0,
+			Stdout:   "Function invocation completed!\n\nResponse:\n{\"message\":\"bdd-grpc-echo\"}\n",
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke" +
+			" --inference-url /v1/chat/completions --model-name openai-compatible-sample" +
+			" --request-body '{\"messages\":[{\"role\":\"user\",\"content\":\"bdd-llm-echo\"}]}' --timeout 120": {
+			ExitCode: 0,
+			Stdout: "Function invocation completed!\n\nResponse:\n" +
+				`{"object":"chat.completion","choices":[{"message":{"content":"This is a fixed 128-byte response from an NVCF-hosted OpenAI-compatible sample, used for load testing and throughput benchmarks."}}]}` +
+				"\n",
+		},
+		`curl -s -o /dev/null -w "%{http_code}" -X POST http://llm.localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"unauthenticated/check","messages":[]}'`: {
+			ExitCode: 0,
+			Stdout:   "401",
 		},
 		// Conflict precheck: feature asserts the conflicting
 		// multi-cluster control-plane is absent.
 		"k3d cluster get ncp-local-cp": {ExitCode: 1},
 	}))
 	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	writeProfileHandoffArtifact(t, suite.Config.RepoRoot)
 	writeHelmfileRegisterValues(t, suite.Config.RepoRoot)
+	if err := os.WriteFile(
+		filepath.Join(home, ".nvcf-cli.nvcf-cli-local.state"),
+		[]byte(`{"apiKey":"wiring-function-api-key"}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write NVCF CLI state: %v", err)
+	}
 
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile.feature")
@@ -421,11 +524,570 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function invoke") {
 		t.Fatal("function invoke CLI command was never invoked")
 	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"curl --silent --show-error --fail-with-body",
+		"Host: vanity.localhost",
+		"http://127.0.0.1:8080/bdd/echo",
+		"bdd-vanity-echo") {
+		t.Fatal("Vanity Gateway exact-host request was never invoked")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"apply HELMFILE_ENV=local-bdd",
+		"HELMFILE_SELECTOR=name=vanity-gateway") {
+		t.Fatal("Vanity Gateway mapping was not applied through the targeted Helmfile release")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function invoke --grpc --grpc-plaintext") {
+		t.Fatal("gRPC function invoke CLI command was never invoked")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "bdd-grpc-load-tester-supreme") {
+		t.Fatal("gRPC sample function was never created or deployed")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"function create --name bdd-grpc-load-tester-supreme",
+		"load_tester_supreme:0.0.8",
+		"--health-protocol GRPC --health-uri / --health-port 8001") {
+		t.Fatal("gRPC sample function was not configured with a gRPC health endpoint")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"api-key generate --for function",
+		"--description bdd-load-tester-supreme") {
+		t.Fatal("HTTP sample function API key was not generated for the function service")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"api-key generate --for function",
+		"--description bdd-grpc-load-tester-supreme") {
+		t.Fatal("gRPC sample function API key was not generated for the function service")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"function create --name bdd-openai-compatible-sample",
+		"nvcf-openai-compatible-sample:local",
+		"--function-type LLM",
+		"--llm-model") {
+		t.Fatal("LLM sample function was not created with the LLM function type and model config")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function invoke --inference-url /v1/chat/completions --model-name openai-compatible-sample") {
+		t.Fatal("LLM function invoke CLI command was never invoked")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function delete --deployment-only") {
+		t.Fatal("function deployment cleanup was never invoked")
+	}
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 3)
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "http://llm.localhost:8080/v1/chat/completions") {
+		t.Fatal("unauthenticated LLM gateway check was never invoked")
+	}
+}
+
+// TestSingleClusterHelmfileLLMPKIFeatureFileWiresToSteps runs the
+// LLM PKI Helmfile feature against a fake runner, with canned results
+// for the LLM invoke and the no-auth curl.
+func TestSingleClusterHelmfileLLMPKIFeatureFileWiresToSteps(t *testing.T) {
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
+		"helm list --all-namespaces --kube-context k3d-ncp-local -o json": {ExitCode: 0, Stdout: helmListAllNamespacesJSON()},
+		"kubectl --context k3d-ncp-local get configmap/nvcf-api-remote-config -n nvcf -o yaml": {
+			ExitCode: 0,
+			Stdout: "data:\n  nvcf-api.yaml: |\n    nvcf:\n" +
+				"      llm-request-router:\n        worker-address: llm-request-router.nvcf.svc.cluster.local:50071\n" +
+				"      sidecars:\n        llm-router-client-image: nvcr.io/test-org/test-team/pylon:test\n",
+		},
+		"helm get values nvca-operator --namespace nvca-operator --kube-context k3d-ncp-local -o yaml": {
+			ExitCode: 0,
+			Stdout:   "agentConfig:\n  mergeConfig: |\n    workload:\n      stargateQUICInsecure: false\n      transportTLS:\n        trustMode: bundle\n        trustBundleFingerprint: sha256:test\n",
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke" +
+			" --inference-url /v1/chat/completions --model-name openai-compatible-sample" +
+			" --request-body '{\"messages\":[{\"role\":\"user\",\"content\":\"bdd-pki-llm\"}]}' --timeout 120": {
+			ExitCode: 0,
+			Stdout: "Function invocation completed!\n\nResponse:\n" +
+				`{"object":"chat.completion","choices":[{"message":{"content":"This is a fixed 128-byte response from an NVCF-hosted OpenAI-compatible sample, used for routing and response-contract validation, not token-generation capacity."}}]}` +
+				"\n",
+		},
+		`curl -s --connect-timeout 5 --max-time 30 -o /dev/null -w "%{http_code}" -X POST ` +
+			`http://llm.localhost:8080/v1/chat/completions -H "Content-Type: application/json" ` +
+			`-H "traceparent: 00-00000000000000000000000000001076-0000000000001076-01" ` +
+			`-d '{"model":"unauthenticated/check","messages":[]}'`: {
+			ExitCode: 0,
+			Stdout:   "401",
+		},
+		// Conflict precheck: feature asserts the conflicting
+		// multi-cluster control-plane is absent.
+		"k3d cluster get ncp-local-cp": {ExitCode: 1},
+	}))
+	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	writeProfileHandoffArtifact(t, suite.Config.RepoRoot)
+	writeHelmfileRegisterValues(t, suite.Config.RepoRoot)
+	seedPKIRenderOutput(t, suite.Config.RepoRoot)
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile-llm-pki.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "single-cluster-helmfile-llm-pki-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+	runs := suite.Runner.(*fakeRunner).runs
+	if !commandRanThatContains(runs, "install HELMFILE_ENV=local-bdd-pki") {
+		t.Fatal("PKI helmfile install make target was never invoked")
+	}
+	profileExport := "/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml" +
+		" self-hosted --control-plane-stack deploy/stacks/self-managed --env local-bdd-pki" +
+		" control-plane profile export --cluster-name ncp-local"
+	initCommand := "/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml init >/dev/null"
+	profileExportIndex := -1
+	initIndex := -1
+	registerIndex := -1
+	for index, command := range runs {
+		if strings.Contains(command, profileExport) {
+			profileExportIndex = index
+		}
+		if strings.Contains(command, initCommand) {
+			initIndex = index
+		}
+		if strings.Contains(command, "register-cluster CLUSTER_NAME=ncp-local") {
+			registerIndex = index
+			if !strings.Contains(command, "CONTROL_PLANE_PROFILE=/repo-root-placeholder/deploy/stacks/self-managed/out/control-plane-profile.yaml") {
+				t.Fatalf("compute-plane registration did not use the exported profile: %s", command)
+			}
+			if !strings.Contains(command, "COMPUTE_KUBE_CONTEXT=k3d-ncp-local") {
+				t.Fatalf("compute-plane registration did not select the local cluster context: %s", command)
+			}
+			if !strings.Contains(command, "NVCF_CLI_CONFIG=/repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml") {
+				t.Fatalf("compute-plane registration did not select the initialized CLI config: %s", command)
+			}
+		}
+	}
+	if profileExportIndex < 0 {
+		t.Fatal("selected Helmfile environment was not exported to a control-plane profile")
+	}
+	if initIndex < 0 {
+		t.Fatal("local admin credentials were not initialized before compute-plane registration")
+	}
+	if registerIndex < 0 {
+		t.Fatal("compute-plane register-cluster make target was never invoked")
+	}
+	if profileExportIndex >= initIndex || initIndex >= registerIndex {
+		t.Fatal("profile export and credential initialization did not precede compute-plane registration")
+	}
+	assertFunctionDeploymentsUseInstanceType(t, runs, "NCP.GPU.H100_1x", 1)
+}
+
+// TestObservabilityControlFeatureFileWiresToSteps runs the live-install
+// observability-control feature against a fake runner. It checks the
+// single-cluster Helmfile path renders and verifies the profile-selected
+// shared releases and monitor resources through explicit local context calls.
+func TestObservabilityControlFeatureFileWiresToSteps(t *testing.T) {
+	const (
+		registryLoginCommand    = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
+		serviceMonitorCommand   = "kubectl get servicemonitor/nvcf-default-monitors-state-metrics --namespace monitoring --context k3d-ncp-local -o name"
+		absentPodMonitorCommand = "kubectl get podmonitor/nvcf-default-monitors-worker --namespace monitoring --context k3d-ncp-local --ignore-not-found -o name"
+		collectorYAMLCommand    = "kubectl get opentelemetrycollector/nvcf-observability --namespace monitoring --context k3d-ncp-local -o yaml"
+	)
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
+		registryLoginCommand:           {ExitCode: 0},
+		serviceMonitorCommand:          {ExitCode: 0},
+		absentPodMonitorCommand:        {ExitCode: 0},
+		"k3d cluster get ncp-local-cp": {ExitCode: 1},
+		"helm list --all-namespaces --kube-context k3d-ncp-local -o json": {
+			ExitCode: 0,
+			Stdout:   observabilityControlHelmListJSON(),
+		},
+		collectorYAMLCommand: {
+			ExitCode: 0,
+			Stdout:   observabilityCollectorYAML(),
+		},
+	}))
+	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "observability-control.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "observability-control-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+	runs := suite.Runner.(*fakeRunner).runs
+	for _, command := range []string{
+		registryLoginCommand,
+		serviceMonitorCommand,
+		absentPodMonitorCommand,
+	} {
+		if !commandRanExactly(runs, command) {
+			t.Fatalf("exact command was never invoked: %s", command)
+		}
+	}
+	if !commandRanThatContains(runs, "install HELMFILE_ENV=local-bdd-observability-control") {
+		t.Fatal("control-profile Helmfile install command was never invoked")
+	}
+}
+
+func observabilityControlHelmListJSON() string {
+	return `[
+{"name":"prometheus-operator-crds","namespace":"monitoring","status":"deployed"},
+{"name":"opentelemetry-operator","namespace":"monitoring","status":"deployed"},
+{"name":"victoria-metrics","namespace":"monitoring","status":"deployed"},
+{"name":"otel-collector","namespace":"monitoring","status":"deployed"},
+{"name":"default-monitors","namespace":"monitoring","status":"deployed"}
+]`
+}
+
+func observabilityCollectorYAML() string {
+	return `apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: nvcf-observability
+  namespace: monitoring
+spec:
+  targetAllocator:
+    enabled: true
+`
+}
+
+// TestObservabilityComputeFeatureFileWiresToSteps runs the live-install
+// observability-compute feature against a fake runner. It checks that every
+// cluster operation is explicitly routed to the local control or compute
+// cluster and that the compute profile verifies its releases and monitors.
+func TestObservabilityComputeFeatureFileWiresToSteps(t *testing.T) {
+	const (
+		registryLoginCommand        = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
+		serviceMonitorCommand       = "kubectl get servicemonitor/nvcf-default-monitors-nvca --namespace monitoring --context k3d-ncp-local-compute-1 -o name"
+		podMonitorCommand           = "kubectl get podmonitor/nvcf-default-monitors-worker --namespace monitoring --context k3d-ncp-local-compute-1 -o name"
+		absentServiceMonitorCommand = "kubectl get servicemonitor/nvcf-default-monitors-state-metrics --namespace monitoring --context k3d-ncp-local-compute-1 --ignore-not-found -o name"
+		collectorValuesCommand      = "helm get values nvca-operator --namespace nvca-operator --kube-context k3d-ncp-local-compute-1 -o yaml"
+		collectorYAMLCommand        = "kubectl get opentelemetrycollector/nvcf-observability --namespace monitoring --context k3d-ncp-local-compute-1 -o yaml"
+		serviceKeyCommand           = `bash -c 'set -eo pipefail; printf %s "$NGC_API_KEY" |` +
+			` kubectl --context k3d-ncp-local-compute-1 create secret generic ngc-service-api-key` +
+			` --namespace nvca-system --from-file=ngc-service-api-key=/dev/stdin --dry-run=client -o yaml |` +
+			` kubectl --context k3d-ncp-local-compute-1 apply -f -'`
+		restartNVCACommand = "kubectl --context k3d-ncp-local-compute-1 delete pod --namespace nvca-system --selector app.kubernetes.io/name=nvca --wait=false"
+	)
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
+		registryLoginCommand:        {ExitCode: 0},
+		"k3d cluster get ncp-local": {ExitCode: 1},
+		serviceMonitorCommand:       {ExitCode: 0},
+		podMonitorCommand:           {ExitCode: 0},
+		absentServiceMonitorCommand: {ExitCode: 0},
+		collectorValuesCommand:      {ExitCode: 0, Stdout: "selfManaged:\n  otelCollector:\n    enabled: true\n    imageRepository: nvcr.io/test-org/test-team/nvcf-otel-collector\n"},
+		"helm list --all-namespaces --kube-context k3d-ncp-local-compute-1 -o json": {
+			ExitCode: 0,
+			Stdout:   observabilityComputeHelmListJSON(),
+		},
+		collectorYAMLCommand: {
+			ExitCode: 0,
+			Stdout:   observabilityCollectorYAML(),
+		},
+		"helm status function-autoscaler --namespace nvcf --kube-context k3d-ncp-local-compute-1": {
+			ExitCode: 1,
+			Stderr:   "Error: release: not found\n",
+		},
+	}))
+	seedHelmfileLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	writeMulticlusterProfileHandoffArtifact(t, suite.Config.RepoRoot)
+	writeMulticlusterComputeRegisterValues(t, suite.Config.RepoRoot, "nvcf-compute-plane", "ncp-local-compute-1")
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "observability-compute.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "observability-compute-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+
+	runs := suite.Runner.(*fakeRunner).runs
+	for _, command := range []string{serviceMonitorCommand, podMonitorCommand, absentServiceMonitorCommand, collectorValuesCommand} {
+		if !commandRanExactly(runs, command) {
+			t.Fatalf("exact command was never invoked: %s", command)
+		}
+	}
+	if !commandRanThatContains(runs, "kubectl --context k3d-ncp-local-compute-1 delete pod --namespace nvca-system") {
+		t.Fatal("NVCA restart command was never invoked")
+	}
+	for _, run := range runs {
+		if strings.HasPrefix(run, "kubectl apply -f ") {
+			t.Fatalf("manifest apply relied on the ambient kube context: %s", run)
+		}
+		if strings.Contains(run, "test-key") {
+			t.Fatalf("NGC API key leaked into command arguments: %s", run)
+		}
+	}
+	for _, stack := range []string{"self-managed", "observability", "nvcf-compute-plane"} {
+		environmentPath := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", stack, "environments", "local-bdd-observability-compute.yaml")
+		profile, found, err := dsl.ReadYAMLKey(environmentPath, "observability.profile")
+		if err != nil {
+			t.Fatalf("read %s observability profile: %v", stack, err)
+		}
+		want := "compute"
+		if stack == "self-managed" {
+			want = "disabled"
+		}
+		if !found || profile != want {
+			t.Fatalf("%s observability profile = %q, found = %t; want %q", stack, profile, found, want)
+		}
+	}
+	computeEnvironmentPath := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", "nvcf-compute-plane", "environments", "local-bdd-observability-compute.yaml")
+	for key, want := range map[string]string{
+		"global.nvcaOperator.selfManaged.otelCollector.enabled": "true",
+	} {
+		got, found, err := dsl.ReadYAMLKey(computeEnvironmentPath, key)
+		if err != nil {
+			t.Fatalf("read compute-profile override %s: %v", key, err)
+		}
+		if !found || got != want {
+			t.Fatalf("compute-profile override %s = %q, found = %t; want %q", key, got, found, want)
+		}
+	}
+}
+
+func observabilityComputeHelmListJSON() string {
+	return `[
+{"name":"prometheus-operator-crds","namespace":"monitoring","status":"deployed"},
+{"name":"opentelemetry-operator","namespace":"monitoring","status":"deployed"},
+{"name":"victoria-metrics","namespace":"monitoring","status":"deployed"},
+{"name":"otel-collector","namespace":"monitoring","status":"deployed"},
+{"name":"default-monitors","namespace":"monitoring","status":"deployed"},
+{"name":"nvca-operator","namespace":"nvca-operator","status":"deployed"}
+]`
+}
+
+// TestObservabilityAllFeatureFileWiresToSteps runs the all-profile feature
+// against a fake runner. It keeps every cluster operation on the explicit
+// local context and verifies that one shared stack serves both monitor sets.
+func TestObservabilityAllFeatureFileWiresToSteps(t *testing.T) {
+	const (
+		registryLoginCommand   = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
+		serviceMonitorCommand  = "kubectl get servicemonitor/nvcf-default-monitors-state-metrics --namespace monitoring --context k3d-ncp-local -o name"
+		podMonitorCommand      = "kubectl get podmonitor/nvcf-default-monitors-worker --namespace monitoring --context k3d-ncp-local -o name"
+		collectorValuesCommand = "helm get values nvca-operator --namespace nvca-operator --kube-context k3d-ncp-local -o yaml"
+		collectorYAMLCommand   = "kubectl get opentelemetrycollector/nvcf-observability --namespace monitoring --context k3d-ncp-local -o yaml"
+		serviceKeyCommand      = `bash -c 'set -eo pipefail; printf %s "$NGC_API_KEY" |` +
+			` kubectl --context k3d-ncp-local create secret generic ngc-service-api-key` +
+			` --namespace nvca-system --from-file=ngc-service-api-key=/dev/stdin --dry-run=client -o yaml |` +
+			` kubectl --context k3d-ncp-local apply -f -'`
+		restartNVCACommand = "kubectl --context k3d-ncp-local delete pod --namespace nvca-system --selector app.kubernetes.io/name=nvca --wait=false"
+
+		selectedFunctionStatusCommand = `/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml status --json`
+		selectedFunctionStatusJSON    = `{"currentFunction":{"hasFunction":true,"functionId":"function-1","versionId":"version-1"}}`
+		listFunctionsCommand          = `/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml` +
+			` cluster agent list-functions --compute-plane-context k3d-ncp-local` +
+			` --kubeconfig /repo-root-placeholder/tests/bdd/out/ncp-local-observability-all-kubeconfig.yaml --json`
+		getFunctionCommand = `/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml` +
+			` cluster agent get-function function-1 version-1 --compute-plane-context k3d-ncp-local` +
+			` --kubeconfig /repo-root-placeholder/tests/bdd/out/ncp-local-observability-all-kubeconfig.yaml --json`
+	)
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
+		registryLoginCommand:           {ExitCode: 0},
+		"k3d cluster get ncp-local-cp": {ExitCode: 1},
+		serviceMonitorCommand:          {ExitCode: 0},
+		podMonitorCommand:              {ExitCode: 0},
+		collectorValuesCommand:         {ExitCode: 0, Stdout: "selfManaged:\n  otelCollector:\n    enabled: true\n    imageRepository: nvcr.io/test-org/test-team/nvcf-otel-collector\n"},
+		serviceKeyCommand:              {ExitCode: 0},
+		restartNVCACommand:             {ExitCode: 0},
+		"helm list --all-namespaces --kube-context k3d-ncp-local -o json": {
+			ExitCode: 0,
+			Stdout:   observabilityAllHelmListJSON(),
+		},
+		collectorYAMLCommand: {
+			ExitCode: 0,
+			Stdout:   observabilityCollectorYAML(),
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-autoscaler-echo\",\"repeats\":1}' --timeout 60 --poll-duration 5": {
+			ExitCode: 1,
+			Stderr:   "Error: failed to invoke function: API error 504:\n",
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-autoscaler-echo\",\"repeats\":1}' --timeout 600 --poll-duration 5": {
+			ExitCode: 0,
+			Stdout:   "Function invocation completed!\n\nResponse:\n{\"rawResponse\":\"bdd-autoscaler-echo\"}\n",
+		},
+		// The autoscaler scenario reads the selected function identity, proves the
+		// compute plane holds no instances for it, then polls until one runs.
+		selectedFunctionStatusCommand: {
+			ExitCode: 0,
+			Stdout:   selectedFunctionStatusJSON,
+		},
+		listFunctionsCommand: {
+			ExitCode: 0,
+			Stdout:   `[{"functionId":"other","functionVersionId":"other-version","instanceCount":2}]`,
+		},
+		getFunctionCommand: {
+			ExitCode: 0,
+			Stdout:   `{"instanceCount":1,"instances":[{"id":"i-1","status":"RUNNING"}]}`,
+		},
+	}))
+	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	writeProfileHandoffArtifact(t, suite.Config.RepoRoot)
+	writeHelmfileRegisterValues(t, suite.Config.RepoRoot)
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "observability-all.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "observability-all-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+
+	runs := suite.Runner.(*fakeRunner).runs
+	for _, command := range []string{
+		registryLoginCommand,
+		serviceMonitorCommand,
+		podMonitorCommand,
+		collectorValuesCommand,
+		serviceKeyCommand,
+		restartNVCACommand,
+	} {
+		if !commandRanExactly(runs, command) {
+			t.Fatalf("exact command was never invoked: %s", command)
+		}
+	}
+	for _, commandFragment := range []string{
+		"deploy/stacks/self-managed install HELMFILE_ENV=local-bdd-observability-all KUBECONFIG_FILE=/repo-root-placeholder/tests/bdd/out/ncp-local-observability-all-kubeconfig.yaml",
+		"register-cluster CLUSTER_NAME=ncp-local" +
+			" CONTROL_PLANE_PROFILE=/repo-root-placeholder/deploy/stacks/self-managed/out/control-plane-profile.yaml" +
+			" COMPUTE_KUBE_CONTEXT=k3d-ncp-local" +
+			" KUBECONFIG_FILE=/repo-root-placeholder/tests/bdd/out/ncp-local-observability-all-kubeconfig.yaml",
+		"deploy/stacks/nvcf-compute-plane install CLUSTER_NAME=ncp-local HELMFILE_ENV=local-bdd-observability-all KUBECONFIG_FILE=/repo-root-placeholder/tests/bdd/out/ncp-local-observability-all-kubeconfig.yaml",
+	} {
+		if !commandRanThatContains(runs, commandFragment) {
+			t.Fatalf("command containing %q was never invoked", commandFragment)
+		}
+	}
+	for _, run := range runs {
+		if strings.HasPrefix(run, "kubectl apply -f ") {
+			t.Fatalf("manifest apply relied on the ambient kube context: %s", run)
+		}
+		if strings.Contains(run, "test-key") {
+			t.Fatalf("NGC API key leaked into command arguments: %s", run)
+		}
+	}
+	if !commandRanThatContainsAll(runs,
+		"function deploy create",
+		"--min-instances 0",
+		"--max-instances 1") {
+		t.Fatal("autoscaler smoke function was not deployed from zero with a one-instance ceiling")
+	}
+	// The expected instance count and status now live in the feature text, so the
+	// canned compute-plane reads above are what prove them: the scenario only
+	// passes because the seeded list reports no row for the selected identity and
+	// the seeded detail reports one running instance.
+	if !commandRanExactly(runs, listFunctionsCommand) {
+		t.Fatal("autoscaler smoke did not prove the selected function started at zero instances")
+	}
+	if !commandRanExactly(runs, getFunctionCommand) {
+		t.Fatal("autoscaler smoke did not observe the selected function on the compute plane")
+	}
+	assertFunctionDeploymentsUseInstanceType(t, runs, "NCP.GPU.H100_1x", 1)
+
+	for _, stack := range []string{"self-managed", "observability", "nvcf-compute-plane"} {
+		environmentPath := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", stack, "environments", "local-bdd-observability-all.yaml")
+		profile, found, err := dsl.ReadYAMLKey(environmentPath, "observability.profile")
+		if err != nil {
+			t.Fatalf("read %s observability profile: %v", stack, err)
+		}
+		if !found || profile != "all" {
+			t.Fatalf("%s observability profile = %q, found = %t; want all", stack, profile, found)
+		}
+	}
+
+	assertions := []struct {
+		stack string
+		key   string
+		want  string
+	}{
+		{stack: "nvcf-compute-plane", key: "global.nvcaOperator.selfManaged.otelCollector.enabled", want: "true"},
+	}
+	for _, assertion := range assertions {
+		environmentPath := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", assertion.stack, "environments", "local-bdd-observability-all.yaml")
+		got, found, err := dsl.ReadYAMLKey(environmentPath, assertion.key)
+		if err != nil {
+			t.Fatalf("read %s override %s: %v", assertion.stack, assertion.key, err)
+		}
+		if !found || got != assertion.want {
+			t.Fatalf("%s override %s = %q, found = %t; want %q", assertion.stack, assertion.key, got, found, assertion.want)
+		}
+	}
+}
+
+func observabilityAllHelmListJSON() string {
+	return `[
+{"name":"prometheus-operator-crds","namespace":"monitoring","revision":"1","status":"deployed"},
+{"name":"opentelemetry-operator","namespace":"monitoring","revision":"1","status":"deployed"},
+{"name":"victoria-metrics","namespace":"monitoring","revision":"1","status":"deployed"},
+{"name":"otel-collector","namespace":"monitoring","revision":"1","status":"deployed"},
+{"name":"default-monitors","namespace":"monitoring","revision":"1","status":"deployed"},
+{"name":"function-autoscaler","namespace":"nvcf","revision":"1","status":"deployed"},
+{"name":"nvca-operator","namespace":"nvca-operator","revision":"1","status":"deployed"}
+]`
 }
 
 // TestMultiClusterHelmfileFeatureFileWiresToSteps runs
 // multi-cluster-helmfile.feature against a fake runner. The same
-// fixture seeds and canned helm-list outputs cover both scenarios;
+// fixture seeds and canned helm-list outputs cover the scenarios;
 // the helm list canned keys carry --kube-context because the
 // multi-cluster feature targets the cp and compute clusters
 // explicitly.
@@ -435,16 +1097,96 @@ func TestMultiClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
 	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
 	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	const taskSmokeCommand = "env NVCT_BDD_TASK_INSTANCE_TYPE=NCP.GPU.H100_1x tests/bdd/scripts/run-nvct-task-smoke.sh"
 	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
 		"helm list --all-namespaces --kube-context k3d-ncp-local-cp -o json":        {ExitCode: 0, Stdout: helmListAllNamespacesJSON()},
-		"helm list -n nvca-operator --kube-context k3d-ncp-local-compute-1 -o json": {ExitCode: 0, Stdout: helmListNVCAJSON()},
+		"helm list --all-namespaces --kube-context k3d-ncp-local-compute-1 -o json": {ExitCode: 0, Stdout: helmListNVCAJSON()},
+		"kubectl --context k3d-ncp-local-cp get configmap/nvcf-api-remote-config -n nvcf -o yaml": {
+			ExitCode: 0,
+			Stdout: "data:\n  nvcf-api.yaml: |\n    nvcf:\n" +
+				"      llm-request-router:\n        worker-address: https://llm-request-router.nvcf.svc.cluster.local:50071\n" +
+				"      sidecars:\n        llm-router-client-image: nvcr.io/test-org/test-team/pylon:test\n",
+		},
+		"kubectl get certificate/stargate-quic-tls --namespace nvcf --context k3d-ncp-local-cp -o yaml": {
+			ExitCode: 0,
+			Stdout:   "spec:\n  secretName: stargate-quic-tls\n  dnsNames:\n    - llm-request-router.nvcf.svc.cluster.local\n    - '*.llm-request-router-headless.nvcf.svc.cluster.local'\n",
+		},
+		"kubectl get certificate/llm-request-router-grpc-tls --namespace envoy-gateway-system --context k3d-ncp-local-cp -o yaml": {
+			ExitCode: 0,
+			Stdout:   "spec:\n  secretName: llm-request-router-grpc-tls\n  dnsNames:\n    - llm-request-router.nvcf.svc.cluster.local\n  issuerRef:\n    kind: ClusterIssuer\n    name: nvcf-openbao-pki\n",
+		},
+		"kubectl get gateway/grpc-gw --namespace envoy-gateway-system --context k3d-ncp-local-cp -o yaml": {
+			ExitCode: 0,
+			Stdout: "spec:\n  gatewayClassName: eg\n  listeners:\n" +
+				"    - name: tcp\n      protocol: TCP\n      port: 10081\n      allowedRoutes:\n        namespaces:\n          from: All\n" +
+				"    - name: worker-tcp\n      protocol: TCP\n      port: 10086\n      allowedRoutes:\n        namespaces:\n          from: All\n" +
+				"    - name: llm-grpc\n" +
+				"      protocol: HTTPS\n" +
+				"      port: 50071\n" +
+				"      tls:\n" +
+				"        mode: Terminate\n" +
+				"        certificateRefs:\n" +
+				"          - group: \"\"\n" +
+				"            kind: Secret\n" +
+				"            name: llm-request-router-grpc-tls\n" +
+				"      allowedRoutes:\n" +
+				"        namespaces:\n" +
+				"          from: All\n" +
+				"    - name: llm-quic\n      protocol: UDP\n      port: 50072\n      allowedRoutes:\n        namespaces:\n          from: All\n",
+		},
+		"kubectl get backendtrafficpolicy/llm-worker-grpc-streams --namespace envoy-gateway-system --context k3d-ncp-local-cp -o yaml": {
+			ExitCode: 0,
+			Stdout:   "spec:\n  targetRefs:\n    - group: gateway.networking.k8s.io\n      kind: GRPCRoute\n      name: llm-worker-grpc\n  timeout:\n    http:\n      requestTimeout: 0s\n      maxStreamDuration: 0s\n",
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-echo\",\"repeats\":1}' --timeout 120 --poll-duration 5": {
+			ExitCode: 0,
+			Stdout:   "Function invocation completed!\n\nResponse:\n{\"rawResponse\":\"bdd-echo\"}\n",
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke" +
+			" --grpc --grpc-plaintext --grpc-service Echo --grpc-method EchoMessage" +
+			" --request-body '{\"message\":\"bdd-grpc-echo\"}' --timeout 120 --poll-duration 5": {
+			ExitCode: 0,
+			Stdout:   "Function invocation completed!\n\nResponse:\n{\"message\":\"bdd-grpc-echo\"}\n",
+		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke" +
+			" --inference-url /v1/chat/completions --model-name openai-compatible-sample" +
+			" --request-body '{\"messages\":[{\"role\":\"user\",\"content\":\"bdd-multi-llm-echo\"}]}' --timeout 120": {
+			ExitCode: 0,
+			Stdout: "Function invocation completed!\n\nResponse:\n" +
+				`{"object":"chat.completion","choices":[{"message":{"content":"This is a fixed 128-byte response for routing and contract validation, not token-generation capacity."}}]}` +
+				"\n",
+		},
+		`curl -s --connect-timeout 5 --max-time 30 -o /dev/null -w "%{http_code}" -X POST ` +
+			`http://llm.localhost:8080/v1/chat/completions -H "Content-Type: application/json" ` +
+			`-H "traceparent: 00-00000000000000000000000000001019-0000000000001019-01" ` +
+			`-d '{"model":"unauthenticated/check","messages":[]}'`: {
+			ExitCode: 0,
+			Stdout:   "401",
+		},
+		taskSmokeCommand: {
+			ExitCode: 0,
+			Stdout:   "Task bdd-nvct-task-smoke status: COMPLETED\n",
+		},
 		// Conflict precheck: feature asserts the conflicting
 		// single-cluster is absent.
 		"k3d cluster get ncp-local": {ExitCode: 1},
 	}))
 	seedHelmfileLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	assertFileContains(t, filepath.Join(suite.Config.RepoRoot, "tests/bdd/fixtures/self-managed-local-bdd-multi.yaml"),
+		"workerConnectBaseURL: http://grpc.nvcf.svc.cluster.local:10086",
+		"chartPath: ../../../helm/gateway-routes/chart",
+		"chartPath: ../../../helm/llm-request-router/llm-request-router",
+		"llmRequestRouterAddress: https://llm-request-router.nvcf.svc.cluster.local:50071",
+		"secretName: llm-request-router-grpc-tls",
+		"grpcWorker:",
+		"llmWorker:",
+		"enabled: true",
+		"listenerName: worker-tcp",
+	)
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
-	writeMulticlusterComputeRegisterValues(t, suite.Config.RepoRoot, "ncp-local-compute-1")
+	writeMulticlusterProfileHandoffArtifact(t, suite.Config.RepoRoot)
+	writeMulticlusterComputeRegisterValues(t, suite.Config.RepoRoot, "nvcf-compute-plane", "ncp-local-compute-1")
 
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "multi-cluster-helmfile.feature")
@@ -464,8 +1206,524 @@ func TestMultiClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if status != 0 {
 		t.Fatalf("godog suite status = %d\n%s", status, out.String())
 	}
-	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "install-nvca-operator") {
-		t.Fatal("install-nvca-operator make target was never invoked")
+	environmentPath := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", "self-managed", "environments", "local-bdd.yaml")
+	for _, assertion := range []struct {
+		key  string
+		want string
+	}{
+		{key: "global.workerEndpoints.llmRequestRouterAddress", want: "https://llm-request-router.nvcf.svc.cluster.local:50071"},
+		{key: "addons.llm.requestRouter.chartPath", want: "../../../helm/llm-request-router/llm-request-router"},
+		{key: "addons.llm.requestRouter.backendRouter.pylonGrpcDialAddress", want: "https://llm-request-router.nvcf.svc.cluster.local:50071"},
+		{key: "addons.llm.requestRouter.backendRouter.pylonReverseTunnelDialAddress", want: "llm-request-router.nvcf.svc.cluster.local:50072"},
+		{key: "addons.llm.requestRouter.grpcTls.enabled", want: "true"},
+		{key: "addons.llm.requestRouter.grpcTls.mode", want: "certManager"},
+		{key: "addons.llm.requestRouter.grpcTls.secretName", want: "llm-request-router-grpc-tls"},
+		{key: "addons.llm.requestRouter.grpcTls.dnsNames[0]", want: "llm-request-router.nvcf.svc.cluster.local"},
+		{key: "addons.llm.pki.allowedDomains", want: "cluster.local"},
+		{key: "addons.llm.pki.dnsNames[0]", want: "llm-request-router.nvcf.svc.cluster.local"},
+		{key: "addons.llm.pki.dnsNames[1]", want: "*.llm-request-router-headless.nvcf.svc.cluster.local"},
+		{key: "ingress.gatewayApi.chartPath", want: "../../../helm/gateway-routes/chart"},
+		{key: "ingress.gatewayApi.routes.llmWorker.enabled", want: "true"},
+		{key: "ingress.gatewayApi.routes.llmWorker.backend.namespace", want: "nvcf"},
+		{key: "ingress.gatewayApi.gateways.llmGrpc.listenerName", want: "llm-grpc"},
+		{key: "ingress.gatewayApi.gateways.llmQuic.listenerName", want: "llm-quic"},
+	} {
+		got, found, err := dsl.ReadYAMLKey(environmentPath, assertion.key)
+		if err != nil {
+			t.Fatalf("read multi-cluster override %s: %v", assertion.key, err)
+		}
+		if !found || got != assertion.want {
+			t.Fatalf("multi-cluster override %s = %q, found = %t; want %q", assertion.key, got, found, assertion.want)
+		}
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "deploy/stacks/nvcf-compute-plane install") {
+		t.Fatal("compute-plane install make target was never invoked")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function invoke") {
+		t.Fatal("function invoke CLI command was never invoked")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function invoke --grpc --grpc-plaintext") {
+		t.Fatal("gRPC function invoke CLI command was never invoked")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "bdd-grpc-load-tester-supreme") {
+		t.Fatal("gRPC sample function was never created or deployed")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"function create --name bdd-grpc-load-tester-supreme",
+		"load_tester_supreme:0.0.8",
+		"--health-protocol GRPC --health-uri / --health-port 8001") {
+		t.Fatal("gRPC sample function was not configured with a gRPC health endpoint")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"api-key generate --for function",
+		"--description bdd-load-tester-supreme") {
+		t.Fatal("HTTP sample function API key was not generated for the function service")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"api-key generate --for function",
+		"--description bdd-grpc-load-tester-supreme") {
+		t.Fatal("gRPC sample function API key was not generated for the function service")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"function create --name bdd-multi-openai-compatible-sample",
+		"nvcf-openai-compatible-sample:local",
+		"--function-type LLM",
+		"--llm-model") {
+		t.Fatal("multi-cluster LLM sample function was not created with the LLM function type and model config")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function invoke --inference-url /v1/chat/completions --model-name openai-compatible-sample") {
+		t.Fatal("multi-cluster LLM function invoke CLI command was never invoked")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"api-key generate --for function",
+		"--description bdd-multi-openai-compatible-sample") {
+		t.Fatal("multi-cluster LLM sample function API key was not generated for the function service")
+	}
+	cleanupCount := 0
+	for _, command := range suite.Runner.(*fakeRunner).runs {
+		if strings.Contains(command, "function delete --deployment-only") {
+			cleanupCount++
+		}
+	}
+	if cleanupCount != 3 {
+		t.Fatalf("function deployment cleanup commands = %d, want 3", cleanupCount)
+	}
+	if commandRanThatContains(suite.Runner.(*fakeRunner).runs, "api-key generate --description bdd-nvct-task-smoke") {
+		t.Fatal("NVCT task smoke should not use nvcf-cli api-key generate because it emits function resources")
+	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, taskSmokeCommand) {
+		t.Fatal("NVCT task API smoke script was not invoked with the local instance type")
+	}
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 3)
+}
+
+// TestMultiClusterHelmfileLLMRegistrationMultiregionFeatureFileWiresToSteps
+// runs the secure recursive-discovery feature against a fake runner. The
+// observations cover distinct Deployment and StatefulSet router identities,
+// the HTTPS remote Watch URI, and Pylon's combined registration topology.
+func TestMultiClusterHelmfileLLMRegistrationMultiregionFeatureFileWiresToSteps(t *testing.T) {
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+
+	const (
+		watchStargatesScript = "bash tests/bdd/scripts/observe-watch-stargates.sh"
+		regionAWatchCommand  = watchStargatesScript +
+			" 127.0.0.1:50071 llm-request-router.nvcf.svc.cluster.local stargate-quic-tls nvcf k3d-ncp-local-cp 3"
+		regionBWatchCommand = watchStargatesScript +
+			" 127.0.0.1:50071 region-b-watch.nvcf.svc.cluster.local stargate-quic-tls nvcf k3d-ncp-local-cp 3"
+		pylonMetricsCommand = "bash tests/bdd/scripts/wait-pylon-metrics.sh" +
+			" bdd-registration-multiregion llm-worker k3d-ncp-local-compute-1 10m" +
+			" pylon_registration_stream_connected exactly 5" +
+			" pylon_reverse_tunnel_connected 'at least' 3"
+		grpcCertificateCommand = "kubectl --context k3d-ncp-local-cp get certificate llm-request-router-grpc-tls" +
+			" -n envoy-gateway-system -o jsonpath={.spec.dnsNames}"
+		invokeCommand = "/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke" +
+			" --inference-url /v1/chat/completions --model-name openai-compatible-sample" +
+			" --request-body '{\"messages\":[{\"role\":\"user\",\"content\":\"bdd-registration-multiregion\"}]}' --timeout 120"
+	)
+
+	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
+		"k3d cluster get ncp-local": {ExitCode: 1},
+		regionAWatchCommand: {
+			ExitCode: 0,
+			Stdout: `{"stargates":[` +
+				`{"identity":"llm-request-router-6c9f4b7d8f-abcde"},` +
+				`{"identity":"llm-request-router-6c9f4b7d8f-fghij"},` +
+				`{"identity":"llm-request-router-6c9f4b7d8f-klmno"}],` +
+				`"watchStargateUrls":["https://region-b-watch.nvcf.svc.cluster.local:50071"]}` + "\n",
+		},
+		regionBWatchCommand: {
+			ExitCode: 0,
+			Stdout: `{"stargates":[` +
+				`{"identity":"llm-request-router-region-b-0.llm-request-router-region-b-headless.nvcf.svc.cluster.local"},` +
+				`{"identity":"llm-request-router-region-b-1.llm-request-router-region-b-headless.nvcf.svc.cluster.local"}]}` + "\n",
+		},
+		grpcCertificateCommand: {
+			ExitCode: 0,
+			Stdout:   "[llm-request-router.nvcf.svc.cluster.local region-b-watch.nvcf.svc.cluster.local]",
+		},
+		pylonMetricsCommand: {
+			ExitCode: 0,
+			Stdout: "pylon_registration_stream_connected=5\n" +
+				"pylon_reverse_tunnel_connected=3\n",
+		},
+		invokeCommand: {
+			ExitCode: 0,
+			Stdout: "Function invocation completed!\n\nResponse:\n" +
+				`{"object":"chat.completion","choices":[{"message":{"content":"This is a fixed 128-byte response for routing and contract validation."}}]}` +
+				"\n",
+		},
+	}))
+	seedHelmfileLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	writeMulticlusterProfileHandoffArtifact(t, suite.Config.RepoRoot)
+	writeMulticlusterComputeRegisterValues(t, suite.Config.RepoRoot, "nvcf-compute-plane", "ncp-local-compute-1")
+	writeArtifact(
+		t,
+		suite.Config.RepoRoot,
+		"self-managed",
+		"registration-multiregion-rendered.yaml",
+		"kind: Deployment\n"+
+			"--remote-stargate-url=https://region-b-watch.nvcf.svc.cluster.local:50071\n",
+	)
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "multi-cluster-helmfile-llm-registration-multiregion.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "multi-cluster-helmfile-llm-registration-multiregion-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+	for _, command := range []string{
+		grpcCertificateCommand,
+		regionAWatchCommand,
+		regionBWatchCommand,
+		pylonMetricsCommand,
+	} {
+		if !commandRanExactly(suite.Runner.(*fakeRunner).runs, command) {
+			t.Fatalf("exact multi-region observation command was not invoked: %s", command)
+		}
+	}
+	if !commandRanThatContainsAll(
+		suite.Runner.(*fakeRunner).runs,
+		"function create --name bdd-registration-multiregion",
+		"--function-type LLM",
+		"--llm-model",
+	) {
+		t.Fatal("multi-region sample was not created as an LLM function")
+	}
+
+	environmentPath, err := dsl.HelmfileEnvironmentPath(
+		suite.Config.RepoRoot,
+		"self-managed",
+		"local-bdd-registration-multiregion",
+	)
+	if err != nil {
+		t.Fatalf("resolve multi-region environment: %v", err)
+	}
+	for _, expectation := range []struct {
+		key  string
+		want string
+	}{
+		{key: "addons.llm.requestRouter.grpcTls.dnsNames[1]", want: "region-b-watch.nvcf.svc.cluster.local"},
+		{key: "addons.llm.pki.dnsNames[2]", want: "region-b-watch.nvcf.svc.cluster.local"},
+		{key: "addons.llm.pki.dnsNames[3]", want: "*.llm-request-router-region-b-headless.nvcf.svc.cluster.local"},
+	} {
+		got, found, readErr := dsl.ReadYAMLKey(environmentPath, expectation.key)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", expectation.key, readErr)
+		}
+		if !found || got != expectation.want {
+			t.Fatalf("%s = %q, found %t, want %q", expectation.key, got, found, expectation.want)
+		}
+	}
+}
+
+// TestMultiClusterHelmfileLLMRegistrationTLSFeatureFileWiresToSteps runs the
+// focused secure registration feature against a fake runner. The canned
+// external observations cover the TLS listener, WatchStargates snapshot,
+// Pylon metrics, and authenticated invocation.
+func TestMultiClusterHelmfileLLMRegistrationTLSFeatureFileWiresToSteps(t *testing.T) {
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+
+	const (
+		grpcurlPreflightCommand = `/bin/sh -c 'command -v grpcurl >/dev/null'`
+		tlsHandshakeCommand     = `/bin/bash -c 'openssl s_client -connect 127.0.0.1:50071 ` +
+			`-servername llm-request-router.nvcf.svc.cluster.local -alpn h2 -verify_return_error ` +
+			`-CAfile <(kubectl --context k3d-ncp-local-cp get secret stargate-quic-tls -n nvcf ` +
+			`-o jsonpath="{.data.ca\.crt}" | base64 -d) </dev/null 2>&1'`
+		plaintextWatchCommand = `/bin/bash -c 'set -u; output=$(grpcurl -plaintext -max-time 5 ` +
+			`-import-path src/libraries/rust/stargate/crates/proto/proto -proto stargate.proto ` +
+			`127.0.0.1:50071 stargate.StargateControlPlane/WatchStargates 2>&1); rc=$?; ` +
+			`if [ "$rc" -eq 0 ]; then printf "%s\n" "plaintext Watch unexpectedly succeeded" >&2; ` +
+			`exit 1; fi; printf "%s\n" "$output" | ` +
+			`bash tests/bdd/scripts/assert-grpcurl-plaintext-tls-rejection.sh'`
+		tlsWatchCommand = "bash tests/bdd/scripts/observe-watch-stargates.sh" +
+			" 127.0.0.1:50071 llm-request-router.nvcf.svc.cluster.local" +
+			" stargate-quic-tls nvcf k3d-ncp-local-cp 3"
+		pylonMetricsCommand = "bash tests/bdd/scripts/wait-pylon-metrics.sh" +
+			" bdd-registration-tls llm-worker k3d-ncp-local-compute-1 10m" +
+			" pylon_registration_stream_connected exactly 3" +
+			" pylon_reverse_tunnel_connected exactly 3"
+		invokeCommand = "/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke" +
+			" --inference-url /v1/chat/completions --model-name openai-compatible-sample" +
+			" --request-body '{\"messages\":[{\"role\":\"user\",\"content\":\"bdd-registration-tls\"}]}' --timeout 120"
+		invalidAuthorityCommand = "make -C deploy/stacks/self-managed template " +
+			"HELMFILE_ENV=local-bdd-registration-tls-invalid-authority"
+	)
+
+	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
+		"k3d cluster get ncp-local": {ExitCode: 1},
+		grpcurlPreflightCommand:     {ExitCode: 0},
+		"kubectl --context k3d-ncp-local-cp get configmap/nvcf-api-remote-config -n nvcf -o yaml": {
+			ExitCode: 0,
+			Stdout:   "worker-address: https://llm-request-router.nvcf.svc.cluster.local:50071\n",
+		},
+		tlsHandshakeCommand: {
+			ExitCode: 0,
+			Stdout:   "ALPN protocol: h2\nVerify return code: 0 (ok)\n",
+		},
+		plaintextWatchCommand: {ExitCode: 0, Stdout: "plaintext-watch-rejected=tls-listener-timeout\n"},
+		tlsWatchCommand: {
+			ExitCode: 0,
+			Stdout: `{
+  "stargates": [
+    {"stargateId": "llm-request-router-0", "grpcPylonDialAddr": "https://llm-request-router.nvcf.svc.cluster.local:50071"},
+    {"stargateId": "llm-request-router-1", "grpcPylonDialAddr": "https://llm-request-router.nvcf.svc.cluster.local:50071"},
+    {"stargateId": "llm-request-router-2", "grpcPylonDialAddr": "https://llm-request-router.nvcf.svc.cluster.local:50071"}
+  ]
+}`,
+			Stderr: "ERROR: DeadlineExceeded",
+		},
+		pylonMetricsCommand: {
+			ExitCode: 0,
+			Stdout: "pylon_registration_stream_connected=3\n" +
+				"pylon_reverse_tunnel_connected=3\n",
+		},
+		invokeCommand: {
+			ExitCode: 0,
+			Stdout: "Function invocation completed!\n\nResponse:\n" +
+				`{"object":"chat.completion","choices":[{"message":{"content":"This is a fixed 128-byte response for routing and contract validation."}}]}` +
+				"\n",
+		},
+		invalidAuthorityCommand: {
+			ExitCode: 1,
+			Stderr: "global.workerEndpoints.llmRequestRouterAddress must use " +
+				"optional http:// or https:// followed by DNS-or-IPv4:port or [IPv6]:port " +
+				"with port 1-65535\n",
+		},
+	}))
+	seedHelmfileLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDMultiFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	writeProfileHandoffArtifact(t, suite.Config.RepoRoot)
+	writeMulticlusterComputeRegisterValues(t, suite.Config.RepoRoot, "nvcf-compute-plane", "ncp-local-compute-1")
+	writeArtifact(
+		t,
+		suite.Config.RepoRoot,
+		"self-managed",
+		"registration-tls-rendered.yaml",
+		"https://llm-request-router.nvcf.svc.cluster.local:50071\n"+
+			"--grpc-pylon-dial-addr=https://llm-request-router.nvcf.svc.cluster.local:50071\n",
+	)
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "multi-cluster-helmfile-llm-registration-tls.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "multi-cluster-helmfile-llm-registration-tls-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+	if !commandRanThatContainsAll(
+		suite.Runner.(*fakeRunner).runs,
+		"function create --name bdd-registration-tls",
+		"--function-type LLM",
+		"--llm-model",
+	) {
+		t.Fatal("secure registration sample was not created as an LLM function")
+	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, pylonMetricsCommand) {
+		t.Fatal("Pylon registration and reverse-tunnel metrics were not observed")
+	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, tlsWatchCommand) {
+		t.Fatal("WatchStargates was not observed over the trusted TLS listener")
+	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, plaintextWatchCommand) {
+		t.Fatal("plaintext WatchStargates rejection was not exercised")
+	}
+	runs := suite.Runner.(*fakeRunner).runs
+	if !commandRanExactly(runs, grpcurlPreflightCommand) {
+		t.Fatal("grpcurl availability was not checked before the live probes")
+	}
+	if !commandRanExactly(runs, invalidAuthorityCommand) {
+		t.Fatal("invalid registration authority was not rejected before installation")
+	}
+	for _, assertion := range []struct {
+		path string
+		want string
+	}{
+		{
+			path: filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", "self-managed", "environments", "local-bdd-registration-tls.yaml"),
+			want: "https://llm-request-router.nvcf.svc.cluster.local:50071",
+		},
+		{
+			path: filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", "self-managed", "environments", "local-bdd-registration-tls-invalid-authority.yaml"),
+			want: "https://llm_request_router.nvcf.svc.cluster.local:50071",
+		},
+	} {
+		got, found, err := dsl.ReadYAMLKey(assertion.path, "global.workerEndpoints.llmRequestRouterAddress")
+		if err != nil {
+			t.Fatalf("read worker endpoint override: %v", err)
+		}
+		if !found || got != assertion.want {
+			t.Fatalf("worker endpoint = %q, found = %t; want %q", got, found, assertion.want)
+		}
+	}
+}
+
+// TestSingleClusterHelmfileUpstreamImagesFeatureFileWiresToSteps runs the
+// focused upstream-image feature against a fake runner. The seeded global
+// template contains the exact documentation blocks so the ledger-backed
+// substitutions exercise real file writes.
+func TestSingleClusterHelmfileUpstreamImagesFeatureFileWiresToSteps(t *testing.T) {
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	upstreamReloader := "docker.io/natsio/nats-server-config-reloader:0.24.0"
+	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
+		"k3d cluster get ncp-local-cp": {ExitCode: 1},
+		"helm list --all-namespaces --kube-context k3d-ncp-local -o json": {
+			ExitCode: 0,
+			Stdout:   helmListAllNamespacesJSON(),
+		},
+		`kubectl get statefulset nats -n nats-system -o 'jsonpath={.spec.template.spec.containers[?(@.name=="reloader")].image}'`: {
+			ExitCode: 0,
+			Stdout:   upstreamReloader,
+		},
+	}))
+	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	seedUpstreamImageStackInputs(t, suite.Config.RepoRoot)
+	seedUpstreamImageRenderOutput(t, suite.Config.RepoRoot)
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile-upstream-images.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "single-cluster-helmfile-upstream-images-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+	runs := suite.Runner.(*fakeRunner).runs
+	if !commandRanThatContains(runs, "template HELMFILE_ENV=local-bdd") {
+		t.Fatal("helmfile template make target was never invoked")
+	}
+	for _, selector := range []string{
+		"HELMFILE_SELECTOR=release-group=dependencies",
+		"HELMFILE_SELECTOR=name=ess-api",
+		"HELMFILE_SELECTOR=name=nats-auth-callout-service",
+		"HELMFILE_SELECTOR=name=api",
+	} {
+		if !commandRanThatContains(runs, "install HELMFILE_ENV=local-bdd "+selector) {
+			t.Fatalf("helmfile install selector %q was never invoked", selector)
+		}
+	}
+	if commandRanThatContains(runs, "rg --fixed-strings") {
+		t.Fatal("rendered manifest assertions should not invoke rg")
+	}
+}
+
+// TestObservabilityDisabledFeatureFileWiresToSteps runs the render-only
+// observability-disabled feature against a fake runner. The fixture setup
+// mirrors the local Helmfile inputs while the feature asserts disabled profile
+// renders omit observability resources from both stacks.
+func TestObservabilityDisabledFeatureFileWiresToSteps(t *testing.T) {
+	const registryLoginCommand = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
+	t.Setenv("NGC_API_KEY", "test-key")
+	t.Setenv("SAMPLE_NGC_ORG", "test-org")
+	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
+	suite := newWiringSuite(t, newFakeRunner(nil))
+	t.Setenv("REPO_ROOT", suite.Config.RepoRoot)
+	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
+	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
+	seedObservabilityDisabledRegistrationValuesFixture(t, suite.Config.RepoRoot)
+	seedObservabilityDisabledRenderOutput(t, suite.Config.RepoRoot)
+
+	sc := steps.NewScenarioContext(suite)
+	featurePath := mustResolveFeaturePath(t, "observability-disabled.feature")
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "observability-disabled-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{featurePath},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("godog suite status = %d\n%s", status, out.String())
+	}
+	runs := suite.Runner.(*fakeRunner).runs
+	if !commandRanExactly(runs, registryLoginCommand) {
+		t.Fatal("Helm OCI registry login command was never invoked")
+	}
+	if !commandRanThatContains(runs, "deploy/stacks/self-managed template HELMFILE_ENV=local-bdd-observability-disabled") {
+		t.Fatal("control-plane Helmfile template command was never invoked")
+	}
+	if !commandRanThatContains(runs, "deploy/stacks/nvcf-compute-plane template CLUSTER_NAME=ncp-local HELMFILE_ENV=local-bdd-observability-disabled") {
+		t.Fatal("compute-plane Helmfile template command was never invoked")
+	}
+}
+
+func seedObservabilityDisabledRegistrationValuesFixture(t *testing.T, repoRoot string) {
+	t.Helper()
+	fixturePath := filepath.Join("fixtures", "ncp-local-register-values.yaml")
+	body, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read registration fixture %s: %v", fixturePath, err)
+	}
+	writeFixture(t, repoRoot, "ncp-local-register-values.yaml", string(body))
+}
+
+func seedObservabilityDisabledRenderOutput(t *testing.T, repoRoot string) {
+	t.Helper()
+	for _, relativePath := range []string{
+		filepath.Join("control-plane", "api.yaml"),
+		filepath.Join("compute-plane", "nvca.yaml"),
+	} {
+		path := filepath.Join(repoRoot, "tests", "bdd", "out", "observability-disabled", relativePath)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create rendered output directory: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("kind: Deployment\n"), 0o644); err != nil {
+			t.Fatalf("write rendered output %s: %v", relativePath, err)
+		}
 	}
 }
 
@@ -476,6 +1734,7 @@ func helmListAllNamespacesJSON() string {
 {"name":"nats","namespace":"nats-system","status":"deployed"},
 {"name":"cert-manager","namespace":"cert-manager","status":"deployed"},
 {"name":"openbao-server","namespace":"vault-system","status":"deployed"},
+{"name":"nvcf-pki","namespace":"cert-manager","status":"deployed"},
 {"name":"cassandra","namespace":"cassandra-system","status":"deployed"},
 {"name":"api-keys","namespace":"api-keys","status":"deployed"},
 {"name":"sis","namespace":"sis","status":"deployed"},
@@ -490,7 +1749,14 @@ func helmListAllNamespacesJSON() string {
 {"name":"nats-auth-callout-service","namespace":"nats-system","status":"deployed"},
 {"name":"ingress","namespace":"envoy-gateway-system","status":"deployed"},
 {"name":"llm-request-router","namespace":"nvcf","status":"deployed"},
-{"name":"llm-api-gateway","namespace":"nvcf","status":"deployed"}
+{"name":"llm-api-gateway","namespace":"nvcf","status":"deployed"},
+{"name":"nvca-operator","namespace":"nvca-operator","status":"deployed"}
+]`
+}
+
+func helmListAllNamespacesWithVanityJSON() string {
+	return strings.TrimSuffix(helmListAllNamespacesJSON(), "\n]") + `,
+{"name":"vanity-gateway","namespace":"nvcf","status":"deployed"}
 ]`
 }
 
@@ -509,29 +1775,201 @@ func seedHelmfileLocalBDDFixture(t *testing.T, repoRoot string) {
 	t.Helper()
 	writeFixture(t, repoRoot, "self-managed-local-bdd.yaml", `global:
   storageClass: local-path
+  workerEndpoints:
+    essServiceURL: http://ess-api.ess.svc.cluster.local:8080
+    invocationServiceURL: http://invocation.nvcf.svc.cluster.local:8080
 addons:
   llm:
     enabled: true
 `)
 }
 
+// seedUpstreamImageStackInputs writes the two stack files the focused
+// upstream-image feature copies and edits in its wiring test.
+func seedUpstreamImageStackInputs(t *testing.T, repoRoot string) {
+	t.Helper()
+	clusterSecretsDir := filepath.Join(repoRoot, "tools", "ncp-local-cluster", "secrets")
+	if err := os.MkdirAll(clusterSecretsDir, 0o755); err != nil {
+		t.Fatalf("mkdir cluster secrets dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(clusterSecretsDir, "docker-config.json"), []byte(`{
+  "auths": {
+    "nvcr.io": {}
+  }
+}`), 0o600); err != nil {
+		t.Fatalf("write docker config: %v", err)
+	}
+	stackDir := filepath.Join(repoRoot, "deploy", "stacks", "self-managed")
+	if err := os.MkdirAll(stackDir, 0o755); err != nil {
+		t.Fatalf("mkdir stack dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stackDir, "Makefile.dist"), []byte("template:\n\t@true\ninstall:\n\t@true\n"), 0o644); err != nil {
+		t.Fatalf("write Makefile.dist: %v", err)
+	}
+	global := `nats:
+  reloader:
+    image:
+      registry: {{ .Values.global.image.registry }}
+      repository: {{ .Values.global.image.repository }}/nats-server-config-reloader
+      tag: "0.24.0"
+api:
+  accountBootstrap:
+    image:
+      registry: {{ .Values.global.image.registry }}
+      repository: {{ .Values.global.image.repository }}/alpine-k8s
+      tag: 1.37.0
+      pullPolicy: IfNotPresent
+`
+	if err := os.WriteFile(filepath.Join(stackDir, "global.yaml.gotmpl"), []byte(global), 0o644); err != nil {
+		t.Fatalf("write global template: %v", err)
+	}
+}
+
+// seedUpstreamImageRenderOutput writes representative render directories for
+// the positive fixed-string assertions in the upstream-image feature.
+func seedUpstreamImageRenderOutput(t *testing.T, repoRoot string) {
+	t.Helper()
+	manifests := map[string]string{
+		"01-nats/templates/nats.yaml": `# Source: helm-nvcf-nats/templates/nkey-secret.yaml
+image: docker.io/natsio/nats-server-config-reloader:0.24.0
+`,
+		"02-cassandra/templates/cassandra.yaml": "image: nvcf-cassandra-migrations:latest\n",
+		"03-api/templates/api.yaml":             "image: docker.io/alpine/k8s:1.37.0\n",
+	}
+	root := filepath.Join(repoRoot, "deploy", "stacks", "self-managed", "out")
+	for relativePath, body := range manifests {
+		filePath := filepath.Join(root, filepath.FromSlash(relativePath))
+		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+			t.Fatalf("mkdir rendered manifest dir: %v", err)
+		}
+		if err := os.WriteFile(filePath, []byte(body), 0o644); err != nil {
+			t.Fatalf("write rendered manifest: %v", err)
+		}
+	}
+}
+
+// seedPKIRenderOutput writes the representative PKI resources asserted by the
+// focused Helmfile feature wiring test.
+func seedPKIRenderOutput(t *testing.T, repoRoot string) {
+	t.Helper()
+	manifest := `kind: ClusterIssuer
+metadata:
+  name: "nvcf-openbao-pki"
+spec:
+  dnsNames:
+    - llm-request-router.nvcf.svc.cluster.local
+env:
+  - name: ADDONS_LLM_ENABLED
+    value: "true"
+  - name: NVCF_SERVICE_PKI_ALLOWED_DOMAINS
+    value: "nvcf.svc.cluster.local"
+image: nvcr.io/test-org/test-team/nvcf-openbao-migrations:0.19.1
+`
+	filePath := filepath.Join(repoRoot, "deploy", "stacks", "self-managed", "out", "01-pki", "templates", "pki.yaml")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("mkdir rendered PKI manifest dir: %v", err)
+	}
+	if err := os.WriteFile(filePath, []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write rendered PKI manifest: %v", err)
+	}
+}
+
 // seedHelmfileLocalBDDMultiFixture writes the multi-cluster variant
 // the multi-cluster helmfile feature copies onto the env file. Its
-// nvcaOperator.selfManaged URLs target the .test hostnames the
-// compute cluster aliases to the control-plane LB; single-cluster
-// in-cluster URLs do not resolve across k3d clusters.
+// workerEndpoints and nvcaOperator.selfManaged URLs use the service
+// DNS names from the local stack. In multi-cluster local runs those
+// names resolve to alias Services in the compute cluster.
 func seedHelmfileLocalBDDMultiFixture(t *testing.T, repoRoot string) {
 	t.Helper()
 	writeFixture(t, repoRoot, "self-managed-local-bdd-multi.yaml", `global:
   storageClass: local-path
+  workerEndpoints:
+    essServiceURL: http://ess-api.ess.svc.cluster.local:8080
+    invocationServiceURL: http://invocation.nvcf.svc.cluster.local:8080
+    llmRequestRouterAddress: https://llm-request-router.nvcf.svc.cluster.local:50071
   nvcaOperator:
     selfManaged:
-      icmsServiceURL: http://sis.nvcf-control-plane.test:8080
-      revalServiceURL: http://reval.nvcf-control-plane.test:8080
-      natsURL: nats://nats.nvcf-control-plane.test:4222
+      icmsServiceURL: http://api.sis.svc.cluster.local:8080
+      revalServiceURL: http://reval.nvcf.svc.cluster.local:8080
+      natsURL: nats://nats.nats-system.svc.cluster.local:4222
 addons:
   llm:
     enabled: true
+    requestRouter:
+      chartPath: ../../../helm/llm-request-router/llm-request-router
+      grpcTls:
+        enabled: true
+        mode: certManager
+        secretName: llm-request-router-grpc-tls
+        dnsNames:
+          - llm-request-router.nvcf.svc.cluster.local
+      backendRouter:
+        pylonGrpcDialAddress: https://llm-request-router.nvcf.svc.cluster.local:50071
+        pylonReverseTunnelDialAddress: llm-request-router.nvcf.svc.cluster.local:50072
+    pki:
+      enabled: true
+      allowedDomains: cluster.local
+      dnsNames:
+        - llm-request-router.nvcf.svc.cluster.local
+        - "*.llm-request-router-headless.nvcf.svc.cluster.local"
+grpcproxy:
+  workerConnectBaseURL: http://grpc.nvcf.svc.cluster.local:10086
+ingress:
+  gatewayApi:
+    chartPath: ../../../helm/gateway-routes/chart
+    gateways:
+      llmGrpc:
+        listenerName: llm-grpc
+      llmQuic:
+        listenerName: llm-quic
+    routes:
+      grpcWorker:
+        enabled: true
+        listenerName: worker-tcp
+      llmWorker:
+        enabled: true
+        backend:
+          namespace: nvcf
+`)
+}
+
+func seedComputePlaneLocalBDDFixture(t *testing.T, repoRoot string) {
+	t.Helper()
+	writeFixture(t, repoRoot, "nvcf-compute-plane-local-bdd.yaml", `global:
+  nodeSelectors:
+    enabled: false
+  nvcaOperator:
+    selfManaged:
+      icmsServiceURL: http://api.sis.svc.cluster.local:8080
+      revalServiceURL: http://reval.nvcf.svc.cluster.local:8080
+      natsURL: nats://nats.nats-system.svc.cluster.local:4222
+agentConfig:
+  mergeConfig: |
+    cluster:
+      validationPolicy:
+        name: Unrestricted
+    workload:
+      stargateQUICInsecure: false
+`)
+}
+
+func seedComputePlaneLocalBDDMultiFixture(t *testing.T, repoRoot string) {
+	t.Helper()
+	writeFixture(t, repoRoot, "nvcf-compute-plane-local-bdd-multi.yaml", `global:
+  nodeSelectors:
+    enabled: false
+  nvcaOperator:
+    selfManaged:
+      icmsServiceURL: http://api.sis.svc.cluster.local:8080
+      revalServiceURL: http://reval.nvcf.svc.cluster.local:8080
+      natsURL: nats://nats.nats-system.svc.cluster.local:4222
+agentConfig:
+  mergeConfig: |
+    cluster:
+      validationPolicy:
+        name: Unrestricted
+    workload:
+      stargateQUICInsecure: false
 `)
 }
 
@@ -564,6 +2002,17 @@ func seedStackBaseYaml(t *testing.T, repoRoot string) {
 	}
 }
 
+func seedComputePlaneBaseYaml(t *testing.T, repoRoot string) {
+	t.Helper()
+	envPath := filepath.Join(repoRoot, "deploy", "stacks", "nvcf-compute-plane", "environments", "base.yaml")
+	if err := os.MkdirAll(filepath.Dir(envPath), 0o755); err != nil {
+		t.Fatalf("mkdir compute env dir: %v", err)
+	}
+	if err := os.WriteFile(envPath, []byte("global: {}\n"), 0o644); err != nil {
+		t.Fatalf("write compute base.yaml: %v", err)
+	}
+}
+
 // seedNVCFCLINonlocalTemplate writes a minimal stand-in for
 // tests/bdd/fixtures/nvcf-cli-nonlocal.yaml.template. The EKS feature's
 // @nvca-registration scenario copies this into tests/bdd/out/ and
@@ -578,14 +2027,12 @@ client_id: "nvcf-default"
 `)
 }
 
-// writeEKSRegisterValues seeds the register-values handoff the
-// @nvca-registration scenario reads back after register-cluster.sh.
-// The wiring test's fakeRunner does not actually run the script, so
-// the file must be pre-seeded with the same shape the assertions
-// expect: ncaID, region matching EKS_REGION, identitySource=psat, and
-// non-empty clusterID + clusterGroupID. The selfManaged URL fields are
-// rewritten in-place by the chart Host-header workaround step, so
-// their initial values do not have to match the EKS gateway.
+// writeEKSRegisterValues seeds the register-values handoff the EKS
+// @nvca-registration scenarios read back. The wiring test's fakeRunner
+// does not actually run the registration command, so the file must be
+// pre-seeded with the same shape the assertions expect: ncaID, region
+// matching EKS_REGION, identitySource=psat, and non-empty clusterID +
+// clusterGroupID.
 func writeEKSRegisterValues(t *testing.T, repoRoot, clusterName, region string) {
 	t.Helper()
 	body := `clusterID: 11111111-2222-3333-4444-555555555555
@@ -594,28 +2041,30 @@ ncaID: nvcf-default
 region: ` + region + `
 selfManaged:
   identitySource: psat
-  icmsServiceURL: http://wiring-elb.example.test
-  revalServiceURL: http://wiring-elb.example.test
-  natsURL: nats://wiring-elb.example.test:4222
+  icmsServiceURL: http://wiring-elb.example.invalid
+  revalServiceURL: http://wiring-elb.example.invalid
+  natsURL: nats://wiring-elb.example.invalid:4222
 `
-	writeArtifact(t, repoRoot, clusterName+"-register-values.yaml", body)
+	writeArtifact(t, repoRoot, "nvcf-compute-plane", clusterName+"-register-values.yaml", body)
+	writeRegistrationArtifact(t, repoRoot, "nvcf-compute-plane", clusterName+"-register-values.yaml", body)
 }
 
 // TestSingleClusterEKSHelmfileFeatureFileWiresToSteps runs the EKS
 // Helmfile feature against a fake CommandRunner. The fakeRunner
 // returns ExitCode 0 for unknown commands by default, so only the
 // commands with assertion-driven output (gateway-address jsonpath,
-// helm list JSON, httproute hostname) need canned responses. The
+// helm list JSON, HTTPRoute YAML) need canned responses. The
 // I export step records the gateway jsonpath stdout into the env
 // Ledger; subsequent ${EKS_GATEWAY_ADDR} interpolations then use the
 // exported value, which is what the @control-plane httproute
 // assertion expects to see.
 func TestSingleClusterEKSHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	const (
-		eksContext      = "arn:aws:eks:us-east-1:000000000000:cluster/wiring-test"
-		eksClusterName  = "wiring-test"
-		eksRegion       = "us-east-1"
-		wiringGatewayLB = "wiring-elb.example.test"
+		eksContext           = "arn:aws:eks:us-east-1:000000000000:cluster/wiring-test"
+		eksClusterName       = "wiring-test"
+		eksRegion            = "us-east-1"
+		wiringGatewayLB      = "wiring-elb.example.invalid"
+		registryLoginCommand = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
 	)
 	t.Setenv("NGC_API_KEY", "test-key")
 	t.Setenv("SAMPLE_NGC_ORG", "test-org")
@@ -637,14 +2086,14 @@ func TestSingleClusterEKSHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		"kubectl --context " + eksContext + " get gateway nvcf-gateway -n envoy-gateway -o jsonpath={.status.addresses[0].value}": {ExitCode: 0, Stdout: wiringGatewayLB},
 		// @control-plane: helm list assertion covers the 16 deployed releases.
 		"helm list --all-namespaces --kube-context " + eksContext + " -o json": {ExitCode: 0, Stdout: helmListAllNamespacesJSON()},
-		// @control-plane: httproute jsonpath assertion expects api.<gw>.
-		"kubectl --context " + eksContext + " get httproute nvcf-api -n envoy-gateway -o jsonpath={.spec.hostnames[0]}": {ExitCode: 0, Stdout: "api." + wiringGatewayLB},
-		// @nvca-registration: helm list confirms nvca-operator deployed.
-		"helm list -n nvca-operator --kube-context " + eksContext + " -o json": {ExitCode: 0, Stdout: helmListNVCAJSON()},
+		// @control-plane: HTTPRoute subset assertion expects api.<gw>.
+		"kubectl get httproute/nvcf-api --namespace envoy-gateway --context " + eksContext + " -o yaml": {ExitCode: 0, Stdout: "spec:\n  hostnames:\n    - api." + wiringGatewayLB + "\n"},
 	}))
 	seedStackBaseYaml(t, suite.Config.RepoRoot)
+	seedComputePlaneBaseYaml(t, suite.Config.RepoRoot)
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
 	seedNVCFCLINonlocalTemplate(t, suite.Config.RepoRoot)
+	writeProfileHandoffArtifact(t, suite.Config.RepoRoot)
 	writeEKSRegisterValues(t, suite.Config.RepoRoot, eksClusterName, eksRegion)
 
 	sc := steps.NewScenarioContext(suite)
@@ -665,32 +2114,37 @@ func TestSingleClusterEKSHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if status != 0 {
 		t.Fatalf("godog suite status = %d\n%s", status, out.String())
 	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, registryLoginCommand) {
+		t.Fatal("Helm OCI registry login command was never invoked")
+	}
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "install HELMFILE_ENV=eks-bdd") {
 		t.Fatal("helmfile install make target was never invoked")
 	}
-	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "cluster register --name") {
-		t.Fatal("nvcf-cli cluster register was never invoked")
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "register-cluster CLUSTER_NAME="+eksClusterName) {
+		t.Fatal("compute-plane register-cluster make target was never invoked")
 	}
-	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "install-nvca-operator") {
-		t.Fatal("install-nvca-operator make target was never invoked")
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "deploy/stacks/nvcf-compute-plane install") {
+		t.Fatal("compute-plane install make target was never invoked")
 	}
 }
 
 // TestMultiClusterEKSHelmfileFeatureFileWiresToSteps runs the
 // multi-cluster EKS Helmfile feature against a fake CommandRunner.
 // Canned outputs cover the control-plane gateway-address jsonpath, the
-// control-plane helm-list, the api HTTPRoute hostname, the compute
+// control-plane helm-list, the API HTTPRoute and ConfigMaps, the compute
 // nvca-operator helm-list, and the function invoke. The helm-list keys
 // carry distinct --kube-context values so the test exercises the
 // control-plane vs compute split. @gateway-setup's export step captures
 // EKS_GATEWAY_ADDR from the canned gateway stdout.
 func TestMultiClusterEKSHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	const (
-		cpContext          = "arn:aws:eks:us-east-1:000000000000:cluster/wiring-cp"
-		computeContext     = "arn:aws:eks:us-east-1:000000000000:cluster/wiring-compute"
-		computeClusterName = "wiring-compute"
-		eksRegion          = "us-east-1"
-		wiringGatewayLB    = "wiring-cp-elb.example.test"
+		cpContext            = "arn:aws:eks:us-east-1:000000000000:cluster/wiring-cp"
+		computeContext       = "arn:aws:eks:us-east-1:000000000000:cluster/wiring-compute"
+		computeClusterName   = "wiring-compute"
+		eksRegion            = "us-east-1"
+		wiringGatewayLB      = "wiring-cp-elb.example.invalid"
+		wiringGatewayDomain  = "192-0-2-10.nip.io"
+		registryLoginCommand = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
 	)
 	t.Setenv("NGC_API_KEY", "test-key")
 	t.Setenv("SAMPLE_NGC_ORG", "test-org")
@@ -701,27 +2155,63 @@ func TestMultiClusterEKSHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("EKS_COMPUTE_CONTEXT", computeContext)
 	t.Setenv("EKS_COMPUTE_CLUSTER_NAME", computeClusterName)
 	t.Setenv("EKS_REGION", eksRegion)
+	t.Setenv("HOME", "/home/wiring")
 	// EKS_GATEWAY_ADDR is intentionally NOT preset: @gateway-setup's
-	// export step captures it from the canned gateway stdout below.
+	// export step captures it from the canned gateway stdout below. The
+	// gateway-domain export is likewise exercised from its canned result.
+	taskSmokeCommand := strings.Join([]string{
+		"env",
+		"NVCT_BDD_STATE_PATH=/home/wiring/.nvcf-cli.nvcf-cli-eks-bdd-multi.state",
+		"NVCT_BDD_API_KEYS_URL=http://" + wiringGatewayLB + "/v1/keys",
+		"NVCT_BDD_API_KEYS_HOST=api-keys." + wiringGatewayDomain,
+		"NVCT_BDD_TASKS_URL=http://" + wiringGatewayLB + "/v1/nvct/tasks",
+		"NVCT_BDD_TASKS_HOST=tasks." + wiringGatewayDomain,
+		"NVCT_BDD_TASK_BACKEND=" + computeClusterName,
+		"NVCT_BDD_TASK_INSTANCE_TYPE=NCP.GPU.H100_8x",
+		"tests/bdd/scripts/run-nvct-task-smoke.sh",
+	}, " ")
+	pullSecretCommand := "kubectl get secret/nvcr-pull-secret --namespace nvca-system --context " + computeContext + " -o name"
 
 	suite := newWiringSuite(t, newFakeRunner(map[string]harness.Result{
 		// @gateway-setup: control-plane gateway address -> EKS_GATEWAY_ADDR.
 		"kubectl --context " + cpContext + " get gateway nvcf-gateway -n envoy-gateway -o jsonpath={.status.addresses[0].value}": {ExitCode: 0, Stdout: wiringGatewayLB},
+		"tests/bdd/scripts/resolve-gateway-domain.sh " + wiringGatewayLB:                                                         {ExitCode: 0, Stdout: wiringGatewayDomain},
 		// control-plane helm list assertion.
 		"helm list --all-namespaces --kube-context " + cpContext + " -o json": {ExitCode: 0, Stdout: helmListAllNamespacesJSON()},
-		// control-plane api HTTPRoute hostname assertion.
-		"kubectl --context " + cpContext + " get httproute nvcf-api -n envoy-gateway -o jsonpath={.spec.hostnames[0]}": {ExitCode: 0, Stdout: "api." + wiringGatewayLB},
+		// control-plane API HTTPRoute hostname assertion.
+		"kubectl get httproute/nvcf-api --namespace envoy-gateway --context " + cpContext + " -o yaml": {ExitCode: 0, Stdout: "spec:\n  hostnames:\n    - api." + wiringGatewayDomain + "\n"},
+		// control-plane API environment config assertions.
+		"kubectl get configmap/nvcf-api-env --namespace nvcf --context " + cpContext + " -o yaml": {
+			ExitCode: 0,
+			Stdout: "data:\n" +
+				"  NVCF_FQDN: http://api." + wiringGatewayDomain + "\n" +
+				"  NVCF_GLOBAL_FQDN_GRPC: http://worker-api." + wiringGatewayDomain + "\n" +
+				"  NVCF_NATS_WORKER_URL: nats://" + wiringGatewayLB + ":4222\n",
+		},
+		"kubectl get configmap/nvct-api-env --namespace nvcf --context " + cpContext + " -o yaml": {
+			ExitCode: 0,
+			Stdout: "data:\n" +
+				"  NVCT_FQDN: http://tasks." + wiringGatewayDomain + "\n" +
+				"  NVCT_GLOBAL_FQDN_GRPC: http://worker-tasks." + wiringGatewayDomain + "\n",
+		},
 		// compute nvca-operator helm list assertion.
-		"helm list -n nvca-operator --kube-context " + computeContext + " -o json": {ExitCode: 0, Stdout: helmListNVCAJSON()},
+		"helm list --all-namespaces --kube-context " + computeContext + " -o json": {ExitCode: 0, Stdout: helmListNVCAJSON()},
+		pullSecretCommand: {ExitCode: 0},
 		// @function-lifecycle: function invoke returns the echo payload.
 		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/out/nvcf-cli-eks-bdd-multi.yaml function invoke --request-body '{\"message\":\"bdd-echo\",\"repeats\":1}' --timeout 120 --poll-duration 5": {
 			ExitCode: 0,
 			Stdout:   "Function invocation completed!\n\nResponse:\n{\"rawResponse\":\"bdd-echo\"}\n",
 		},
+		taskSmokeCommand: {
+			ExitCode: 0,
+			Stdout:   "Task bdd-nvct-task-smoke status: COMPLETED\n",
+		},
 	}))
 	seedStackBaseYaml(t, suite.Config.RepoRoot)
+	seedComputePlaneBaseYaml(t, suite.Config.RepoRoot)
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)
 	seedNVCFCLINonlocalTemplate(t, suite.Config.RepoRoot)
+	writeMulticlusterProfileHandoffArtifact(t, suite.Config.RepoRoot)
 	writeEKSRegisterValues(t, suite.Config.RepoRoot, computeClusterName, eksRegion)
 
 	sc := steps.NewScenarioContext(suite)
@@ -742,18 +2232,31 @@ func TestMultiClusterEKSHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if status != 0 {
 		t.Fatalf("godog suite status = %d\n%s", status, out.String())
 	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, registryLoginCommand) {
+		t.Fatal("Helm OCI registry login command was never invoked")
+	}
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "install HELMFILE_ENV=eks-bdd-multi") {
 		t.Fatal("helmfile install make target was never invoked")
 	}
-	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "cluster register --name") {
-		t.Fatal("nvcf-cli cluster register was never invoked")
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "register-cluster CLUSTER_NAME="+computeClusterName) {
+		t.Fatal("compute-plane register-cluster make target was never invoked")
 	}
-	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "install-nvca-operator") {
-		t.Fatal("install-nvca-operator make target was never invoked")
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "KUBECONFIG_FILE=/repo-root-placeholder/tests/bdd/out/eks-compute-kubeconfig.yaml") {
+		t.Fatal("compute-plane register/install did not use the generated compute kubeconfig")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "deploy/stacks/nvcf-compute-plane install") {
+		t.Fatal("compute-plane install make target was never invoked")
+	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, pullSecretCommand) {
+		t.Fatal("compute-plane pull-secret propagation assertion was never invoked")
 	}
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function invoke") {
 		t.Fatal("function invoke CLI command was never invoked")
 	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, taskSmokeCommand) {
+		t.Fatal("NVCT task API smoke script was not invoked with the EKS instance type")
+	}
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_8x", 1)
 }
 
 // TestSingleClusterUp is the live entry point for the single-cluster
@@ -793,6 +2296,61 @@ func TestSingleClusterHelmfile(t *testing.T) {
 	runLiveFeature(t, "single-cluster-helmfile.feature")
 }
 
+// TestSingleClusterHelmfileLLMPKI is the live entry point for the
+// PKI-secured LLM transport Helmfile feature. Skipped under -short.
+func TestSingleClusterHelmfileLLMPKI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "single-cluster-helmfile-llm-pki.feature")
+}
+
+// TestObservabilityControl is the live entry point for the control
+// observability profile feature. Skipped under -short.
+func TestObservabilityControl(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "observability-control.feature")
+}
+
+// TestObservabilityCompute is the live entry point for the compute
+// observability profile on the local split-cluster topology. Skipped under
+// -short.
+func TestObservabilityCompute(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "observability-compute.feature")
+}
+
+// TestObservabilityAll is the live entry point for both observability planes
+// on the local single-cluster topology. Skipped under -short.
+func TestObservabilityAll(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "observability-all.feature")
+}
+
+// TestSingleClusterHelmfileUpstreamImages is the live entry point for the
+// focused Docker Hub supporting-image override feature. Skipped under -short.
+func TestSingleClusterHelmfileUpstreamImages(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "single-cluster-helmfile-upstream-images.feature")
+}
+
+// TestObservabilityDisabled is the live entry point for the render-only
+// disabled observability profile feature. Skipped under -short.
+func TestObservabilityDisabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "observability-disabled.feature")
+}
+
 // TestMultiClusterHelmfile is the live entry point for the
 // multi-cluster Helmfile feature: control-plane install on
 // k3d-ncp-local-cp followed by register + NVCA install on the
@@ -802,6 +2360,26 @@ func TestMultiClusterHelmfile(t *testing.T) {
 		t.Skip("live run skipped under -short")
 	}
 	runLiveFeature(t, "multi-cluster-helmfile.feature")
+}
+
+// TestMultiClusterHelmfileLLMRegistrationMultiregion is the live entry point
+// for secure recursive registration across two local logical regions.
+// Skipped under -short.
+func TestMultiClusterHelmfileLLMRegistrationMultiregion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "multi-cluster-helmfile-llm-registration-multiregion.feature")
+}
+
+// TestMultiClusterHelmfileLLMRegistrationTLS is the live entry point for the
+// focused secure Pylon registration feature on local split-cluster k3d.
+// Skipped under -short.
+func TestMultiClusterHelmfileLLMRegistrationTLS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "multi-cluster-helmfile-llm-registration-tls.feature")
 }
 
 // TestSingleClusterEKSHelmfile is the live entry point for the
@@ -816,20 +2394,13 @@ func TestSingleClusterEKSHelmfile(t *testing.T) {
 // TestMultiClusterEKSHelmfile is the live entry point for the
 // multi-cluster EKS Helmfile feature: control-plane install on one EKS
 // cluster, then register + NVCA install on a separate compute EKS
-// cluster. Skipped under -short.
-//
-// The @function-lifecycle scenario is excluded from the live run via
-// ~@skip: cross-cluster function execution is not supported by the
-// current nvca-operator chart/agent (worker pods receive the control
-// plane's in-cluster service FQDNs, which do not resolve on a separate
-// compute cluster). The wiring test still exercises that scenario
-// against the fake runner. Drop the tag filter once worker FQDNs can be
-// externalized.
+// cluster, then execute a function and an NVCT task there. Skipped under
+// -short.
 func TestMultiClusterEKSHelmfile(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
 	}
-	runLiveFeatureTags(t, "multi-cluster-eks-helmfile.feature", "~@skip")
+	runLiveFeature(t, "multi-cluster-eks-helmfile.feature")
 }
 
 // runLiveFeature is the shared live-run path: build CLI, register
@@ -850,7 +2421,9 @@ func runLiveFeatureTags(t *testing.T, feature, tags string) {
 	if err != nil {
 		t.Fatalf("new suite: %v", err)
 	}
+	stopSignalCleanup := suite.InstallSignalCleanup()
 	defer func() {
+		stopSignalCleanup()
 		if err := suite.Teardown(); err != nil {
 			t.Errorf("teardown: %v", err)
 		}
@@ -861,6 +2434,18 @@ func runLiveFeatureTags(t *testing.T, feature, tags string) {
 		Name: "bdd-live-" + feature,
 		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
 			steps.RegisterAll(ctx, sc)
+			stepHooks := ctx.StepContext()
+			stepHooks.Before(func(stepContext context.Context, _ *godog.Step) (context.Context, error) {
+				return suite.BeginSignalSafeStep(stepContext)
+			})
+			stepHooks.After(func(
+				stepContext context.Context,
+				_ *godog.Step,
+				_ godog.StepResultStatus,
+				_ error,
+			) (context.Context, error) {
+				return suite.EndSignalSafeStep(stepContext), nil
+			})
 		},
 		Options: &godog.Options{
 			Format:        "pretty",
@@ -884,6 +2469,72 @@ func commandRanThatContains(runs []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func assertFunctionDeploymentsUseInstanceType(t *testing.T, runs []string, want string, wantCount int) {
+	t.Helper()
+	count := 0
+	for _, command := range runs {
+		if !strings.Contains(command, " function deploy create ") {
+			continue
+		}
+		count++
+		if !commandOptionEquals(command, "--instance-type", want) {
+			t.Fatalf("function deployment command did not use instance type %s: %s", want, command)
+		}
+	}
+	if count != wantCount {
+		t.Fatalf("function deployment commands = %d, want %d", count, wantCount)
+	}
+}
+
+func commandOptionEquals(command, option, want string) bool {
+	fields := strings.Fields(command)
+	for index := 0; index+1 < len(fields); index++ {
+		if fields[index] == option {
+			return fields[index+1] == want
+		}
+	}
+	return false
+}
+
+func commandRanExactly(runs []string, want string) bool {
+	for _, run := range runs {
+		if run == want {
+			return true
+		}
+	}
+	return false
+}
+
+func commandRanThatContainsAll(runs []string, needles ...string) bool {
+	for _, run := range runs {
+		matched := true
+		for _, needle := range needles {
+			if !strings.Contains(run, needle) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func assertFileContains(t *testing.T, path string, needles ...string) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	text := string(content)
+	for _, needle := range needles {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("%s does not contain %q", path, needle)
+		}
+	}
 }
 
 // mustResolveFeaturePath returns the feature file path relative to the

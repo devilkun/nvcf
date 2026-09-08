@@ -47,8 +47,7 @@ follow-up either vendors libssl via http_archive with per-platform
 crate.annotation entries, or switches the scylla driver's TLS feature
 to rustls.
 
-Local Bazel cache setup is documented in the umbrella's
-`nvidia-internal/bazel-cheatsheet.md`.
+Local Bazel cache setup is documented in the `nvcf/nvcf-internal` docs.
 
 ```mermaid
 sequenceDiagram

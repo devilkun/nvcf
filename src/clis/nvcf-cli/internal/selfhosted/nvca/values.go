@@ -26,12 +26,35 @@ import (
 )
 
 type Values struct {
-	ClusterName    string            `yaml:"clusterName,omitempty"`
-	ClusterID      string            `yaml:"clusterID"`
-	ClusterGroupID string            `yaml:"clusterGroupID"`
-	NCAID          string            `yaml:"ncaID"`
-	Region         string            `yaml:"region"`
-	SelfManaged    SelfManagedValues `yaml:"selfManaged"`
+	ClusterName    string             `yaml:"clusterName,omitempty"`
+	ClusterID      string             `yaml:"clusterID"`
+	ClusterGroupID string             `yaml:"clusterGroupID"`
+	NCAID          string             `yaml:"ncaID"`
+	Region         string             `yaml:"region"`
+	SelfManaged    SelfManagedValues  `yaml:"selfManaged"`
+	Agent          *AgentValues       `yaml:"agent,omitempty"`
+	AgentConfig    *AgentConfigValues `yaml:"agentConfig,omitempty"`
+}
+
+// AgentValues carries the top-level agent.* nvca-operator values rendered by the
+// CLI. It is a pointer so an empty agent section is omitted entirely.
+type AgentValues struct {
+	LLM *AgentLLMValues `yaml:"llm,omitempty"`
+}
+
+// AgentLLMValues carries agent.llm.* values. RequestRouterAddress is the
+// host:port LLM request router (Stargate) address consumed by the
+// nvca-operator chart under agent.llm.requestRouterAddress. It configures the
+// operator; it is not a runtime fallback for LLM workloads, which require
+// LLM_REQUEST_ROUTER_ADDRESS in their launch environment.
+type AgentLLMValues struct {
+	RequestRouterAddress string `yaml:"requestRouterAddress,omitempty"`
+}
+
+// AgentConfigValues carries the top-level agentConfig.* nvca-operator values
+// rendered by the CLI. MergeConfig is a literal NVCA config YAML fragment.
+type AgentConfigValues struct {
+	MergeConfig string `yaml:"mergeConfig,omitempty"`
 }
 
 type SelfManagedValues struct {

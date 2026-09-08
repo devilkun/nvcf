@@ -58,10 +58,8 @@ clippy-report.json
 codeql.zip
 results.sarif
 dependency-urls.txt
-sonar-project.properties
 
 # Bazel
 bazel-*
 .bazel-cache/
 user.bazelrc
-

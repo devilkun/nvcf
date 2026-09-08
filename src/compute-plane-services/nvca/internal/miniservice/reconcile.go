@@ -20,7 +20,9 @@ package mscontroller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
@@ -36,6 +39,8 @@ import (
 	translateutil "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/util"
 	cmnotel "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otel"
 	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/go-containerregistry/pkg/name"
 	otelattr "go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -105,8 +110,12 @@ type Reconciler struct {
 	// Creates a client.Client that performs request on behalf of a specific user,
 	// in this case a namespace's service account.
 	newImpersonatingClient func(namespace string) (client.Client, error)
-	// Creatse a function that checks permissions for resources, caching responses per GVK in caniCache.
-	newPermissionsChecker func(caniCache map[schema.GroupVersionKind]error) permissionCheckerFunc
+	// Creatse a function that checks verb permissions for resources, caching responses per GVK in caniCache.
+	newPermissionsChecker func(caniCache map[schema.GroupVersionKind]error, verbs []string) permissionCheckerFunc
+
+	// Cache of failed workload update attempts by revision to avoid unnecessary expensive operations like rendering.
+	failedWorkloadUpdateRevisionCache     map[string]error
+	failedWorkloadUpdateRevisionCacheLock sync.RWMutex
 }
 
 // permissionCheckerFunc checks if c can perform a minimal set of actions on an object
@@ -129,6 +138,7 @@ var (
 
 const (
 	InferenceNamespaceEnvKey        = "HELM_CHART_NAMESPACE"
+	miniServiceKind                 = "MiniService"
 	miniServiceUnknownPhase         = "Unknown"
 	miniServiceUnknownFailureReason = "Unknown"
 	miniServicePhaseAttrKey         = "nvca.miniservice.phase"
@@ -201,14 +211,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		controllerutil.AddFinalizer(msCopy, finalizer)
 
 		// Detect spec changes (e.g., helm values update) that require a re-render.
-		if err := r.prepareUpgradeIfNeeded(ctx, msCopy); err != nil {
+		if err := r.prepareUpdateIfNeeded(ctx, msCopy); err != nil {
 			return reconcile.Result{}, err
 		}
 
 		switch msCopy.Status.Phase {
 		case "", v1alpha1.MiniServiceCacheInProgress, v1alpha1.MiniServiceInstalling:
-			log.Info("Performing install action")
-			if res, rerr = r.doInstall(ctx, msCopy, icmsReq); isTerminal(rerr) {
+			if needsWorkloadUpdate(msCopy) {
+				log.Info("Performing workload update action")
+				res, rerr = r.doUpdateWorkload(ctx, msCopy, icmsReq)
+			} else {
+				log.Info("Performing install action")
+				res, rerr = r.doInstall(ctx, msCopy, icmsReq)
+			}
+			if isTerminal(rerr) {
 				msCopy.Status.Phase = v1alpha1.MiniServiceInstallFailed
 				if !meta.IsStatusConditionFalse(msCopy.Status.Conditions, v1alpha1.MiniServiceConditionInstallSuccessful) {
 					meta.SetStatusCondition(&msCopy.Status.Conditions, metav1.Condition{
@@ -296,6 +312,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 }
 
 func isTerminal(err error) bool { return errors.Is(err, reconcile.TerminalError(nil)) }
+
+// unwrapTerminalError unwraps err if terminal until a non-terminal error is found.
+func unwrapTerminalError(err error) error {
+	for err != nil {
+		if !isTerminal(err) {
+			return err
+		}
+		err = errors.Unwrap(err)
+	}
+	return err
+}
 
 func normalizeMiniServicePhase(phase v1alpha1.MiniServicePhase) string {
 	if phase == "" {
@@ -397,21 +424,92 @@ func (r *Reconciler) patchMiniService(ctx context.Context, oldObj, newObj *v1alp
 		return fmt.Errorf("patch miniservice %s status: %w", oldObj.Name, err)
 	}
 
-	newObj.ResourceVersion = newObjWithStatus.ResourceVersion
-	if err := r.Client.Patch(ctx, newObj, client.MergeFrom(newObjWithStatus)); err != nil {
-		return fmt.Errorf("patch miniservice %s: %w", oldObj.Name, err)
+	// Only patch finalizers if they are different. Spec and other metadata must not be modified by the controller.
+	if !slices.Equal(newObj.Finalizers, oldObj.Finalizers) {
+		if err := r.Client.Patch(ctx, &v1alpha1.MiniService{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            newObj.Name,
+				Finalizers:      newObj.Finalizers,
+				ResourceVersion: newObjWithStatus.ResourceVersion,
+			},
+		}, client.MergeFrom(&v1alpha1.MiniService{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            newObjWithStatus.Name,
+				Finalizers:      newObjWithStatus.Finalizers,
+				ResourceVersion: newObjWithStatus.ResourceVersion,
+			},
+		})); err != nil {
+			return fmt.Errorf("patch miniservice %s: %w", oldObj.Name, err)
+		}
 	}
 
 	return nil
 }
 
-// prepareUpgradeIfNeeded detects spec changes by comparing metadata.generation
+// saveWorkloadConfig persists the workload config decoded from the rendered workload config
+// ConfigMap onto the MiniService spec, patching only that field inline. It is a no-op when the
+// config is unchanged. On success ms is updated in place so callers see the persisted value
+// and current ResourceVersion.
+func (r *Reconciler) saveWorkloadConfig(
+	ctx context.Context,
+	ms *v1alpha1.MiniService,
+	desired *v1alpha1.WorkloadConfig,
+) error {
+	if cmp.Equal(ms.Spec.WorkloadConfig, desired, cmpopts.EquateEmpty()) {
+		return nil
+	}
+
+	spec := map[string]any{"workloadConfig": nil}
+	if desired != nil {
+		workloadConfig, err := runtime.DefaultUnstructuredConverter.ToUnstructured(desired)
+		if err != nil {
+			return fmt.Errorf("convert miniservice %s workload config: %w", ms.Name, err)
+		}
+		spec["workloadConfig"] = workloadConfig
+	}
+	// Build the apply payload independently of MiniServiceSpec's compatibility serializer.
+	// This gives the controller ownership of only spec.workloadConfig and prevents zero-valued
+	// namespace, request-name, or Helm fields from entering the SSA request.
+	applyPatch := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": v1alpha1.SchemeGroupVersion.String(),
+		"kind":       miniServiceKind,
+		"metadata": map[string]any{
+			"name": ms.Name,
+		},
+		"spec": spec,
+	}}
+	if err := r.Client.Patch(
+		ctx,
+		applyPatch,
+		client.Apply,
+		client.FieldOwner(managedByValue),
+		client.ForceOwnership,
+	); err != nil {
+		return fmt.Errorf("patch miniservice %s workload config: %w", ms.Name, err)
+	}
+
+	ms.Spec.WorkloadConfig = desired.DeepCopy()
+	ms.ResourceVersion = applyPatch.GetResourceVersion()
+	return nil
+}
+
+// prepareUpdateIfNeeded detects spec changes by comparing metadata.generation
 // to status.observedGeneration. Because generation increments on any spec field change,
 // this method additionally compares helm values against the latest revision ConfigMap.
-// If only non-values fields changed, it returns without triggering an upgrade
+// If only non-values fields changed, it returns without triggering an update
 // (observedGeneration is still updated at the end of Reconcile).
-func (r *Reconciler) prepareUpgradeIfNeeded(ctx context.Context, ms *v1alpha1.MiniService) error {
+func (r *Reconciler) prepareUpdateIfNeeded(ctx context.Context, ms *v1alpha1.MiniService) error {
 	if ms.Status.ObservedGeneration == 0 || ms.Generation == ms.Status.ObservedGeneration {
+		return nil
+	}
+	// Installing at revision zero means initial object application is still in progress.
+	// doInstall reads the current spec and its render cache is keyed by Helm configuration,
+	// so it can handle spec changes without entering an update path that assumes infra exists.
+	if ms.Status.Phase == v1alpha1.MiniServiceInstalling && ms.Status.Revision == 0 {
+		logf.FromContext(ctx).Info("Spec change detected during initial install, continuing install",
+			"generation", ms.Generation,
+			"observedGeneration", ms.Status.ObservedGeneration,
+		)
 		return nil
 	}
 
@@ -427,7 +525,7 @@ func (r *Reconciler) prepareUpgradeIfNeeded(ctx context.Context, ms *v1alpha1.Mi
 		return fmt.Errorf("check if helm values changed: %w", err)
 	}
 	if !changed {
-		log.Info("Helm values unchanged, skipping upgrade")
+		log.Info("Helm values unchanged, skipping update")
 		return nil
 	}
 
@@ -440,7 +538,8 @@ func (r *Reconciler) prepareUpgradeIfNeeded(ctx context.Context, ms *v1alpha1.Mi
 	ms.Status.Revision++
 	ms.Status.Phase = v1alpha1.MiniServiceInstalling
 
-	log.Info("Upgrade prepared", "newRevision", ms.Status.Revision)
+	log.Info("Update prepared", "newRevision", ms.Status.Revision)
+
 	return nil
 }
 
@@ -481,6 +580,13 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		PodLabels:      make(map[string]string),
 	}
 
+	// Enable NVIDIA Nsight GPU profiling for this function's workload pods when it is in
+	// the profiling allowlist. The label is injected onto admitted pods by the miniservice
+	// mutating webhook via metaInput.PodLabels.
+	if r.NsightProfilingAllowlist.ShouldProfile(icmsReq.Spec.FunctionDetails.FunctionID) {
+		metaInput.PodLabels[r.NsightProfilingAllowlist.LabelKey()] = r.NsightProfilingAllowlist.LabelValue()
+	}
+
 	ms.Status.Phase = v1alpha1.MiniServiceInstalling
 
 	unfilteredInfraObjs, err := r.translateWorkload(ms, icmsReq)
@@ -514,8 +620,13 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		}
 	}
 
-	workloadObjs, resources, err := decodeObjects(ctx, r.Decoder, objsData)
+	workloadObjs, resources, workloadConfig, err := decodeObjects(ctx, r.Decoder, objsData)
 	if err != nil {
+		return reconcile.Result{}, err
+	}
+	// Persist workload config decoded from the rendered workload config ConfigMap so later
+	// reconciles (e.g. status) can source it from the spec.
+	if err := r.saveWorkloadConfig(ctx, ms, workloadConfig); err != nil {
 		return reconcile.Result{}, err
 	}
 	// Update the resources status in the MiniService status.
@@ -549,6 +660,11 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		r.ClusterRegion, r.ClusterName, functionName, taskName, false)
 
 	if err := r.ensureInstanceNamespace(ctx, ms, icmsReq); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	transportTLSObjs := append([]client.Object{utilsPod}, workloadObjs...)
+	if err := r.prepareTransportTLSForWorkloads(ctx, ms, transportTLSObjs); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -596,7 +712,7 @@ func (r *Reconciler) doInstall(ctx context.Context,
 	// All Pods created by NVCA must use the same scheduler.
 	if r.FeatureFlagFetcher.IsFeatureFlagEnabled(featureflag.KAIScheduler) {
 		utilsPod.Spec.SchedulerName = kaischeduler.SchedulerName
-		utilsPod.Labels[kaischeduler.SchedulerQueueLabel] = kaischeduler.GetQName()
+		utilsPod.Labels[kaischeduler.SchedulerQueueLabel] = kaischeduler.DefaultQueue
 	}
 
 	// Set required worker env vars.
@@ -616,20 +732,36 @@ func (r *Reconciler) doInstall(ctx context.Context,
 			k8sutil.BYOOMetricsEgressTargetLabelValue
 	}
 
+	// Select the model cache backend ONCE per reconcile and use the same value
+	// for both StorageRequest creation (below) and the ephemeral annotation
+	// (further down). Selecting twice would race a StorageClass change between
+	// the two calls and could both create a ModelCacheRequest and inject the
+	// ephemeral init container, or neither.
+	// Skip the lookup entirely when the launch does not request caching: the
+	// selection needs a StorageClass API call, and a transient API error must
+	// not fail or delay installs that never cache.
+	// Non-terminal on purpose: this is a StorageClass API lookup, so a
+	// transient error (timeout, rate-limit) must be retried.
+	cacheBackend := nvcastorage.HelmCacheBackendNone
+	if cacheLaunchRequested(icmsReq) {
+		// Same config value the storage controller provisions cache volumes
+		// with, so the class checked here is the class they land on.
+		cacheBackend, err = r.selectHelmCacheBackend(ctx, icmsReq, ms.Spec.Namespace)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("select helm cache backend: %w", err)
+		}
+	}
+
 	// Create storage requests if configured for the cluster.
-	stDone, err := r.doStorageRequests(ctx,
+	stDone, readyStorageRequests, err := r.doStorageRequests(ctx,
 		ms, icmsReq, infraObjectMutators,
-		workerPullSecrets, cacheInitJob, cacheInitPVC,
+		workerPullSecrets, cacheInitJob, cacheInitPVC, cacheBackend,
 	)
 	if err != nil || !stDone {
 		return reconcile.Result{}, err
 	}
 
-	stList := &nvcav2beta1.StorageRequestList{}
-	if err := r.Client.List(ctx, stList, client.InNamespace(ms.Spec.Namespace)); err != nil {
-		return reconcile.Result{}, (err)
-	}
-	instanceStorageAnnos, utilsStorageAnnos := getAnnotationsForReadyStorageRequests(stList)
+	instanceStorageAnnos, utilsStorageAnnos := getAnnotationsForReadyStorageRequests(readyStorageRequests)
 	if len(instanceStorageAnnos) != 0 {
 		maps.Copy(metaInput.PodAnnotations, instanceStorageAnnos)
 	}
@@ -647,6 +779,21 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		}
 	}
 
+	// The NVMesh, shared-FS, and Samba backends all populate via a
+	// ModelCacheRequest handled by the storage controller (see
+	// doStorageRequests / makeStorageRequests), mounted through the
+	// ModelCacheRequest ROPVCName annotation. Only the ephemeral backend is
+	// handled here: inject a per-pod model-cache-init init container via the
+	// webhook (no shared cache backend available).
+	if cacheLaunchRequested(icmsReq) && cacheBackend == nvcastorage.HelmCacheBackendEphemeral {
+		initEnv, initImage, err := ephemeralModelCacheInitEnv(ms, icmsReq)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		metaInput.PodAnnotations[nvcastorage.WebhookEphemeralModelCacheInitImageAnnotationKey] = initImage
+		metaInput.ModelCacheInitEnv = initEnv
+	}
+
 	// BYOO-specific mutators.
 	if needsBYOO {
 		var err error
@@ -656,6 +803,11 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		}
 		// Apply BYOO telemetry annotations to workload objects for Helm-rendered pods
 		metaInput.EnvVars = append(metaInput.EnvVars, byooEnvs...)
+		collectorEnvs := r.cfg.Agent.BYOOOTelCollectorEnvVars()
+		metaInput.OTelCollectorEnvVars = append(metaInput.OTelCollectorEnvVars, collectorEnvs...)
+		// The webhook special-cases Helm utils pods and skips metadata-carried collector
+		// env injection, so inject the envs directly into the BYOO collector sidecar.
+		k8sutil.AddBYOOOTelCollectorEnvVarsToPodSpec(&utilsPod.Spec, collectorEnvs)
 	}
 
 	// Task-specific mutators.
@@ -682,14 +834,13 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		setUtilsHelmTaskPollProgressEnv(log, utilsPod, taskLaunchSpec.MaxRuntimeDuration)
 	}
 
-	// Utils and init container resources are toggled by feature flag.
-	if (taskLaunchSpec != nil && r.FeatureFlagFetcher.IsFeatureFlagEnabled(featureflag.EnforceHelmTaskResourceLimits)) ||
-		(funcLaunchSpec != nil && r.FeatureFlagFetcher.IsFeatureFlagEnabled(featureflag.EnforceHelmFunctionResourceLimits)) {
-		k8sutil.SetNVCFInfraContainerResources(corev1.ResourceList(r.cfg.Agent.UtilsResources), utilsPod)
-		if err := k8sutil.ValidateAllContainerResourcesSet(utilsPod); err != nil {
-			log.Error(err, "Helm utils pod resources are invalid")
-			return reconcile.Result{}, reconcile.TerminalError(err)
-		}
+	// Utils and init container resource limits are toggled by feature flag.
+	setResourceLimits := (taskLaunchSpec != nil && r.FeatureFlagFetcher.IsFeatureFlagEnabled(featureflag.EnforceHelmTaskResourceLimits)) ||
+		(funcLaunchSpec != nil && r.FeatureFlagFetcher.IsFeatureFlagEnabled(featureflag.EnforceHelmFunctionResourceLimits))
+	k8sutil.SetNVCFInfraContainerResources(corev1.ResourceList(r.cfg.Agent.UtilsResources), utilsPod, setResourceLimits)
+	if err := k8sutil.ValidateAllContainerResourcesSet(utilsPod); err != nil {
+		log.Error(err, "Helm utils pod resources are invalid")
+		return reconcile.Result{}, reconcile.TerminalError(err)
 	}
 
 	infraObjs = append(infraObjs, utilsPod)
@@ -705,13 +856,7 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		return reconcile.Result{}, err
 	}
 
-	isUpgrade := ms.Status.Revision > 0
-	if isUpgrade {
-		log.Info("Applying objects via Server-Side Apply for upgrade", "revision", ms.Status.Revision)
-		err = r.applySSAInfra(ctx, ms, infraObjectMutators, genericInfraMutator, infraObjs...)
-	} else {
-		err = r.applyInfra(ctx, ms, infraObjectMutators, genericInfraMutator, infraObjs...)
-	}
+	err = r.applyInfra(ctx, ms, infraObjectMutators, genericInfraMutator, infraObjs...)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -742,17 +887,13 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		return reconcile.Result{}, err
 	}
 
-	if isUpgrade {
-		err = r.applySSAWorkload(ctx, ms, genericWorkloadMutator, workloadObjs...)
-	} else {
-		err = r.applyWorkload(ctx, ms, genericWorkloadMutator, workloadObjs...)
-	}
+	err = r.applyWorkload(ctx, ms, genericWorkloadMutator, workloadObjs...)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
 	if err := r.saveRevisionHistory(ctx, ms); err != nil {
-		log.Error(err, "Failed to save revision history after install")
+		log.Error(err, "Failed to save revision history after initial install")
 		return reconcile.Result{}, err
 	}
 
@@ -761,6 +902,170 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		Type:   v1alpha1.MiniServiceConditionInstallSuccessful,
 		Status: metav1.ConditionTrue,
 		Reason: "AllObjectsApplied",
+	})
+
+	return reconcile.Result{}, nil
+}
+
+// needsWorkloadUpdate checks if a workload update is needed for ms.
+// It returns true if ms is in the Installing phase and has a revision greater than 0,
+// which can only be true if the controller has explicitly transitioned ms to
+// the Installing phase post-Running.
+func needsWorkloadUpdate(ms *v1alpha1.MiniService) bool {
+	return ms.Status.Phase == v1alpha1.MiniServiceInstalling &&
+		ms.Status.Revision > 0
+}
+
+func (r *Reconciler) prepareUpdateWorkload(ctx context.Context,
+	ms *v1alpha1.MiniService,
+	icmsReq *nvcav2beta1.ICMSRequest,
+) ([]client.Object, []v1alpha1.ResourceStatus, *v1alpha1.WorkloadConfig, string, string, error) {
+	log := logf.FromContext(ctx)
+
+	log.Info("Preparing MiniService workload update", "revision", ms.Status.Revision)
+
+	funcLaunchSpec := icmsReq.Spec.CreationMsgInfo.FunctionLaunchSpecification
+	taskLaunchSpec := icmsReq.Spec.CreationMsgInfo.TaskLaunchSpecification
+	if funcLaunchSpec == nil && taskLaunchSpec == nil {
+		return nil, nil, nil, "", "", reconcile.TerminalError(
+			fmt.Errorf("both function and task launch specs are empty in ICMSRequest %s", icmsReq.Name))
+	}
+
+	functionName, taskName, err := getFunctionNameAndTaskName(funcLaunchSpec, taskLaunchSpec)
+	if err != nil {
+		return nil, nil, nil, "", "", reconcile.TerminalError(fmt.Errorf("failed to get function name and task name: %w", err))
+	}
+
+	objsData, isRendered, err := r.getRenderedData(ctx, ms)
+	if err != nil {
+		return nil, nil, nil, "", "", err
+	}
+
+	if !isRendered {
+		// To avoid unnecessary re-renders, cache failed render attempts by helm values hash.
+		// (which is not prone to races like revision is).
+		helmValuesHash := sha256.Sum256(ms.Spec.HelmChartConfig.Values)
+		helmValuesHashShort := hex.EncodeToString(helmValuesHash[:])[:8]
+		failedWorkloadUpdateRevisionCacheKey := fmt.Sprintf("%s-%s", ms.Name, helmValuesHashShort)
+
+		r.failedWorkloadUpdateRevisionCacheLock.RLock()
+		failed := r.failedWorkloadUpdateRevisionCache[failedWorkloadUpdateRevisionCacheKey]
+		r.failedWorkloadUpdateRevisionCacheLock.RUnlock()
+		if failed != nil {
+			return nil, nil, nil, "", "", failed
+		}
+
+		if objsData, err = r.render(ctx, ms, icmsReq); err != nil {
+			r.failedWorkloadUpdateRevisionCacheLock.Lock()
+			r.failedWorkloadUpdateRevisionCache[failedWorkloadUpdateRevisionCacheKey] = err
+			r.failedWorkloadUpdateRevisionCacheLock.Unlock()
+			return nil, nil, nil, "", "", err
+		}
+
+		// Clear the cache on a successful render for prior revisions to this MiniService
+		// so entries don't accumulate indefinitely.
+		r.failedWorkloadUpdateRevisionCacheLock.Lock()
+		maps.DeleteFunc(r.failedWorkloadUpdateRevisionCache, func(k string, _ error) bool {
+			return strings.HasPrefix(k, ms.Name+"-")
+		})
+		r.failedWorkloadUpdateRevisionCacheLock.Unlock()
+
+		if err := r.saveRenderedData(ctx, ms, objsData); err != nil {
+			return nil, nil, nil, "", "", err
+		}
+	}
+
+	workloadObjs, resources, workloadConfig, err := decodeObjects(ctx, r.Decoder, objsData)
+	if err != nil {
+		return nil, nil, nil, "", "", err
+	}
+
+	return workloadObjs, resources, workloadConfig, functionName, taskName, nil
+}
+
+// doUpdateWorkload performs a workload update for a MiniService, doing almost the same operations as doInstall,
+// but without infra install steps. It assumes that the MiniService is already in the Running phase,
+// but a recent change to Helm values has been detected and MiniService transitioned to the Installing phase.
+func (r *Reconciler) doUpdateWorkload(ctx context.Context,
+	ms *v1alpha1.MiniService,
+	icmsReq *nvcav2beta1.ICMSRequest,
+) (reconcile.Result, error) {
+	log := logf.FromContext(ctx)
+
+	workloadObjs, resources, workloadConfig, functionName, taskName, err := r.prepareUpdateWorkload(ctx, ms, icmsReq)
+	if err != nil {
+		// Workload preparation may result in terminal errors that would cause workload cleanup.
+		// To let the un-updated workload continue running, warn the user with a non-terminal error.
+		if isTerminal(err) {
+			err = unwrapTerminalError(err)
+			log.Error(err, "Failed to prepare update workload with terminal error. MiniService must be updated with new values to progress update")
+		}
+		return reconcile.Result{}, err
+	}
+
+	log.Info("Updating MiniService workload", "revision", ms.Status.Revision)
+
+	// Update the resources status in the MiniService status.
+	updateResourcesStatus(ms, resources)
+
+	// Only add labels and annotations to workload objects. The pod webhook will handle applying metadata to pods.
+	genericWorkloadMutator := newGenericMutator(r.FeatureFlagFetcher, ms, icmsReq,
+		r.ClusterRegion, r.ClusterName, functionName, taskName, false)
+
+	// The utils pod has several init containers that may write files needed by workload pods,
+	// like secrets.json. These init containers should complete before updating workload objects.
+	utilsPod := &corev1.Pod{}
+	utilsPodKey := client.ObjectKey{Namespace: ms.Spec.Namespace, Name: common.UtilsPodName}
+	switch err := r.Client.Get(ctx, utilsPodKey, utilsPod); {
+	case err == nil:
+		// Ensure pod is in a healthy state so an initialized but errored pod
+		// does not result in workload apply.
+		schedulingTimeout := getPodSchedulingTimeout(ctx, icmsReq, r.K8sTimeConfig)
+		if status := getPodStatus(utilsPod, r.K8sTimeConfig, schedulingTimeout); status.TerminalBad {
+			return reconcile.Result{}, reconcile.TerminalError(fmt.Errorf("utils pod is %s: %s", status.Status, status.Reason))
+		}
+		if !isInitContainersComplete(utilsPod) {
+			log.V(1).Info("Utils pod init containers have not completed, waiting for initialization event to update workload")
+			return reconcile.Result{}, nil
+		}
+		log.V(1).Info("Utils pod init containers have completed, proceeding with workload update")
+	case apierrors.IsNotFound(err):
+		// The utils pod must exist at this point in the instance's lifecycle,
+		// so NotFound errors are considered non-transient.
+		log.Error(err, "Utils pod expected to be found but was not during workload update")
+		return reconcile.Result{}, reconcile.TerminalError(err)
+	case k8sutil.IsTransientK8sError(err):
+		log.V(1).Info("Transient error getting utils pod, will retry", "error", err)
+		return reconcile.Result{Requeue: true}, nil
+	default:
+		log.Error(err, "Non-transient error getting utils pod during workload update")
+		return reconcile.Result{}, err
+	}
+
+	if err := r.applySSAWorkload(ctx, ms, genericWorkloadMutator, workloadObjs...); err != nil {
+		if isTerminal(err) {
+			err = unwrapTerminalError(err)
+			log.Error(err, "Failed to apply workload objects with terminal error. MiniService must be updated with new values to progress update; "+
+				"successfully applied objects prior to this error may need to be cleaned up manually")
+		}
+		return reconcile.Result{}, err
+	}
+
+	if err := r.saveWorkloadConfig(ctx, ms, workloadConfig); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err := r.saveRevisionHistory(ctx, ms); err != nil {
+		log.Error(err, "Failed to save revision history after workload update")
+		return reconcile.Result{}, err
+	}
+
+	ms.Status.Phase = v1alpha1.MiniServiceInstalled
+	meta.SetStatusCondition(&ms.Status.Conditions, metav1.Condition{
+		Type:    v1alpha1.MiniServiceConditionInstallSuccessful,
+		Status:  metav1.ConditionTrue,
+		Reason:  "WorkloadObjectsUpdated",
+		Message: fmt.Sprintf("Workload update to revision %d completed successfully", ms.Status.Revision),
 	})
 
 	return reconcile.Result{}, nil
@@ -1037,7 +1342,7 @@ func (r *Reconciler) doCleanup(ctx context.Context, //nolint:gocyclo
 	} else {
 		log.V(1).Info("Using cached rendered object data in cleanup")
 
-		if objs, _, err = decodeObjects(ctx, r.Decoder, objsData); err != nil {
+		if objs, _, _, err = decodeObjects(ctx, r.Decoder, objsData); err != nil {
 			return reconcile.Result{}, err
 		}
 		for i := 0; i < len(objs); i++ {
@@ -1274,19 +1579,7 @@ func (r *Reconciler) applyWorkload(ctx context.Context,
 	return r.create(ctx, ms, objectMutatorSet{}, genericMutator, c, objs...)
 }
 
-const fieldManagerName = "miniservice-controller"
-
-// applySSAInfra applies infra objects using server-side apply for upgrades.
-func (r *Reconciler) applySSAInfra(ctx context.Context,
-	ms *v1alpha1.MiniService,
-	objectMutators objectMutatorSet,
-	genericMutator objectMutator,
-	objs ...client.Object,
-) error {
-	return r.applySSA(ctx, ms, objectMutators, genericMutator, r.Client, objs...)
-}
-
-// applySSAWorkload applies workload objects using server-side apply for upgrades.
+// applySSAWorkload applies workload objects using server-side apply for updates.
 // Like applyWorkload, it may use an impersonating client for RBAC enforcement.
 func (r *Reconciler) applySSAWorkload(ctx context.Context,
 	ms *v1alpha1.MiniService,
@@ -1306,7 +1599,7 @@ func (r *Reconciler) applySSAWorkload(ctx context.Context,
 
 // applySSA uses server-side apply to create or update objects.
 // Unlike create(), which skips existing objects, applySSA applies desired state
-// to both new and existing objects, making it suitable for helm values upgrades.
+// to both new and existing objects, making it suitable for helm values updates.
 func (r *Reconciler) applySSA(ctx context.Context,
 	ms *v1alpha1.MiniService,
 	objectMutators objectMutatorSet,
@@ -1321,7 +1614,7 @@ func (r *Reconciler) applySSA(ctx context.Context,
 	})
 
 	caniCache := map[schema.GroupVersionKind]error{}
-	checkPermissions := r.newPermissionsChecker(caniCache)
+	checkPermissions := r.newPermissionsChecker(caniCache, requiredRBACVerbsWrite)
 
 	rm := c.RESTMapper()
 	for _, obj := range objs {
@@ -1360,7 +1653,7 @@ func (r *Reconciler) applySSA(ctx context.Context,
 		obj.SetResourceVersion("")
 		obj.GetObjectKind().SetGroupVersionKind(gvk)
 
-		if err := c.Patch(ctx, obj, client.Apply, client.FieldOwner(fieldManagerName), client.ForceOwnership); err != nil {
+		if err := c.Patch(ctx, obj, client.Apply, client.FieldOwner(managedByValue), client.ForceOwnership); err != nil {
 			if apierrors.IsInvalid(err) || apierrors.IsForbidden(err) {
 				err = reconcile.TerminalError(err)
 			}
@@ -1368,6 +1661,7 @@ func (r *Reconciler) applySSA(ctx context.Context,
 		}
 		log.V(1).Info("Applied object via Server-Side Apply", "gvk", gvk, "name", obj.GetName())
 	}
+
 	return nil
 }
 
@@ -1386,7 +1680,7 @@ func (r *Reconciler) create(ctx context.Context,
 
 	// Cache permissions errors per GVK to reduce requests to the API server.
 	caniCache := map[schema.GroupVersionKind]error{}
-	checkPermissions := r.newPermissionsChecker(caniCache)
+	checkPermissions := r.newPermissionsChecker(caniCache, requiredRBACVerbsWrite)
 
 	rm := c.RESTMapper()
 	for _, obj := range objs {
@@ -1438,10 +1732,13 @@ func (r *Reconciler) create(ctx context.Context,
 }
 
 var (
-	// The minimal list of verbs to check prior to using the caching client.
+	// The list of verbs to check prior to using the caching client for read operations.
 	// This list is intentionally not exhaustive; other client methods will return more descriptive errors
 	// if the corresponding verb is not permitted for a resource.
-	requiredRBACVerbs = []string{"get", "list", "watch"}
+	requiredRBACVerbsRead = []string{"get", "list", "watch"}
+
+	// The list of verbs to check prior to using the caching client for write operations.
+	requiredRBACVerbsWrite = []string{"get", "list", "watch", "create", "update", "patch", "delete"}
 )
 
 type resourceAccesssDeniedError struct {
@@ -1458,7 +1755,7 @@ func (e resourceAccesssDeniedError) Error() string {
 // preventing unrecoverable cache errors when RBAC is missing.
 // It checks permissions with Kubernetes SelfSubjectAccessReview objects.
 // See https://github.com/kubernetes-sigs/controller-runtime/issues/550
-func newSelfSubjectAccessReviewPermissionsChecker(caniCache map[schema.GroupVersionKind]error) permissionCheckerFunc {
+func newSelfSubjectAccessReviewPermissionsChecker(caniCache map[schema.GroupVersionKind]error, verbs []string) permissionCheckerFunc {
 	return func(ctx context.Context, c client.Client, gvk schema.GroupVersionKind, namespace string) error {
 		log := logf.FromContext(ctx).WithValues("gvk", gvk.String(), "namespace", namespace)
 
@@ -1473,7 +1770,7 @@ func newSelfSubjectAccessReviewPermissionsChecker(caniCache map[schema.GroupVers
 		}
 
 		hasBadVerbs := false
-		for _, verb := range requiredRBACVerbs {
+		for _, verb := range verbs {
 			ssar := &authorizationv1.SelfSubjectAccessReview{
 				Spec: authorizationv1.SelfSubjectAccessReviewSpec{
 					ResourceAttributes: &authorizationv1.ResourceAttributes{
@@ -1571,29 +1868,46 @@ func weighObject(obj client.Object) int8 {
 	}
 }
 
-func decodeObjects(ctx context.Context, decoder runtime.Decoder, objsData []byte) ([]client.Object, []v1alpha1.ResourceStatus, error) {
+// decodeObjects decodes the ReVal-rendered object data into typed client objects and a
+// per-GVK resource summary. The workload config ConfigMap
+// (featureflag.WorkloadConfigConfigMapName) is a control signal from the chart and is never
+// created on-cluster: it is extracted and returned as a decoded WorkloadConfig, and excluded
+// from the returned objects and resource summary so it is never applied or status-checked.
+func decodeObjects(ctx context.Context, decoder runtime.Decoder, objsData []byte) (
+	[]client.Object, []v1alpha1.ResourceStatus, *v1alpha1.WorkloadConfig, error,
+) {
 	log := logf.FromContext(ctx)
 
 	var rawObjs []json.RawMessage
 	if err := json.Unmarshal(objsData, &rawObjs); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	objs := make([]client.Object, len(rawObjs))
+	objs := make([]client.Object, 0, len(rawObjs))
 	resourcesByGVK := map[string]v1alpha1.ResourceStatus{}
+	var workloadConfig *v1alpha1.WorkloadConfig
 	for i, rawObj := range rawObjs {
 		robj, _, err := decoder.Decode(rawObj, nil, nil)
 		if err != nil {
 			log.Error(err, "Error decoding object from ReVal", "index", i)
-			return nil, nil, reconcile.TerminalError(err)
+			return nil, nil, nil, reconcile.TerminalError(err)
 		}
 
 		cobj, ok := robj.(client.Object)
 		if !ok {
 			log.Error(nil, "Object does not implement client.Object", "index", i)
-			return nil, nil, reconcile.TerminalError(fmt.Errorf("bad object type"))
+			return nil, nil, nil, reconcile.TerminalError(fmt.Errorf("bad object type"))
 		}
 
-		objs[i] = cobj
+		// Extract the workload config ConfigMap. It must never be applied on-cluster,
+		// so drop it from the objects to create and status-check.
+		if cm, ok := cobj.(*corev1.ConfigMap); ok && cm.Name == featureflag.WorkloadConfigConfigMapName {
+			if workloadConfig, err = featureflag.DecodeWorkloadConfig(ctx, log, cm); err != nil {
+				return nil, nil, nil, reconcile.TerminalError(fmt.Errorf("decode workload config: %w", err))
+			}
+			continue
+		}
+
+		objs = append(objs, cobj)
 		gvk := cobj.GetObjectKind().GroupVersionKind().String()
 		if _, ok := resourcesByGVK[gvk]; ok {
 			resource := resourcesByGVK[gvk]
@@ -1615,7 +1929,7 @@ func decodeObjects(ctx context.Context, decoder runtime.Decoder, objsData []byte
 		log.V(1).Info("Decoded object", "gvk", resource.GVK, "names", resource.Names, "count", resource.Count)
 	}
 
-	return objs, resources, nil
+	return objs, resources, workloadConfig, nil
 }
 
 // getObjectGVK returns the GVK for an object using the gvkCache from context for better performance.
@@ -1832,4 +2146,50 @@ func updateResourcesStatus(ms *v1alpha1.MiniService, resources []v1alpha1.Resour
 		ms.Status.RenderDetails = &v1alpha1.RenderDetailsStatus{}
 	}
 	ms.Status.RenderDetails.Resources = resources
+}
+
+// cacheLaunchRequested reports whether the request asks for model caching
+// (a CacheLaunchSpecification with a positive size).
+func cacheLaunchRequested(icmsReq *nvcav2beta1.ICMSRequest) bool {
+	if icmsReq == nil {
+		return false
+	}
+	var cls *common.CacheLaunchSpecification
+	switch {
+	case icmsReq.Spec.CreationMsgInfo.FunctionLaunchSpecification != nil:
+		cls = icmsReq.Spec.CreationMsgInfo.FunctionLaunchSpecification.CacheLaunchSpecification
+	case icmsReq.Spec.CreationMsgInfo.TaskLaunchSpecification != nil:
+		cls = icmsReq.Spec.CreationMsgInfo.TaskLaunchSpecification.CacheLaunchSpecification
+	default:
+		return false
+	}
+	return cls != nil && cls.CacheSize > 0
+}
+
+// ephemeralModelCacheInitEnv materializes the launch env (plus INSTANCE_ID)
+// consumed by the ephemeral model-cache-init container and returns it with
+// the init image. The env travels to the webhook inside the miniservice
+// metadata ConfigMap (MiniserviceMetadata.ModelCacheInitEnv) instead of a
+// dedicated per-instance ConfigMap.
+func ephemeralModelCacheInitEnv(
+	ms *v1alpha1.MiniService,
+	icmsReq *nvcav2beta1.ICMSRequest,
+) (map[string]string, string, error) {
+	envSet, err := parseWorkloadEnvSet(icmsReq)
+	if err != nil {
+		return nil, "", fmt.Errorf("decode launch env for model cache init: %w", err)
+	}
+
+	initImage := envSet[common.InitImageEnv]
+	if initImage == "" {
+		return nil, "", fmt.Errorf("missing %s in launch environment", common.InitImageEnv)
+	}
+
+	data := maps.Clone(envSet)
+	if data == nil {
+		data = map[string]string{}
+	}
+	data["INSTANCE_ID"] = ms.Name
+
+	return data, initImage, nil
 }

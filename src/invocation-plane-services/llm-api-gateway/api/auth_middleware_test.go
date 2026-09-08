@@ -25,10 +25,44 @@ import (
 	"testing"
 
 	echo "github.com/labstack/echo/v4"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/nvcf"
 )
+
+func TestNVCFAuthHTTPErrorMapsCodes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"invalid argument -> 400", status.Error(codes.InvalidArgument, "bad routing key"), http.StatusBadRequest},
+		{"unauthenticated -> 401", status.Error(codes.Unauthenticated, "auth failed"), http.StatusUnauthorized},
+		{"permission denied -> 403", status.Error(codes.PermissionDenied, "nope"), http.StatusForbidden},
+		{"not found -> 404", status.Error(codes.NotFound, "not found"), http.StatusNotFound},
+		{"deadline -> 504", status.Error(codes.DeadlineExceeded, "slow"), http.StatusGatewayTimeout},
+		{"unavailable -> 503", status.Error(codes.Unavailable, "down"), http.StatusServiceUnavailable},
+		{"internal -> 502", status.Error(codes.Internal, "boom"), http.StatusBadGateway},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			he, ok := nvcfAuthHTTPError(tc.err).(*echo.HTTPError)
+			if !ok {
+				t.Fatalf("want *echo.HTTPError, got %T", nvcfAuthHTTPError(tc.err))
+			}
+			if he.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", he.Code, tc.wantStatus)
+			}
+		})
+	}
+}
 
 func TestNVCFAuthMiddlewareEnrichesRequestContext(t *testing.T) {
 	t.Parallel()
@@ -107,6 +141,125 @@ func TestNVCFAuthMiddlewareEnrichesRequestContext(t *testing.T) {
 	}
 	if authClient.authorizeCalls != 1 {
 		t.Fatalf("authorize calls = %d, want 1", authClient.authorizeCalls)
+	}
+}
+
+// The auth middleware is registered globally, so priority propagation is
+// path-independent; exercise every LLM entry that forwards X-Priority.
+var priorityMiddlewarePaths = []struct {
+	path string
+	body string
+}{
+	{
+		path: "/v1/chat/completions",
+		body: `{"model":"fn-chat/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`,
+	},
+	{
+		path: "/v1/responses",
+		body: `{"model":"fn-chat/company-name/model-name","input":"hello"}`,
+	},
+	{
+		path: "/v1/embeddings",
+		body: `{"model":"fn-chat/company-name/model-name","input":"hello"}`,
+	},
+}
+
+func TestNVCFAuthMiddlewarePropagatesResolvedPriority(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range priorityMiddlewarePaths {
+		t.Run(tc.path, func(t *testing.T) {
+			t.Parallel()
+
+			wantPriority := uint32(3)
+			authClient := &stubInvocationAuthClient{
+				authResponse: &nvcf.InvocationAuthResponse{
+					RoutingKey:   "fn-chat",
+					ClientAuthID: "subject-123",
+					AuthContext:  map[string]string{"ncaId": "nca-456"},
+					RateLimitKey: "nca-456",
+					Priority:     &wantPriority,
+				},
+			}
+
+			cfg := config.Default()
+
+			e := echo.New()
+			e.Use(NewContextMiddleware(cfg))
+			e.Use(NewNVCFAuthMiddleware(authClient))
+			e.POST(tc.path, func(ec echo.Context) error {
+				gc := ec.(*GatewayContext)
+				reqCtx := gc.RequestContext()
+				if reqCtx == nil {
+					t.Fatal("request context was not set")
+				}
+				if reqCtx.Priority == nil {
+					t.Fatal("priority was not propagated to request context")
+				}
+				if *reqCtx.Priority != 3 {
+					t.Fatalf("priority = %d, want 3", *reqCtx.Priority)
+				}
+				return gc.NoContent(http.StatusNoContent)
+			})
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			req.Header.Set(echo.HeaderAuthorization, "Bearer sk-live")
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestNVCFAuthMiddlewareLeavesPriorityUnsetWhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range priorityMiddlewarePaths {
+		t.Run(tc.path, func(t *testing.T) {
+			t.Parallel()
+
+			authClient := &stubInvocationAuthClient{
+				authResponse: &nvcf.InvocationAuthResponse{
+					RoutingKey:   "fn-chat",
+					ClientAuthID: "subject-123",
+					AuthContext:  map[string]string{"ncaId": "nca-456"},
+					RateLimitKey: "nca-456",
+				},
+			}
+
+			cfg := config.Default()
+
+			e := echo.New()
+			e.Use(NewContextMiddleware(cfg))
+			e.Use(NewNVCFAuthMiddleware(authClient))
+			e.POST(tc.path, func(ec echo.Context) error {
+				gc := ec.(*GatewayContext)
+				reqCtx := gc.RequestContext()
+				if reqCtx == nil {
+					t.Fatal("request context was not set")
+				}
+				if reqCtx.Priority != nil {
+					t.Fatalf("priority = %d, want unset", *reqCtx.Priority)
+				}
+				return gc.NoContent(http.StatusNoContent)
+			})
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			req.Header.Set(echo.HeaderAuthorization, "Bearer sk-live")
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -271,4 +424,30 @@ func (s *stubInvocationAuthClient) AuthorizeInvocation(
 	s.authorizeToken = clientAuthorizationToken
 	s.authorizeRoutingKey = routingKey
 	return s.authResponse, nil
+}
+
+func TestNVCFAuthHTTPErrorDoesNotLeakTransportDetail(t *testing.T) {
+	t.Parallel()
+
+	// The shape a real dial failure takes. Returned verbatim, it handed callers
+	// the auth service's address and port on a pre-authentication path.
+	transportErr := status.Error(codes.Unavailable,
+		`connection error: desc = "transport: Error while dialing dial tcp 10.0.0.5:9090: connect: connection refused"`)
+
+	for _, err := range []error{
+		transportErr,
+		status.Error(codes.Internal, "panic in authorize: /opt/nvcf/internal/auth.go:412"),
+		status.Error(codes.DeadlineExceeded, "context deadline exceeded talking to auth.nvcf.svc.cluster.local:9090"),
+	} {
+		he, ok := nvcfAuthHTTPError(err).(*echo.HTTPError)
+		if !ok {
+			t.Fatalf("want *echo.HTTPError, got %T", nvcfAuthHTTPError(err))
+		}
+		msg, _ := he.Message.(string)
+		for _, leak := range []string{"10.0.0.5", "9090", "rpc error", "svc.cluster.local", "/opt/nvcf", "dial tcp"} {
+			if strings.Contains(msg, leak) {
+				t.Errorf("response message leaks %q: %s", leak, msg)
+			}
+		}
+	}
 }

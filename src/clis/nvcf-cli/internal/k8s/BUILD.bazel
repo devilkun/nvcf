@@ -24,6 +24,7 @@ go_library(
         "//src/clis/nvcf-cli/internal/logging",
         "@io_k8s_api//core/v1:core",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//dynamic",
         "@io_k8s_client_go//kubernetes",
         "@io_k8s_client_go//rest",
         "@io_k8s_client_go//tools/clientcmd",

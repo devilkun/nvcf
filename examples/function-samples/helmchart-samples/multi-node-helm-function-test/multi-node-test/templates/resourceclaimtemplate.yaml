@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-{{- if .Values.resourceClaimTemplate.enabled }}
+{{ $profile := include "multi-node-test.effectiveProfileValues" . | fromYaml -}}
+{{ $resourceClaimTemplate := $profile.resourceClaimTemplate | default dict -}}
+{{ if ($resourceClaimTemplate.enabled | default false) }}
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: {{ .Values.resourceClaimTemplate.name }}
+  name: {{ $resourceClaimTemplate.name }}
 spec:
   metadata: {}
   spec:
     devices:
       requests:
         - exactly:
-            allocationMode: {{ .Values.resourceClaimTemplate.allocationMode }}
-            count: {{ .Values.resourceClaimTemplate.count }}
-            deviceClassName: {{ .Values.resourceClaimTemplate.deviceClassName }}
-          name: {{ .Values.resourceClaimTemplate.claimName }}
+            allocationMode: {{ $resourceClaimTemplate.allocationMode }}
+            count: {{ $resourceClaimTemplate.count }}
+            deviceClassName: {{ $resourceClaimTemplate.deviceClassName }}
+          name: {{ $resourceClaimTemplate.claimName }}
 {{- end }}

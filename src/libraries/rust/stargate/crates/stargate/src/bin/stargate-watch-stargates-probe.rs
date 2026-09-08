@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use std::collections::HashSet;
+use std::fmt::Debug;
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -26,34 +28,24 @@ use stargate_proto::pb::stargate_control_plane_client::StargateControlPlaneClien
 struct Args {
     #[arg(long, value_name = "ADDR")]
     addr: String,
-
     #[arg(long = "expect-id", value_name = "ID")]
     expected_ids: Vec<String>,
-
     #[arg(long = "expect-advertise-addr", value_name = "ADDR")]
     expected_advertise_addrs: Vec<String>,
-
     #[arg(long = "expect-grpc-pylon-dial-addr", value_name = "ADDR")]
     expected_grpc_pylon_dial_addrs: Vec<String>,
-
     #[arg(long = "expect-watch-url", value_name = "URL")]
     expected_watch_urls: Vec<String>,
-
     #[arg(long, value_name = "N")]
     expect_stargate_count: Option<usize>,
-
     #[arg(long = "expect-watch-url-count", value_name = "N")]
     expect_watch_url_count: Option<usize>,
-
     #[arg(long = "reject-advertise-prefix", value_name = "PREFIX")]
     rejected_advertise_prefixes: Vec<String>,
-
     #[arg(long, default_value_t = false)]
     expect_empty_http_advertise: bool,
-
     #[arg(long, default_value_t = 30, value_name = "N")]
     attempts: u32,
-
     #[arg(long, default_value_t = 1000, value_name = "MS")]
     interval_ms: u64,
 }
@@ -61,16 +53,23 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let endpoint = if args.addr.starts_with("http://") || args.addr.starts_with("https://") {
-        args.addr.clone()
-    } else {
-        format!("http://{}", args.addr)
-    };
+    run_probe_with(&args, |endpoint, request| async move {
+        watch_stargates_once(&endpoint, request).await
+    })
+    .await
+}
 
-    let mut last_error = None;
+async fn run_probe_with<F, Fut>(args: &Args, mut watch_stargates_fn: F) -> Result<()>
+where
+    F: FnMut(String, WatchStargatesRequest) -> Fut,
+    Fut: Future<Output = Result<stargate_proto::pb::WatchStargatesResponse>>,
+{
+    let endpoint = endpoint_from_addr(&args.addr);
+
+    let mut last_error = "no attempts ran".to_string();
     for attempt in 1..=args.attempts {
-        match watch_stargates_once(&endpoint).await {
-            Ok(response) => match validate_snapshot(&response, &args) {
+        last_error = match watch_stargates_fn(endpoint.clone(), WatchStargatesRequest {}).await {
+            Ok(response) => match validate_snapshot(&response, args) {
                 Ok(()) => {
                     let ids: Vec<_> = response
                         .stargates
@@ -83,122 +82,83 @@ async fn main() -> Result<()> {
                     );
                     return Ok(());
                 }
-                Err(error) => {
-                    last_error = Some(format!(
-                        "attempt {attempt}/{} returned invalid snapshot: {error:#}",
-                        args.attempts
-                    ));
-                }
-            },
-            Err(error) => {
-                last_error = Some(format!(
-                    "attempt {attempt}/{} failed: {error:#}",
+                Err(error) => format!(
+                    "attempt {attempt}/{} returned invalid snapshot: {error:#}",
                     args.attempts
-                ));
-            }
-        }
+                ),
+            },
+            Err(error) => format!("attempt {attempt}/{} failed: {error:#}", args.attempts),
+        };
 
         if attempt < args.attempts {
             tokio::time::sleep(Duration::from_millis(args.interval_ms)).await;
         }
     }
 
-    bail!(
-        "WatchStargates did not return expected stargates from {endpoint}: {}",
-        last_error.unwrap_or_else(|| "no attempts ran".to_string())
-    )
+    bail!("WatchStargates did not return expected stargates from {endpoint}: {last_error}")
+}
+
+fn endpoint_from_addr(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
 }
 
 async fn watch_stargates_once(
     endpoint: &str,
+    request: WatchStargatesRequest,
 ) -> Result<stargate_proto::pb::WatchStargatesResponse> {
     let mut client = StargateControlPlaneClient::connect(endpoint.to_string())
         .await
         .with_context(|| format!("connect to {endpoint}"))?;
     let mut stream = client
-        .watch_stargates(WatchStargatesRequest {})
+        .watch_stargates(request)
         .await
         .context("call WatchStargates")?
         .into_inner();
 
-    let response = tokio::time::timeout(Duration::from_secs(5), stream.message())
+    tokio::time::timeout(Duration::from_secs(5), stream.message())
         .await
         .context("timed out waiting for WatchStargates snapshot")?
         .context("read WatchStargates snapshot")?
-        .context("WatchStargates stream closed before first snapshot")?;
-
-    Ok(response)
+        .context("WatchStargates stream closed before first snapshot")
 }
 
 fn validate_snapshot(
     response: &stargate_proto::pb::WatchStargatesResponse,
     args: &Args,
 ) -> Result<()> {
-    if let Some(expected_count) = args.expect_stargate_count
-        && response.stargates.len() != expected_count
-    {
-        bail!(
-            "expected {expected_count} stargates; got {}: {:?}",
-            response.stargates.len(),
-            response.stargates
-        );
-    }
-
-    if let Some(expected_count) = args.expect_watch_url_count
-        && response.watch_stargate_urls.len() != expected_count
-    {
-        bail!(
-            "expected {expected_count} watch urls; got {}: {:?}",
-            response.watch_stargate_urls.len(),
-            response.watch_stargate_urls
-        );
-    }
-
-    let ids: HashSet<_> = response
-        .stargates
-        .iter()
-        .map(|s| s.stargate_id.as_str())
-        .collect();
-    for expected_id in &args.expected_ids {
-        if !ids.contains(expected_id.as_str()) {
-            bail!("missing stargate_id {expected_id}; got {ids:?}");
-        }
-    }
-
-    let advertise_addrs: HashSet<_> = response
-        .stargates
-        .iter()
-        .map(|s| s.advertise_addr.as_str())
-        .collect();
-    for expected_advertise_addr in &args.expected_advertise_addrs {
-        if !advertise_addrs.contains(expected_advertise_addr.as_str()) {
-            bail!("missing advertise_addr {expected_advertise_addr}; got {advertise_addrs:?}");
-        }
-    }
-
-    let grpc_pylon_dial_addrs: HashSet<_> = response
-        .stargates
-        .iter()
-        .map(|s| s.grpc_pylon_dial_addr.as_str())
-        .collect();
-    for expected_grpc_pylon_dial_addr in &args.expected_grpc_pylon_dial_addrs {
-        if !grpc_pylon_dial_addrs.contains(expected_grpc_pylon_dial_addr.as_str()) {
-            bail!(
-                "missing grpc_pylon_dial_addr {expected_grpc_pylon_dial_addr}; got {grpc_pylon_dial_addrs:?}"
-            );
-        }
-    }
-
-    let watch_urls: HashSet<_> = response
-        .watch_stargate_urls
-        .iter()
-        .map(String::as_str)
-        .collect();
-    for expected_watch_url in &args.expected_watch_urls {
-        if !watch_urls.contains(expected_watch_url.as_str()) {
-            bail!("missing watch url {expected_watch_url}; got {watch_urls:?}");
-        }
-    }
+    require_count(&response.stargates, args.expect_stargate_count, "stargates")?;
+    require_count(
+        &response.watch_stargate_urls,
+        args.expect_watch_url_count,
+        "watch urls",
+    )?;
+    require_expected(
+        response.stargates.iter().map(|s| s.stargate_id.as_str()),
+        &args.expected_ids,
+        "stargate_id",
+    )?;
+    require_expected(
+        response.stargates.iter().map(|s| s.advertise_addr.as_str()),
+        &args.expected_advertise_addrs,
+        "advertise_addr",
+    )?;
+    require_expected(
+        response
+            .stargates
+            .iter()
+            .map(|s| s.grpc_pylon_dial_addr.as_str()),
+        &args.expected_grpc_pylon_dial_addrs,
+        "grpc_pylon_dial_addr",
+    )?;
+    require_expected(
+        response.watch_stargate_urls.iter().map(String::as_str),
+        &args.expected_watch_urls,
+        "watch url",
+    )?;
 
     for stargate in &response.stargates {
         for rejected_prefix in &args.rejected_advertise_prefixes {
@@ -222,11 +182,78 @@ fn validate_snapshot(
     Ok(())
 }
 
+fn require_count<T: Debug>(items: &[T], expected: Option<usize>, label: &str) -> Result<()> {
+    match expected {
+        Some(expected) if items.len() != expected => bail!(
+            "expected {expected} {label}; got {}: {items:?}",
+            items.len()
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn require_expected<'a>(
+    actual: impl IntoIterator<Item = &'a str>,
+    expected: &[String],
+    label: &str,
+) -> Result<()> {
+    let actual: HashSet<_> = actual.into_iter().collect();
+    if let Some(expected) = expected
+        .iter()
+        .find(|expected| !actual.contains(expected.as_str()))
+    {
+        bail!("missing {label} {expected}; got {actual:?}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stargate_proto::pb::StargateInfo;
-    use stargate_proto::pb::WatchStargatesResponse;
+    use std::pin::Pin;
+
+    use futures::Stream;
+    use stargate_proto::pb::stargate_control_plane_server::{
+        StargateControlPlane, StargateControlPlaneServer,
+    };
+    use stargate_proto::pb::{
+        InferenceServerAck, InferenceServerRegistration, StargateInfo, WatchStargatesResponse,
+    };
+    use tokio::net::TcpListener;
+    use tonic::{Request, Response, Status};
+
+    type WatchStargatesStream =
+        Pin<Box<dyn Stream<Item = Result<WatchStargatesResponse, Status>> + Send + 'static>>;
+    type RegisterInferenceServerStream =
+        Pin<Box<dyn Stream<Item = Result<InferenceServerAck, Status>> + Send + 'static>>;
+
+    #[derive(Clone)]
+    struct TestControlPlane {
+        response: WatchStargatesResponse,
+    }
+
+    #[tonic::async_trait]
+    impl StargateControlPlane for TestControlPlane {
+        type WatchStargatesStream = WatchStargatesStream;
+        type RegisterInferenceServerStream = RegisterInferenceServerStream;
+
+        async fn watch_stargates(
+            &self,
+            _request: Request<WatchStargatesRequest>,
+        ) -> Result<Response<Self::WatchStargatesStream>, Status> {
+            let response = self.response.clone();
+            Ok(Response::new(Box::pin(futures::stream::iter([Ok(
+                response,
+            )]))))
+        }
+
+        async fn register_inference_server(
+            &self,
+            _request: Request<tonic::Streaming<InferenceServerRegistration>>,
+        ) -> Result<Response<Self::RegisterInferenceServerStream>, Status> {
+            Err(Status::unimplemented("not needed by watch probe tests"))
+        }
+    }
 
     fn args() -> Args {
         Args {
@@ -242,6 +269,119 @@ mod tests {
             attempts: 1,
             interval_ms: 1,
         }
+    }
+
+    fn response_with_stargate(stargate_id: &str) -> WatchStargatesResponse {
+        WatchStargatesResponse {
+            stargates: vec![StargateInfo {
+                stargate_id: stargate_id.to_string(),
+                advertise_addr: format!("{stargate_id}.stargate.external:50071"),
+                http_advertise_addr: String::new(),
+                grpc_pylon_dial_addr: String::new(),
+            }],
+            watch_stargate_urls: Vec::new(),
+        }
+    }
+
+    async fn spawn_watch_server(response: WatchStargatesResponse) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind to a loopback port");
+        let addr = listener
+            .local_addr()
+            .expect("bound listener should expose its local address");
+        let incoming = async_stream::stream! {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _peer_addr)) => yield Ok::<_, std::io::Error>(stream),
+                    Err(error) => {
+                        yield Err(error);
+                        break;
+                    }
+                }
+            }
+        };
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(StargateControlPlaneServer::new(TestControlPlane {
+                    response,
+                }))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test WatchStargates server should run");
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn probe_loop_accepts_valid_snapshot() {
+        let mut args = args();
+        args.expected_ids = vec!["stargate-0".to_string()];
+        args.attempts = 1;
+        let mut calls = 0;
+
+        run_probe_with(&args, |endpoint, _request| {
+            calls += 1;
+            assert_eq!(endpoint, "http://127.0.0.1:50071");
+            std::future::ready(Ok(response_with_stargate("stargate-0")))
+        })
+        .await
+        .expect("expected snapshot should pass");
+
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn probe_loop_reports_last_invalid_snapshot() {
+        let mut args = args();
+        args.expected_ids = vec!["stargate-a".to_string()];
+        args.attempts = 2;
+        args.interval_ms = 0;
+        let mut calls = 0;
+
+        let error = run_probe_with(&args, |_endpoint, _request| {
+            calls += 1;
+            let stargate_id = if calls == 1 {
+                "stargate-b"
+            } else {
+                "stargate-c"
+            };
+            std::future::ready(Ok(response_with_stargate(stargate_id)))
+        })
+        .await
+        .expect_err("invalid snapshots should fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("attempt 2/2 returned invalid snapshot"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("missing stargate_id stargate-a"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(calls, 2);
+
+        args.attempts = 0;
+        let error = run_probe_with(&args, |_, _| {
+            std::future::ready(Ok(response_with_stargate("unused")))
+        })
+        .await
+        .expect_err("zero attempts should fail");
+        assert!(error.to_string().ends_with("no attempts ran"));
+    }
+
+    #[tokio::test]
+    async fn watch_stargates_once_reads_first_snapshot() {
+        let endpoint = spawn_watch_server(response_with_stargate("stargate-0")).await;
+
+        let response = watch_stargates_once(&endpoint, WatchStargatesRequest {})
+            .await
+            .expect("watch call should read first snapshot");
+
+        assert_eq!(response.stargates[0].stargate_id, "stargate-0");
     }
 
     #[test]

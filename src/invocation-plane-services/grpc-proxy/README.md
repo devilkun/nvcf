@@ -14,6 +14,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
+
+<!-- Release-pipeline touchpoint for #315: validates version-registration on release. -->
 # NVCF GRPC Proxy
 
 A proxy service that facilitates communication between clients and NVIDIA Cloud Functions (NVCF) workers. This service handles HTTP/3 CONNECT endpoints, HTTP/1 CONNECT endpoints, and HTTP/1-2 forwarding for GRPC requests.
@@ -458,8 +460,6 @@ the broader Phase B context.
 
 ### Environment Setup
 
-### Environment Setup
-
 Configuration is primarily handled through environment variables or command-line flags. Key configuration parameters include:
 
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: Endpoint for OpenTelemetry tracing
@@ -467,10 +467,10 @@ Configuration is primarily handled through environment variables or command-line
 - `NVCF_FQDN_GRPC`: FQDN for the NVCF API
 - `ENABLE_HTTP1_CONNECT`: Enable HTTP/1 CONNECT endpoints
 - `ENABLE_HTTP3_CONNECT`: Enable HTTP/3 CONNECT endpoints
+- `SELF_WORKER_FQDN`: Optional worker callback endpoint advertised for CONNECT traffic
 
 See the `Config` struct in the code for a complete list of configuration options.
 
 GRPC Client credentials are provided by either OAuth2 Client Credentials or a bearer token loaded from the secrets.json file.
 OAuth2 Client Credentials should be provided at the json key "id" and "secret".
 Alternatively, bearer token credentials should be provided at the json key "nvcfApiToken" and "ratelimiterToken".
-

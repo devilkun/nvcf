@@ -4,20 +4,20 @@ Quick reference for NVCF (NVIDIA Cloud Functions) in this repository.
 
 ## Repo Layout
 
-This repo is an umbrella layout: upstream services appear as ordinary directories (synthetic imports), arranged under `src/`, `deploy/`, `infra/`, and `migrations/` according to `imports.yaml`. Goal: over time, land and maintain code here natively; synthetic imports are a bridge while sources still live in separate upstream projects. Tooling lives under `tools/` and `tests/`.
+This repo is an umbrella layout: upstream services appear as ordinary
+directories arranged under `src/`, `deploy/`, `infra/`, and `migrations/`
+according to `imports.yaml`. Goal: over time, land and maintain code here
+natively while upstream-owned sources are still tracked by commit pin. Tooling
+lives under `tools/` and `tests/`.
 
 Use `python3`, not `python`, when Python is needed. Use the nearest nested `AGENTS.md` for subtree-specific guidance.
 
 Useful pointers:
 - `BAZEL.md` for the contributor-facing Bazel build path
+- `docs/AGENTS.md` for in-repo user and developer documentation
 - `tools/AGENTS.md` for repo tooling
-- `deploy/helm/AGENTS.md` for native Helm chart guidance
-- `migrations/AGENTS.md` for native migration image guidance
-- `.cursor/skills/add-synthetic-import/SKILL.md` for synthetic imports
+- `imports.yaml` for subtree ownership and commit pins
 - `.cursor/skills/documentation-style/SKILL.md` for docs style
-- `.cursor/skills/nvcf-gitlab-subproject-ci/SKILL.md` for native subproject CI
-  (read before editing `.gitlab-ci.yml`, `subproject-validations.yaml`, or
-  `generated-release-jobs.yml`)
 - `.cursor/skills/` for root dev-skill symlink fanout
 - `ai-tooling/user/skills/` and `ai-tooling/dev/skills/` for public skills
 
@@ -25,17 +25,21 @@ If a referenced skill is outdated, update it before finishing.
 
 ## Cross-repo and stack routing
 
+Documentation is monorepo-native. User docs, version catalogs, and Fern
+navigation are owned under `docs/` and `fern/` in this repository. Do not route
+documentation changes through an external documentation repository or an
+external workspace index. Start with `docs/AGENTS.md` and the nearest nested
+guidance.
+
 Use `imports.yaml` to decide whether a subtree is monorepo-native or still
-owned by an upstream synthetic import. Native subprojects are edited here.
-Upstream-owned synthetic imports usually need the change in the upstream repo
-and a later `tools/sync-synthetic-imports` pin update.
+owned by an upstream repo. Native subprojects are edited here. Upstream-owned
+subtrees usually need the change in the upstream repo and a later commit-pin
+update.
 
 For self-managed stack ownership, deployment order, chart/image-source mapping,
 or "which subtree owns this" questions, use:
 - `.cursor/skills/nvcf-explore-stack/SKILL.md` for the in-repo Helmfile,
   dependency, chart, hook, and image-source map
-- `.cursor/skills/nvcf-workspace-router/SKILL.md` when private workspace
-  routing metadata is relevant
 
 Do not copy workspace routing boilerplate into subtree `AGENTS.md` files. Local
 guidance should only record subtree-specific ownership exceptions, adjacent
@@ -50,11 +54,10 @@ merge-request links or ref names, internal hostnames or URLs, private service
 names, registry endpoints, vault endpoints, or debugging context that external
 readers cannot access.
 
-Keep private context in `nvidia-internal/`, in the internal Merge
-Request/Pull Request description outside the public commit section, or in a
-non-allowlisted runbook. If a change requires public wording, generalize it to
-the user-visible behavior and remove the private evidence trail from the
-allowlisted file.
+Keep private context in the internal Merge Request/Pull Request description
+outside the public commit section or in a non-allowlisted runbook. If a change
+requires public wording, generalize it to the user-visible behavior and remove
+the private evidence trail from the allowlisted file.
 
 ## Local QA and Testing Environment Safety
 
@@ -65,22 +68,57 @@ local artifact state, then ask the user whether cleanup or a net-new isolated
 environment is appropriate. Never delete clusters, Helm releases, worktrees,
 secrets, or artifact directories without explicit user confirmation.
 
-Use `.cursor/skills/nvcf-self-hosted-local-dev/SKILL.md` for the detailed local
-k3d workflow. If creating a net-new environment, use unique cluster names,
-ports, Helmfile environments, secrets files, CLI configs, and artifact
-directories.
+If creating a net-new environment, use unique cluster names, ports, Helmfile
+environments, secrets files, CLI configs, and artifact directories.
+
+## GitLab CI Manual Actions
+
+Treat manual GitLab CI actions as remote write operations. Before triggering a
+manual job, retrying or restarting a job or pipeline, canceling CI, or using a
+push/API side effect to retrigger CI, ask the user for explicit approval in the
+current thread. Do this even when the user asks an agent to fix CI, restart a
+pipeline or job, get a release unstuck, or investigate a failed pipeline.
+
+The approval request must name the exact project, ref, pipeline or job name and
+ID when available, and the expected side effect. Do not treat a broad request
+such as "fix CI", "restart the pipeline", or "get this released" as permission
+to press a manual CI button or retrigger CI.
 
 ## Writing AGENTS.md Files
 
-Every subtree that an agent may work in should have its own `AGENTS.md` with build commands, test commands, code style, and any subtree-specific conventions. Keep each file under 400 lines; split into separate docs or skills when it grows past that.
+Every subtree that an agent may work in should have its own `AGENTS.md` with
+build commands, test commands, code style, and any subtree-specific conventions.
+Keep each file under 400 lines. Split long examples or workflow detail into
+separate docs or skills.
 
-`AGENTS.md` is the source of truth for agent guidance. Cursor and Codex read `AGENTS.md` directly. Claude Code reads `CLAUDE.md`, so every directory that has an `AGENTS.md` also has a sibling `CLAUDE.md` that is a regular file containing the single line `@AGENTS.md`. That import line tells Claude Code to load the adjacent `AGENTS.md`, so all three tools end up on the same content. When creating a new `AGENTS.md`, create the companion `CLAUDE.md` in the same commit: `printf '@AGENTS.md\n' > CLAUDE.md`. Do not use a symlink, and never put unique content in `CLAUDE.md`.
+Apply `documentation-style` whenever you create or edit `AGENTS.md` or
+`CLAUDE.md`. Keep the guidance short, public-safe, and command-focused.
+
+`AGENTS.md` is the source of truth for agent guidance. Cursor and Codex read it
+directly.
+
+Claude Code reads `CLAUDE.md`. Every directory with an `AGENTS.md` also has a
+sibling `CLAUDE.md` containing only `@AGENTS.md`. That import line tells Claude
+Code to load the adjacent `AGENTS.md`, so all three tools use the same content.
+
+When creating a new `AGENTS.md`, create the companion `CLAUDE.md` in the same
+commit: `printf '@AGENTS.md\n' > CLAUDE.md`. Do not use a symlink, and never put
+unique content in `CLAUDE.md`.
 
 ## Skills
 
-Skills are reusable, on-demand agent instructions for specific workflows. They follow the [Agent Skills specification](https://agentskills.io/specification) and are compatible with the [Vercel Skills CLI](https://github.com/vercel-labs/skills). Skills are invoked when relevant, not auto-applied (auto-applied guidance belongs in rules, not skills).
+Skills are reusable, on-demand agent instructions for specific workflows. They
+follow the [Agent Skills specification](https://agentskills.io/specification)
+and are compatible with the [Vercel Skills CLI](https://github.com/vercel-labs/skills).
 
-Keep durable skills focused on current behavior, stable prerequisites, and reusable workflows. Do not put in-progress Merge Request/Pull Request tables, merge-order checklists, branch-specific references, or temporary cross-repo coordination status in skills. Put that information in Merge Request/Pull Request descriptions, comments on the ticket, or temporary runbooks instead.
+Skills are invoked when relevant, not auto-applied. Auto-applied guidance
+belongs in rules, not skills.
+
+Keep durable skills focused on current behavior, stable prerequisites, and
+reusable workflows. Do not put in-progress Pull Request tables, merge-order
+checklists, branch-specific references, or temporary cross-repo coordination
+status in skills. Put that information in Pull Request descriptions, comments
+on the ticket, or temporary runbooks instead.
 
 ### Skill structure
 
@@ -126,15 +164,19 @@ Skills are split by visibility and audience:
 
 - `ai-tooling/user/skills/`: public user-facing NVCF skills.
 - `ai-tooling/dev/skills/`: public developer workflow skills.
-- Private skill source trees follow the same `user/skills/` and `dev/skills/` split in the private subtree.
-- `.cursor/skills/`: root dev-skill fanout only. Each entry is a symlink to a public or private dev skill source directory.
+- Private skill source trees use the same `user/skills/` and `dev/skills/`
+  split outside this public snapshot.
+- `.cursor/skills/`: root dev-skill fanout only. Each entry is a symlink to a
+  public dev skill source directory in this repository.
 
-Cross-tool symlinks make root dev skills available to all agents. The root fanout directories must contain symlinks only, never source skill directories or regular skill files:
-- `.cursor/skills/<name>` -> symlink to the dev skill source directory.
-- `.codex/skills/<name>` -> symlink to the same dev skill source directory.
-- `.claude/skills/<name>` -> symlink to the same dev skill source directory.
+Cross-tool symlinks make root dev skills available to all agents. The root
+fanout directories (`.cursor/skills/`, `.codex/skills/`, `.claude/skills/`)
+must contain symlinks only, never source skill directories or regular skill
+files.
 
-The project hook `.cursor/hooks/validate-skill-fanout.py` audits this before an agent finishes. If it reports a fanout error, fix the symlinks or source placement before responding.
+The project hook `.cursor/hooks/validate-skill-fanout.py` audits this before an
+agent finishes. If it reports a fanout error, fix the symlinks or source
+placement before responding.
 
 When adding a skill:
 1. Decide visibility (public or private) and audience (`user/skills` or `dev/skills`).
@@ -142,50 +184,49 @@ When adding a skill:
 3. For root-wide dev skills, create matching `.cursor/skills/<name>`, `.codex/skills/<name>`, and `.claude/skills/<name>` symlinks to the same source directory.
 4. Update the relevant public or private skills table.
 
+### Generated artifacts
+
+When editing source files under `ai-tooling/user/skills/nvcf-self-managed-cli/**` or
+`ai-tooling/user/skills/nvcf-self-managed-installation/**`, regenerate the embedded CLI
+data and commit the result in the same Pull Request:
+
+```sh
+cd src/clis/nvcf-cli
+go generate ./internal/agentskill/...
+git add internal/agentskill/skilldata_generated.go
+```
+
+The CI job `check-agent-skill-generated` hard-fails if `src/clis/nvcf-cli/internal/agentskill/skilldata_generated.go`
+is stale. Do not edit this file by hand.
+
 ### Where hooks live
 
-Hooks follow the same source-and-fanout pattern as root dev skills. The root
-hook directories are agent-facing fanouts only; hook implementation scripts
-must live in their owning public or private source tree.
-
-- `ai-tooling/dev/hooks/`: public hook source scripts.
-- `.cursor/hooks/`: Cursor hook script fanout only. Entries must be symlinks.
-- `.codex/hooks/`: Codex hook script fanout only. Entries must be symlinks.
-- `.claude/hooks/`: Claude hook script fanout only. Entries must be symlinks.
-
-Tool-specific hook config files, such as `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, and `.claude/settings.json`, may be regular files. Hook implementation scripts must live in a public or private `dev/hooks/` source tree and be exposed through matching symlinks in all three root hook fanouts.
-
-Internal checkouts may configure stop hooks that audit fanout integrity and
-newly added private references in OSS-allowlisted files. If a hook reports
-public snapshot hygiene findings, remove or rewrite those additions before
-finishing. If the hook is unavailable in a public snapshot, still follow the
-OSS Snapshot Hygiene policy manually.
+Hooks follow the same source-and-fanout pattern as root dev skills.
+Implementation scripts live in `ai-tooling/dev/hooks/`; `.cursor/hooks/`,
+`.codex/hooks/`, and `.claude/hooks/` are symlink fanouts only. Tool-specific
+hook config files outside those fanout directories may be regular files.
+Internal-only stop hooks and private snapshot hygiene checks live outside this
+public snapshot; still follow OSS Snapshot Hygiene manually before finishing.
 
 ### Public skills
 
 | Skill | Location | Purpose |
 |-------|----------|---------|
-| `bazel-go-gazelle` | `ai-tooling/dev/skills/` | Wire Go modules into Bazel with rules_go and Gazelle |
-| `bazel-java-maven` | `ai-tooling/dev/skills/` | Wire Java and Spring Boot services into Bazel with Maven artifacts |
-| `bazel-gitlab-child-pipelines` | `ai-tooling/dev/skills/` | Generic Bazel parent-child pipeline pattern; for this repo prefer `nvcf-gitlab-subproject-ci` |
-| `bazel-monorepo-bootstrap` | `ai-tooling/dev/skills/` | Bootstrap Bazel in an existing polyglot monorepo |
-| `bazel-oci-images` | `ai-tooling/dev/skills/` | Build multi-arch OCI images from Bazel binaries |
-| `bazel-rust-crate-universe` | `ai-tooling/dev/skills/` | Wire Rust services into Bazel with crate_universe |
-| `bazel-synthetic-import-strategy` | `ai-tooling/dev/skills/` | Plan Bazel rollout for NVCF synthetic imports |
-| `nvcf-gitlab-subproject-ci` | `ai-tooling/dev/skills/` | Native subproject CI via generated child pipeline (not root `.gitlab-ci.yml`) |
-| `documentation-style` | `ai-tooling/dev/skills/` | NVCF documentation conventions (no bold, no emojis, no em-dash) |
+| `documentation-style` | `ai-tooling/dev/skills/` | Public docs, AGENTS, and skill-writing style |
 | `nvcf-explore-stack` | `ai-tooling/dev/skills/` | Navigate the self-hosted stack topology and dependency graph |
-| `official-docs-style` | `ai-tooling/dev/skills/` | External-facing NVCF user documentation voice and structure |
+| `nvca-chart-release` | `ai-tooling/dev/skills/` | Release NVCA Operator chart changes from monorepo source to the vendored Helm chart |
+| `nvca-self-managed-install` | `ai-tooling/dev/skills/` | Install or validate the NVCA Operator chart against a self-managed control plane |
+| `nvca-values-customization` | `ai-tooling/dev/skills/` | Customize NVCA Operator Helm chart values in the monorepo |
 | `nvcf-self-managed-cli` | `ai-tooling/user/skills/` | Install, operate, and manage self-managed NVCF through `nvcf-cli` |
 | `nvcf-self-managed-installation` | `ai-tooling/user/skills/` | Install and deploy the self-managed NVCF stack |
 | `nvcf-self-managed-prerequisite` | `ai-tooling/user/skills/` | Install cluster-level prerequisites such as KAI Scheduler and SMB CSI driver |
 
-Private skill inventory lives in the private subtree guidance.
-
 ## GitLab CI for native subprojects
 
 The umbrella parent pipeline (`.gitlab-ci.yml`) is not where native service
-build, test, helm-lint, or release validation jobs go.
+build, test, helm-lint, or release validation jobs go. `.gitlab-ci.yml` and
+`tools/ci/generated-release-jobs.yml` are internal GitLab CI config not
+present in this public snapshot.
 
 | Job kind | Where to declare it |
 |---|---|
@@ -194,7 +235,7 @@ build, test, helm-lint, or release validation jobs go.
 | License scan, bazel-smoke, docs, OSS snapshot | root `.gitlab-ci.yml` only |
 
 Before adding or moving any CI job for a path under `src/`, `deploy/helm/`, or
-`migrations/`, read `nvcf-gitlab-subproject-ci` (`.cursor/skills/` symlink).
+`migrations/`, read this section in full.
 Do not add per-service jobs to root `.gitlab-ci.yml` and do not recreate
 `src/**/.gitlab-ci.yml`, `deploy/helm/**/.gitlab-ci.yml`, or
 `migrations/**/.gitlab-ci.yml` for native subprojects. Helm CI-only values
@@ -202,7 +243,7 @@ belong in `tools/ci/helm-validate-values/`, not under chart `ci/` dirs.
 
 ## Commit Messages
 
-Use Conventional Commits v1.0.0. Include issue references in the footer when required by the change type; use `NO-REF` only when acceptable.
+Use Conventional Commits v1.0.0. Include issue references in the footer when required by the change type. For GitHub PR work, use a public `NVIDIA/nvcf` issue reference.
 
 Format:
 
@@ -217,19 +258,31 @@ Foundational types (not in release notes): `docs`, `build`, `test`, `refactor`, 
 
 When a commit adds or updates a third-party dependency, call out the dependency name and version in the body so reviewers can assess license and security impact.
 
-## Merge Requests/Pull Requests
+## Pull Requests
 
-Use Conventional Commit format for Merge Request/Pull Request titles, as
-described in the Commit Messages section. Release automation depends on this
-format. Examples: `feat:`, `fix:`, `chore:`, `docs:`.
+Use Conventional Commit format for Pull Request titles, as described in the
+Commit Messages section. Release automation depends on this format. Examples:
+`feat:`, `fix:`, `chore:`, `docs:`.
 
-Before creating a Merge Request/Pull Request, confirm there is a bug, issue, or
-ticket reference. If none was provided, ask for one. Use `None` or `NO-REF` only
-after explicit confirmation that no issue exists or one is not required.
+For GitHub PRs, agents must create or link a public `NVIDIA/nvcf` issue in
+`## Issues` using `Closes #123`, `Fixes #123`, `Resolves NVIDIA/nvcf#123`, or
+`Relates to #123`. If context is private, create a generic public issue. Do not
+use `NO-REF`, Jira keys, private tracker or bug IDs, private URLs, title-only
+refs, other-repo issues, or invented issue numbers for agent-authored PRs.
 
-Use a structured Merge Request/Pull Request description. Subtree repos may define
-their own Merge Request/Pull Request template; fall back to this shape when none
-exists. Do not include a test plan checklist unless explicitly requested.
+Use a structured Pull Request description. Start from the root Pull Request
+template. Fall back to this shape only when that template is unavailable. Do
+not include a test plan checklist unless explicitly requested.
+
+Every Pull Request description must explain why the change is needed, not only
+what changed. Include enough context that a reviewer can understand the
+motivation without doing detective work. Always include:
+- the problem, requirement, review comment, or CI blocker driving the change
+- what changed and how the changed pieces connect
+- links to upstream Pull Requests, tickets, bugs, or related reviews when
+  relevant
+- tests run, skipped tests, and whether QA is needed
+- dependency changes, license review status, and NOTICE impact
 
 ```
 ## Why
@@ -256,28 +309,91 @@ exists. Do not include a test plan checklist unless explicitly requested.
 ## References
 <bug, issue, or ticket links at the bottom, or "None">
 
-## Related Merge Requests/Pull Requests
+## Related Pull Requests
 <links or "None">
 
 ## Dependencies
 <new or updated third-party packages, license review result, NOTICE update status, or "None">
 ```
 
+### Merge preparation
+
+Before merging:
+
+- Set the Pull Request title to the intended squash commit subject.
+- Refresh the description. Remove outdated plans, status, and test results.
+- Squash merge with a concise message that omits intermediate work logs.
+
+## PR scope and batching
+
+Group changes that share a root cause into one Pull Request. Do not open one PR
+per file when a single fix addresses the same underlying problem across multiple
+files or sections. For example, broken-link corrections across several doc pages,
+a style fix applied to multiple files, or a rename propagated through a subtree
+are each one logical change and belong in one PR.
+
+A high volume of fine-grained PRs degrades reviewer throughput and obscures
+signal in the project history. When in doubt, ask: "would a reviewer naturally
+review these together?" If yes, combine them.
+
 ## Cross-subtree impact
 
-NVCF clients in this repo (notably `src/clis/nvcf-cli`) are hand-written against control-plane and invocation-plane APIs. When changing public API surfaces (request/response shapes, auth flow, new endpoints, removed fields), evaluate whether `src/clis/nvcf-cli` needs a matching change, and list affected clients in the Merge Request/Pull Request "Related Merge Requests/Pull Requests" section. If the CLI needs an update, file a follow-up issue.
+NVCF clients in this repo (notably `src/clis/nvcf-cli`) are hand-written against
+control-plane and invocation-plane APIs. When changing public API surfaces
+(request/response shapes, auth flow, new endpoints, removed fields), evaluate
+whether `src/clis/nvcf-cli` needs a matching change, and list affected clients
+in the Pull Request "Related Pull Requests" section. If the CLI needs an
+update, file a follow-up issue.
 
 ## Tests
 
-Code changes must include tests. If a change does not include tests, explain why in the Merge Request/Pull Request description (for example: pure documentation, CI-only change, or refactor with full existing coverage).
+Code changes must include tests. If a change does not include tests, explain why
+in the Pull Request description (for example: pure documentation, CI-only
+change, or refactor with full existing coverage).
 
 Prefer the repo-native test runner (`make test`, `go test`, `cargo test`, etc.). Run tests before committing. Check coverage requirements in the subtree `AGENTS.md` or CI config.
+
+### Version-pin assertions
+
+Do not assert an exact image tag or chart version unless that literal is the
+behavior under test. Exact literals break on every unrelated pin bump, and
+repeated updates make the test diff easy to overlook.
+If the surrounding wiring (override precedence, cross-chart consistency) is
+worth testing, read the expected value from its source of truth at test
+time. Use `Chart.yaml` `appVersion`, the `.gotmpl`'s `default "..."`, or the
+release's `version:` instead of copying it into the test (see
+`deploy/stacks/self-managed/tests/observability-autoscaler.sh` and
+`llm-pki-release.sh`). Otherwise, delete the assertion.
+
+### Verification commands
+
+Run these from the repo root before opening a PR. They are the general
+default; see `BAZEL.md` for the full command and flag reference, and use the
+nearest nested `AGENTS.md` for subtree-scoped commands.
+
+```bash
+bazel test //src/clis/nvcf-cli/... --test_output=streamed    # scoped: the package(s) you changed, streamed output
+bazel test //...                                              # full suite: broad or cross-cutting changes
+git diff --check HEAD                                         # docs-only: whitespace errors, conflict markers
+fern check                                                     # docs-only: validate Fern nav, links, and config
+```
+
+### Java Bazel test target contract
+
+The `manual` tag placement in `rules/java/defs.bzl` is intentional.
+`nvcf_java_test` creates the native Java target used by IntelliJ and direct test
+runs. Its companion `nvcf_java_coverage_test` remains eligible for wildcard
+selection so each suite runs once and CI receives JUnit and JaCoCo artifacts.
+Do not reverse these tags without also updating `.github/workflows/bazel.yml`,
+Java artifact staging, and `BAZEL.md`.
 
 ## Code Style
 
 Write self-documenting code. Add comments only when the logic is non-obvious. Match the existing package structure, naming, and error-handling conventions of each subtree instead of imposing a new framework.
 
-Follow the documentation style rules in `.cursor/skills/documentation-style/SKILL.md`:
+Follow the documentation style rules in `.codex/skills/documentation-style/SKILL.md`
+(same source as `.cursor/skills/documentation-style/SKILL.md` and
+`.claude/skills/documentation-style/SKILL.md`):
 - No markdown bold for emphasis.
 - No emojis.
 - No em-dash (U+2014).
@@ -358,7 +474,8 @@ When a change affects observability, verify:
 - New spans propagate context and set error attributes on failure.
 - New metrics follow the naming convention and are pre-initialized.
 - Existing dashboards and alerts are not broken by renamed or removed metrics/spans.
-- The Merge Request/Pull Request description calls out the observability impact if dashboards or alerts may need updating.
+- The Pull Request description calls out the observability impact if dashboards
+  or alerts may need updating.
 
 ## Diagrams
 
@@ -366,4 +483,5 @@ When a change modifies runtime behavior, data flow, or component interactions, a
 
 ## Issue Tracking
 
-Reference related issues in commits and Merge Request/Pull Request descriptions. When creating follow-up work, file a ticket rather than leaving a TODO in code.
+Reference related issues in commits and Pull Request descriptions. When
+creating follow-up work, file a ticket rather than leaving a TODO in code.

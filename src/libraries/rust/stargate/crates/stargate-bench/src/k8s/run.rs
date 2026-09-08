@@ -22,7 +22,7 @@ use crate::config::{AlgorithmConfig, BenchmarkConfig};
 use crate::runtime::slugify;
 
 use super::images::{ImageRefs, resolve_image_refs};
-use super::kubectl::resolve_nodeport_host;
+use super::kubectl::Kubectl;
 use super::render::{RenderManifestConfig, render_manifest};
 
 #[derive(Clone)]
@@ -48,7 +48,7 @@ pub fn prepare_benchmark_k8s_run(
     output_dir: &Path,
     run_index: usize,
 ) -> anyhow::Result<BenchmarkK8sRun> {
-    let service_host = resolve_nodeport_host()?;
+    let service_host = Kubectl::default().resolve_nodeport_host()?;
     prepare_benchmark_k8s_run_with_nodeport_host(
         config,
         algorithm,

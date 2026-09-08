@@ -1,6 +1,6 @@
 # Runtime Stats Interface
 
-> Type: Reference. Source: pylon stats collector, request observer, and mock backend contracts.
+Source: pylon stats collector, request observer, and mock backend contracts.
 
 Pylon gets request-throughput stats from the inference runtime through:
 
@@ -97,15 +97,29 @@ Pylon publishes:
 - optional KV capacity/used/free tokens
 - source and capability labels
 
+Every publication is derived from one per-model aggregate, so throughput,
+request lifecycle load, KV state, and labels cannot diverge between publication
+paths. Once a valid cumulative-counter output sample exists, it is
+authoritative over live request-timing estimates until stale cleanup clears the
+counter-derived output window.
+
 If request stats go stale, volatile output TPS is cleared. Sticky input TPS
 stays until a later valid sample replaces it.
 
-Shared clusters sum backend-local live load, union labels, and keep the
-assigning Stargate's calibration floor. Effective input capacity is:
+Shared clusters sum backend-local live load and union labels. Effective input
+capacity is:
 
 ```text
-max(local_calibration_floor, sum(runtime_reports))
+sum(active_runtime_reports)
 ```
+
+Before registration, Pylon initializes each model generation from exactly one
+source. `--initial-input-tps` installs the configured value. Local calibration
+installs nothing: it runs an increasing request ramp until a load-step timeout,
+and those requests' exact-generation observer events build the same distribution
+used at runtime. Duplicate engine events for calibration IDs are ignored. Pylon
+logs the current stats at timeout without reinjecting them.
+Later valid runtime samples continue updating either unpinned distribution.
 
 Labels:
 
@@ -118,6 +132,10 @@ Labels:
 Runtime-stats metrics use the `pylon_engine_stats_*` prefix for stream events,
 invalid events, reconnects, connection state, live requests, model states,
 stale cleanup, dirty snapshots, and source transitions.
+
+`pylon_engine_stats_model_states` counts models admitted into aggregate
+counter or stream-observation state. Lifecycle-only and KV-only model state
+does not inflate that gauge.
 
 ## Mock Defaults
 

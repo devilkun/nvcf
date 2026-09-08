@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use stargate_protocol::common::valid_last_mean_input_tps;
 use std::fmt;
 
 use crate::routing_state::RoutedClusterSnapshot;
@@ -63,24 +64,16 @@ pub(crate) fn input_work_seconds_for_request(
     candidates: &[RoutedClusterSnapshot],
 ) -> Option<f64> {
     input_work_seconds_from_candidates(
-        candidates.iter().filter(|candidate| {
-            input_work_admission_includes_candidate(config, request, candidate)
-        }),
+        candidates
+            .iter()
+            .filter(|candidate| match config.algorithm() {
+                LoadBalancerAlgorithm::Pulsar | LoadBalancerAlgorithm::PulsarWaitAndWiden => {
+                    pulsar::input_work_admission_candidate(config, request, candidate)
+                }
+                _ => !request.excludes_cluster(&candidate.cluster_id),
+            }),
         request.input_tokens.unwrap_or_default(),
     )
-}
-
-fn input_work_admission_includes_candidate(
-    config: &LoadBalancerAlgorithmConfig,
-    request: &LoadBalancerRequest<'_>,
-    candidate: &RoutedClusterSnapshot,
-) -> bool {
-    match config.algorithm() {
-        LoadBalancerAlgorithm::Pulsar | LoadBalancerAlgorithm::PulsarMultiregion => {
-            pulsar::input_work_admission_candidate(config, request, candidate)
-        }
-        _ => !request.excludes_cluster(&candidate.cluster_id),
-    }
 }
 
 fn input_work_seconds_from_candidates<'a>(
@@ -91,9 +84,7 @@ fn input_work_seconds_from_candidates<'a>(
     let mut service_rate = 0.0;
     for candidate in candidates {
         work_units += input_work_units(candidate);
-        if candidate.stats.last_mean_input_tps > 0.0
-            && candidate.stats.last_mean_input_tps.is_finite()
-        {
+        if valid_last_mean_input_tps(candidate.stats.last_mean_input_tps) {
             service_rate += candidate.stats.last_mean_input_tps;
         }
     }
@@ -159,36 +150,3 @@ impl HashInputBuilder {
         self.heap = Some(heap);
     }
 }
-
-#[cfg(test)]
-pub(crate) struct SelectedCandidateForTest {
-    pub(super) candidate: SelectedClusterForTest,
-    pub(super) rank_depth: usize,
-    pub(super) selected_after_kv_free_tokens_skip: bool,
-}
-
-#[cfg(test)]
-pub(crate) struct SelectedClusterForTest {
-    pub(super) cluster_id: String,
-}
-
-#[cfg(test)]
-pub(crate) trait LoadBalancerTestChoiceExt: LoadBalancer {
-    fn choose_for_test(
-        &self,
-        request: &LoadBalancerRequest<'_>,
-        candidates: &[RoutedClusterSnapshot],
-    ) -> Option<SelectedCandidateForTest> {
-        self.choose_candidate(request, candidates)
-            .map(|choice| SelectedCandidateForTest {
-                candidate: SelectedClusterForTest {
-                    cluster_id: candidates[choice.candidate_index].cluster_id.clone(),
-                },
-                rank_depth: choice.rank_depth,
-                selected_after_kv_free_tokens_skip: choice.selected_after_kv_free_tokens_skip,
-            })
-    }
-}
-
-#[cfg(test)]
-impl<T> LoadBalancerTestChoiceExt for T where T: LoadBalancer + ?Sized {}

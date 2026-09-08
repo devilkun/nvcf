@@ -13,19 +13,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::kv_cache::*;
+use super::openai::*;
+use super::stats_stream::*;
+use super::test_control::*;
+use super::timing::*;
 use super::*;
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn request(max_tokens: Option<usize>) -> ChatRequest {
+fn request() -> ChatRequest {
     ChatRequest {
         stream: Some(true),
         model: Some("dummy-model".to_string()),
-        max_tokens,
+        max_tokens: Some(1),
         messages: Vec::new(),
     }
 }
@@ -33,6 +38,459 @@ fn request(max_tokens: Option<usize>) -> ChatRequest {
 fn test_stats_events() -> broadcast::Sender<StatsStreamEvent> {
     let (tx, _) = broadcast::channel(1024);
     tx
+}
+
+fn test_state() -> AppState {
+    AppState {
+        model_name: "dummy-model".to_string(),
+        output_tokens: OutputTokenConfig::fixed(1),
+        context_length_tokens: 0,
+        decode_rate: DecodeRate::TokenDelay {
+            base_ms: 0,
+            jitter_ms: 0,
+        },
+        ttft: Duration::ZERO,
+        ttft_jitter_ms: 0,
+        prefill_tokens_per_s: 0.0,
+        request_slots: None,
+        health_delay: Duration::ZERO,
+        kv_cache: Arc::new(Mutex::new(KvCacheState::new(0))),
+        stats_events: test_stats_events(),
+        test_control: TestControlState::with_discovered_models(["dummy-model".to_string()]),
+    }
+}
+
+#[test]
+fn h100_llama_profile_selects_complete_behavior() {
+    let args = Args::try_parse_from(["mock-dynamo", "--profile", "h100-llama-3.1-8b"])
+        .expect("profile should parse");
+
+    assert_eq!(
+        args.behavior().expect("profile behavior should be valid"),
+        Behavior {
+            context_length_tokens: 131_072,
+            decode_rate: DecodeRate::Uniform {
+                min_tokens_per_s: 128.0,
+                max_tokens_per_s: 200.0,
+            },
+            ttft_ms: 10,
+            ttft_jitter_ms: 20,
+            prefill_tokens_per_s: 7000.0,
+            max_concurrent_requests: 25,
+            kv_cache_capacity_tokens: 400_000,
+        }
+    );
+    assert_eq!(
+        args.output_tokens()
+            .expect("profile output token defaults should be valid"),
+        OutputTokenConfig {
+            min: 128,
+            max: 8192,
+            distribution: OutputTokenDistribution::Gaussian,
+        }
+    );
+}
+
+#[test]
+fn h100_llama_profile_rejects_manual_overrides() {
+    let error = Args::try_parse_from([
+        "mock-dynamo",
+        "--profile",
+        "h100-llama-3.1-8b",
+        "--token-delay-ms",
+        "1",
+    ])
+    .expect_err("manual behavior overrides should conflict with a profile");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn profile_output_token_defaults_can_be_overridden() {
+    let args = Args::try_parse_from([
+        "mock-dynamo",
+        "--profile",
+        "h100-llama-3.1-8b",
+        "--output-tokens-min",
+        "64",
+        "--output-tokens-max",
+        "512",
+        "--output-token-distribution",
+        "uniform",
+    ])
+    .expect("profile output token defaults should be overridable");
+
+    assert_eq!(
+        args.output_tokens()
+            .expect("output token override should be valid"),
+        OutputTokenConfig {
+            min: 64,
+            max: 512,
+            distribution: OutputTokenDistribution::Uniform,
+        }
+    );
+}
+
+#[test]
+fn output_rate_range_is_complete_ordered_and_deterministic() {
+    let args = Args::try_parse_from([
+        "mock-dynamo",
+        "--output-tps-min",
+        "120",
+        "--output-tps-max",
+        "200",
+    ])
+    .expect("complete output rate bounds should parse");
+    assert_eq!(
+        args.behavior()
+            .expect("ordered bounds should be valid")
+            .decode_rate,
+        DecodeRate::Uniform {
+            min_tokens_per_s: 120.0,
+            max_tokens_per_s: 200.0,
+        }
+    );
+    assert!(
+        Args::try_parse_from(["mock-dynamo", "--output-tps-min", "120"]).is_err(),
+        "one output rate bound must not silently select a partial range"
+    );
+
+    let reversed = Args::try_parse_from([
+        "mock-dynamo",
+        "--output-tps-min",
+        "200",
+        "--output-tps-max",
+        "120",
+    ])
+    .expect("individual output rate bounds should parse");
+    assert!(reversed.behavior().is_err());
+
+    let first = distributed_output_rate("request-a", 120.0, 200.0);
+    assert_eq!(first, distributed_output_rate("request-a", 120.0, 200.0));
+    assert!((120.0..=200.0).contains(&first));
+}
+
+#[tokio::test]
+async fn pylon_canary_streams_one_correct_token() {
+    let state = AppState {
+        output_tokens: OutputTokenConfig {
+            min: 100,
+            max: 200,
+            distribution: OutputTokenDistribution::Gaussian,
+        },
+        ..test_state()
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(state);
+    let (addr, server) = spawn_test_app(app).await;
+    let response = json_response(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        "connection: close\r\nx-request-id: canary-00000000-0000-4000-8000-000000000000-g0-1",
+        r#"{"model":"dummy-model","messages":[{"role":"user","content":"1+1="}],"max_tokens":237,"stream":true}"#,
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("content-type: text/event-stream"));
+    assert!(response.contains(r#""content":"2""#));
+    assert_eq!(response.matches(r#""content":""#).count(), 1);
+    assert!(response.contains("data: [DONE]"));
+    server.abort();
+}
+
+async fn spawn_test_app(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let addr = listener.local_addr().expect("local address should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test server should serve");
+    });
+    (addr, server)
+}
+
+async fn send_json_request(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("test client should connect");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{headers}\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("request should write");
+    stream
+}
+
+async fn json_response(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> String {
+    read_to_end(&mut send_json_request(addr, method, path, headers, body).await).await
+}
+
+#[tokio::test]
+async fn test_controls_isolate_chat_failure_by_model() {
+    let controls = TestControlState::default();
+
+    controls
+        .update_model(
+            "model-b",
+            ModelTestControlUpdate {
+                chat_failure: Some(true),
+                ..ModelTestControlUpdate::default()
+            },
+        )
+        .await;
+
+    assert!(!controls.chat_failure_enabled("model-a").await);
+    assert!(controls.chat_failure_enabled("model-b").await);
+
+    controls
+        .update_model(
+            "model-b",
+            ModelTestControlUpdate {
+                chat_failure: Some(false),
+                ..ModelTestControlUpdate::default()
+            },
+        )
+        .await;
+
+    assert!(!controls.chat_failure_enabled("model-b").await);
+}
+
+#[tokio::test]
+async fn test_controls_hold_bringup_until_the_model_gate_is_released() {
+    let controls = TestControlState::default();
+    controls
+        .update_model(
+            "model-a",
+            ModelTestControlUpdate {
+                bringup_blocked: Some(true),
+                ..ModelTestControlUpdate::default()
+            },
+        )
+        .await;
+    let waiting_controls = controls.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        entered_tx.send(()).expect("test should observe waiter");
+        waiting_controls.wait_for_bringup_release("model-a").await;
+    });
+    entered_rx.await.expect("waiter should start");
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    controls
+        .update_model(
+            "model-a",
+            ModelTestControlUpdate {
+                bringup_blocked: Some(false),
+                ..ModelTestControlUpdate::default()
+            },
+        )
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("released bringup should finish")
+        .expect("bringup waiter should not panic");
+}
+
+#[tokio::test]
+async fn test_controls_count_endpoint_model_and_request_class() {
+    let controls = TestControlState::default();
+    let recorded = [
+        (
+            TestEndpoint::ChatCompletions,
+            "model-a",
+            TestRequestClass::PylonGenerated,
+        ),
+        (
+            TestEndpoint::ChatCompletions,
+            "model-a",
+            TestRequestClass::ApiGateway,
+        ),
+        (
+            TestEndpoint::Embeddings,
+            "model-b",
+            TestRequestClass::ApiGateway,
+        ),
+    ];
+    for (endpoint, model, request_class) in recorded {
+        controls
+            .record_request(endpoint, model, request_class)
+            .await;
+    }
+
+    let snapshot = controls.snapshot().await;
+    for (endpoint, model, request_class, expected) in recorded
+        .map(|(endpoint, model, class)| (endpoint, model, class, 1))
+        .into_iter()
+        .chain([(
+            TestEndpoint::Responses,
+            "model-a",
+            TestRequestClass::ApiGateway,
+            0,
+        )])
+    {
+        assert_eq!(snapshot.counter(endpoint, model, request_class), expected);
+    }
+}
+
+#[tokio::test]
+async fn test_control_http_api_updates_one_model_and_reports_request_counters() {
+    let state = test_state();
+    let observed_control = state.test_control.clone();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/test-control/models/{model}",
+            put(update_model_test_control),
+        )
+        .route("/test-control", get(test_control_snapshot))
+        .with_state(state);
+    let (addr, server) = spawn_test_app(app).await;
+
+    let update_body = r#"{"chat_failure":true}"#;
+    let update_response = json_response(
+        addr,
+        "PUT",
+        "/test-control/models/model-b",
+        "connection: close",
+        update_body,
+    )
+    .await;
+    assert!(update_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(update_response.contains(r#""model-b":{"chat_failure":true,"bringup_blocked":false}"#));
+
+    let failed_body = r#"{"model":"model-b","messages":[],"max_tokens":1,"stream":false}"#;
+    let failed_response = json_response(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        "connection: close\r\nx-request-id: calibration-00000000-0000-4000-8000-000000000000-7",
+        failed_body,
+    )
+    .await;
+    assert!(failed_response.starts_with("HTTP/1.1 503 Service Unavailable"));
+
+    let successful_body = r#"{"model":"model-a","messages":[],"max_tokens":1,"stream":false}"#;
+    let successful_response = json_response(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        "connection: close\r\nx-request-id: user-7",
+        successful_body,
+    )
+    .await;
+    assert!(successful_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(successful_response.contains("content-type: application/json"));
+    let (_, body) = successful_response
+        .split_once("\r\n\r\n")
+        .expect("chat response should contain a body");
+    let mut body: serde_json::Value =
+        serde_json::from_str(body).expect("chat response should be valid JSON");
+    assert!(
+        body["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("chatcmpl-mock-"))
+    );
+    body["id"] = serde_json::json!("chatcmpl-mock-id");
+    assert_eq!(
+        body,
+        serde_json::from_str::<serde_json::Value>(
+            r#"{"id":"chatcmpl-mock-id","object":"chat.completion","model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .expect("expected chat response fixture should be valid JSON")
+    );
+
+    let snapshot_response = raw_http_request(
+        addr,
+        &format!("GET /test-control HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(snapshot_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(snapshot_response.contains(r#""endpoint":"chat_completions""#));
+    assert!(snapshot_response.contains(r#""request_class":"pylon_generated""#));
+    assert!(snapshot_response.contains(r#""request_class":"api_gateway""#));
+
+    let snapshot = observed_control.snapshot().await;
+    assert_eq!(
+        snapshot.counter(
+            TestEndpoint::ChatCompletions,
+            "model-b",
+            TestRequestClass::PylonGenerated,
+        ),
+        1
+    );
+    assert_eq!(
+        snapshot.counter(
+            TestEndpoint::ChatCompletions,
+            "model-a",
+            TestRequestClass::ApiGateway,
+        ),
+        1
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn model_discovery_http_api_returns_and_replaces_authoritative_models() {
+    let state = test_state();
+    state
+        .test_control
+        .replace_discovered_models(vec!["model-b".to_string(), "model-a".to_string()])
+        .await
+        .expect("valid model IDs should be accepted");
+    let test_control = state.test_control.clone();
+    let app = Router::new()
+        .route("/v1/models", get(list_models))
+        .route(
+            "/test-control/discovery-models",
+            put(replace_discovery_models),
+        )
+        .with_state(state);
+    let (addr, server) = spawn_test_app(app).await;
+
+    let initial = json_response(addr, "GET", "/v1/models", "connection: close", "").await;
+    assert!(initial.contains(
+        r#"{"object":"list","data":[{"id":"model-a","object":"model"},{"id":"model-b","object":"model"}]}"#
+    ));
+    assert_eq!(test_control.snapshot().await.model_discovery_requests, 1);
+
+    let replaced = json_response(
+        addr,
+        "PUT",
+        "/test-control/discovery-models",
+        "connection: close",
+        r#"{"models":[]}"#,
+    )
+    .await;
+    assert!(replaced.starts_with("HTTP/1.1 200 OK"));
+    assert!(replaced.contains(r#""discovered_models":[]"#));
+
+    let empty = json_response(addr, "GET", "/v1/models", "connection: close", "").await;
+    assert!(empty.contains(r#"{"object":"list","data":[]}"#));
+    assert_eq!(test_control.snapshot().await.model_discovery_requests, 2);
+
+    server.abort();
 }
 
 #[test]
@@ -47,96 +505,205 @@ fn counts_openai_embedding_input_items() {
     assert_eq!(embedding_item_count(&serde_json::json!([])), 0);
 }
 
+fn embedding_tokens(input: serde_json::Value) -> usize {
+    request_embedding_tokens(&HeaderMap::new(), &input)
+}
+
+#[test]
+fn embedding_token_estimates_follow_input_shape() {
+    assert_eq!(embedding_tokens(serde_json::json!("abcd")), 4);
+    assert_eq!(embedding_tokens(serde_json::json!([1, 2, 3])), 3);
+    assert_eq!(embedding_tokens(serde_json::json!(["alpha", "b"])), 6);
+    assert_eq!(
+        embedding_tokens(serde_json::json!([[1, 2], [3, 4], [5]])),
+        5
+    );
+    assert_eq!(
+        embedding_tokens(serde_json::json!(["abc", [1, 2], true])),
+        6
+    );
+    assert_eq!(embedding_tokens(serde_json::json!({"unexpected": true})), 1);
+}
+
+#[test]
+fn embedding_token_estimates_preserve_empty_batch_item_work() {
+    assert_eq!(embedding_tokens(serde_json::json!(["", "b"])), 2);
+    assert_eq!(embedding_tokens(serde_json::json!([[], [1, 2]])), 3);
+}
+
+#[test]
+fn embedding_token_header_override_clamps_to_nonzero() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-input-tokens", HeaderValue::from_static("0"));
+
+    assert_eq!(
+        request_embedding_tokens(&headers, &serde_json::json!(["alpha", "beta"])),
+        1
+    );
+}
+
 #[test]
 fn embedding_format_controls_mock_embedding_value_shape() {
-    assert!(matches!(
-        deterministic_embedding_value(0, EmbeddingEncodingFormat::Float),
-        EmbeddingValue::Float(_)
-    ));
-    assert!(matches!(
-        deterministic_embedding_value(0, EmbeddingEncodingFormat::Base64),
-        EmbeddingValue::Base64(_)
-    ));
+    assert_eq!(
+        serde_json::to_value(deterministic_embedding_value(
+            0,
+            EmbeddingEncodingFormat::Float
+        ))
+        .unwrap(),
+        serde_json::json!([0.0, 0.125, -0.25])
+    );
+    assert_eq!(
+        serde_json::to_value(deterministic_embedding_value(
+            0,
+            EmbeddingEncodingFormat::Base64
+        ))
+        .unwrap(),
+        "AAAAAAAAAAA="
+    );
+}
+
+#[test]
+fn chat_stream_chunks_preserve_delta_and_finish_shapes() {
+    for (chunk, delta, finish_reason) in [
+        (
+            ChatStreamChunk::Role,
+            serde_json::json!({ "role": "assistant" }),
+            serde_json::Value::Null,
+        ),
+        (
+            ChatStreamChunk::Content("token"),
+            serde_json::json!({ "content": "token" }),
+            serde_json::Value::Null,
+        ),
+        (
+            ChatStreamChunk::Stop,
+            serde_json::json!({}),
+            serde_json::json!("stop"),
+        ),
+    ] {
+        let value: serde_json::Value =
+            serde_json::from_str(&chat_chunk_json("id", "model", chunk)).unwrap();
+        assert_eq!(value["choices"][0]["delta"], delta);
+        assert_eq!(value["choices"][0]["finish_reason"], finish_reason);
+        assert!(value.get("usage").is_none());
+    }
 }
 
 #[tokio::test]
 async fn embeddings_endpoint_returns_json_without_stream() {
-    let state = AppState {
-        model_name: "dummy-model".to_string(),
-        num_tokens: 1,
-        token_delay: Duration::ZERO,
-        decode_jitter_ms: 0,
-        ttft: Duration::ZERO,
-        ttft_jitter_ms: 0,
-        prefill_tokens_per_s: 0.0,
-        request_slots: None,
-        health_delay: Duration::ZERO,
-        kv_cache: Arc::new(Mutex::new(KvCacheState::new(0))),
-        stats_events: test_stats_events(),
-    };
+    let state = test_state();
     let app = Router::new()
         .route("/v1/embeddings", post(embeddings))
         .with_state(state);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let addr = listener.local_addr().expect("local address should exist");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("test server should serve");
-    });
+    let (addr, server) = spawn_test_app(app).await;
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("test client should connect");
     let request_body = serde_json::json!({
         "model": "request-model",
         "input": ["alpha", "beta"],
         "encoding_format": "float",
     })
     .to_string();
-    stream
-            .write_all(
-                format!(
-                    "POST /v1/embeddings HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-input-tokens: 11\r\n\r\n{request_body}",
-                    request_body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("request should write");
-
-    let response = read_to_end(&mut stream).await;
+    let response = json_response(
+        addr,
+        "POST",
+        "/v1/embeddings",
+        "connection: close\r\nx-input-tokens: 9",
+        &request_body,
+    )
+    .await;
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains(r#""object":"list""#));
     assert!(response.contains(r#""model":"request-model""#));
     assert!(response.contains(r#""index":1"#));
-    assert!(response.contains(r#""prompt_tokens":11"#));
-    assert!(response.contains(r#""total_tokens":11"#));
+    assert!(response.contains(r#""prompt_tokens":9"#));
+    assert!(response.contains(r#""total_tokens":9"#));
 
     server.abort();
 }
 
 #[test]
-fn output_tokens_prefer_benchmark_header() {
+fn output_token_selection_supports_overrides_and_bounded_distributions() {
     let mut headers = HeaderMap::new();
     headers.insert("x-output-tokens", HeaderValue::from_static("64"));
+    let uniform = OutputTokenConfig {
+        min: 120,
+        max: 200,
+        distribution: OutputTokenDistribution::Uniform,
+    };
+    let gaussian = OutputTokenConfig {
+        distribution: OutputTokenDistribution::Gaussian,
+        ..uniform
+    };
 
-    assert_eq!(request_output_tokens(&headers, &request(Some(16)), 8), 64);
+    assert_eq!(
+        select_output_tokens(&headers, "request-a", uniform, Some(32)),
+        64
+    );
+    for config in [uniform, gaussian] {
+        let selected = select_output_tokens(&HeaderMap::new(), "request-a", config, None);
+        assert_eq!(
+            selected,
+            select_output_tokens(&HeaderMap::new(), "request-a", config, None)
+        );
+        assert!((120..=200).contains(&selected));
+        assert_eq!(
+            select_output_tokens(&HeaderMap::new(), "request-a", config, Some(16)),
+            16
+        );
+    }
 }
 
 #[test]
-fn max_tokens_is_capped_by_default_when_header_absent() {
+fn selected_output_tokens_are_bounded_by_remaining_context() {
     assert_eq!(
-        request_output_tokens(&HeaderMap::new(), &request(Some(128)), 8),
-        8
+        bounded_output_tokens(120_000, 20_000, 131_072),
+        Some(11_072)
     );
+    assert_eq!(bounded_output_tokens(131_072, 1, 131_072), None);
+    assert_eq!(bounded_output_tokens(usize::MAX, 64, 0), Some(64));
+}
+
+#[tokio::test]
+async fn chat_completion_saturates_total_tokens_at_usize_max() {
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(test_state());
+    let (addr, server) = spawn_test_app(app).await;
+
+    let response = json_response(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        &format!(
+            "connection: close\r\nx-input-tokens: {}\r\nx-output-tokens: 1",
+            usize::MAX
+        ),
+        r#"{"model":"dummy-model","messages":[],"stream":false}"#,
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains(&format!(r#""total_tokens":{}"#, usize::MAX)));
+    server.abort();
 }
 
 #[test]
 fn prefill_delay_scales_with_input_tokens() {
     assert_eq!(prefill_delay(4_000, 2_000.0), Duration::from_secs(2));
+}
+
+#[test]
+fn timing_boundaries_saturate_and_keep_deterministic_jitter() {
+    assert_eq!(prefill_delay(1, 0.0), Duration::ZERO);
+    assert_eq!(prefill_delay(1, f64::NAN), Duration::ZERO);
+    assert_eq!(prefill_delay(1, f64::INFINITY), Duration::ZERO);
+    assert_eq!(prefill_delay(usize::MAX, 0.5), Duration::MAX);
+    assert_eq!(jitter_ms("request-a", "salt", 0), 0);
+    assert!(jitter_ms("request-a", "salt", 10) <= 10);
+    assert_eq!(
+        jitter_ms("request-a", "salt", u64::MAX),
+        18_127_296_015_107_935_538
+    );
 }
 
 fn completed_cache_access(
@@ -212,17 +779,9 @@ fn kv_cache_shorter_follow_up_does_not_shrink_retained_prefix() {
 #[tokio::test]
 async fn chat_completion_retains_prefix_only_after_modeled_prefill_completes() {
     let state = AppState {
-        model_name: "dummy-model".to_string(),
-        num_tokens: 1,
-        token_delay: Duration::ZERO,
-        decode_jitter_ms: 0,
-        ttft: Duration::ZERO,
-        ttft_jitter_ms: 0,
         prefill_tokens_per_s: 100.0,
-        request_slots: None,
-        health_delay: Duration::ZERO,
         kv_cache: Arc::new(Mutex::new(KvCacheState::new(1_000))),
-        stats_events: test_stats_events(),
+        ..test_state()
     };
     let observed_cache = state.kv_cache.clone();
     let mut stats_events = state.stats_events.subscribe();
@@ -234,11 +793,9 @@ async fn chat_completion_retains_prefix_only_after_modeled_prefill_completes() {
     headers.insert("x-input-tokens", HeaderValue::from_static("100"));
     headers.insert("x-cache-affinity-key", HeaderValue::from_static("cache-a"));
 
-    let request = tokio::spawn(chat_completions(
-        State(state),
-        headers,
-        Json(request(Some(1))),
-    ));
+    let mut chat_request = request();
+    chat_request.messages = vec![serde_json::json!({ "content": "x".repeat(100) })];
+    let request = tokio::spawn(chat_completions(State(state), headers, Json(chat_request)));
     tokio::time::timeout(Duration::from_millis(100), stats_events.recv())
         .await
         .expect("stream request should announce work before prefill completes")
@@ -288,46 +845,24 @@ fn kv_cache_evicts_least_recently_used_entry() {
 #[tokio::test]
 async fn streaming_response_delays_first_data_frame_until_ttft() {
     let state = AppState {
-        model_name: "dummy-model".to_string(),
-        num_tokens: 1,
-        token_delay: Duration::ZERO,
-        decode_jitter_ms: 0,
         ttft: Duration::from_millis(120),
-        ttft_jitter_ms: 0,
-        prefill_tokens_per_s: 0.0,
-        request_slots: None,
-        health_delay: Duration::ZERO,
-        kv_cache: Arc::new(Mutex::new(KvCacheState::new(0))),
-        stats_events: test_stats_events(),
+        ..test_state()
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/pylon/v1/stats/stream", get(stats_stream))
         .with_state(state);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let addr = listener.local_addr().expect("local address should exist");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("test server should serve");
-    });
+    let (addr, server) = spawn_test_app(app).await;
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("test client should connect");
     let body = r#"{"model":"dummy-model","messages":[],"max_tokens":1,"stream":true}"#;
-    stream
-            .write_all(
-                format!(
-                    "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-request-id: req-ttft\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("request should write");
+    let mut stream = send_json_request(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        "x-request-id: req-ttft",
+        body,
+    )
+    .await;
 
     assert!(
         tokio::time::timeout(Duration::from_millis(50), read_until_sse_data(&mut stream))
@@ -345,46 +880,24 @@ async fn streaming_response_delays_first_data_frame_until_ttft() {
 #[tokio::test]
 async fn streaming_response_exposes_stats_stream_endpoint() {
     let state = AppState {
-        model_name: "dummy-model".to_string(),
-        num_tokens: 2,
-        token_delay: Duration::ZERO,
-        decode_jitter_ms: 0,
-        ttft: Duration::ZERO,
-        ttft_jitter_ms: 0,
-        prefill_tokens_per_s: 0.0,
-        request_slots: None,
-        health_delay: Duration::ZERO,
-        kv_cache: Arc::new(Mutex::new(KvCacheState::new(0))),
-        stats_events: test_stats_events(),
+        output_tokens: OutputTokenConfig::fixed(2),
+        ..test_state()
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/pylon/v1/stats/stream", get(stats_stream))
         .with_state(state);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let addr = listener.local_addr().expect("local address should exist");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("test server should serve");
-    });
+    let (addr, server) = spawn_test_app(app).await;
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("test client should connect");
-    let body = r#"{"model":"dummy-model","messages":[],"max_tokens":2,"stream":true}"#;
-    stream
-            .write_all(
-                format!(
-                    "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-request-id: req-contract\r\nx-input-tokens: 11\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("request should write");
+    let body = r#"{"model":"dummy-model","messages":[{"role":"user","content":"hello world"}],"max_tokens":2,"stream":true}"#;
+    let mut stream = send_json_request(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        "x-request-id: req-contract\r\nx-input-tokens: 11",
+        body,
+    )
+    .await;
 
     let response = read_until_done(&mut stream).await;
     assert!(!response.contains(r#""usage":"#));
@@ -438,53 +951,44 @@ fn stats_stream_events_are_ndjson() {
 #[tokio::test]
 async fn responses_endpoint_streams_response_events_without_private_stats_headers() {
     let state = AppState {
-        model_name: "dummy-model".to_string(),
-        num_tokens: 2,
-        token_delay: Duration::ZERO,
-        decode_jitter_ms: 0,
-        ttft: Duration::ZERO,
-        ttft_jitter_ms: 0,
-        prefill_tokens_per_s: 0.0,
-        request_slots: None,
-        health_delay: Duration::ZERO,
+        output_tokens: OutputTokenConfig::fixed(2),
         kv_cache: Arc::new(Mutex::new(KvCacheState::new(10_000))),
-        stats_events: test_stats_events(),
+        ..test_state()
     };
     let app = Router::new()
         .route("/v1/responses", post(responses))
         .with_state(state);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let addr = listener.local_addr().expect("local address should exist");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("test server should serve");
-    });
+    let (addr, server) = spawn_test_app(app).await;
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("test client should connect");
-    let request_body = serde_json::json!({
-        "model": "request-model",
-        "input": "hello",
-        "max_output_tokens": 2,
-        "stream": true,
-    })
-    .to_string();
-    stream
-            .write_all(
-                format!(
-                    "POST /v1/responses HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-request-id: req-responses-contract\r\nx-input-tokens: 7\r\nx-cache-affinity-key: cache-a\r\n\r\n{request_body}",
-                    request_body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("request should write");
-
-    let response = read_to_end(&mut stream).await;
+    let cases = [
+        (None, 1),
+        (Some(serde_json::json!("hello")), 5),
+        (Some(serde_json::json!(["hi", {"x": 1}])), 9),
+        (Some(serde_json::json!({"x": 1})), 7),
+    ];
+    let mut response = String::new();
+    for (index, (input, expected_tokens)) in cases.into_iter().enumerate() {
+        let mut request_body = serde_json::json!({
+            "model": "request-model",
+            "max_output_tokens": 2,
+            "stream": true,
+        });
+        if let Some(input) = input {
+            request_body["input"] = input;
+        }
+        response = json_response(
+            addr,
+            "POST",
+            "/v1/responses",
+            &format!("connection: close\r\nx-request-id: req-responses-{index}\r\nx-input-tokens: {expected_tokens}\r\nx-cache-affinity-key: cache-{index}"),
+            &request_body.to_string(),
+        )
+        .await;
+        assert!(response.contains(&format!(
+            "x-kv-cache-uncached-input-tokens: {expected_tokens}"
+        )));
+        assert!(response.contains(&format!(r#""input_tokens":{expected_tokens}"#)));
+    }
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("x-kv-cache-hit: false"));
     assert!(response.contains("x-kv-cache-reused-input-tokens: 0"));
@@ -511,52 +1015,29 @@ async fn responses_endpoint_streams_response_events_without_private_stats_header
 #[tokio::test]
 async fn responses_endpoint_rejects_non_streaming_requests() {
     let state = AppState {
-        model_name: "dummy-model".to_string(),
-        num_tokens: 2,
-        token_delay: Duration::ZERO,
-        decode_jitter_ms: 0,
-        ttft: Duration::ZERO,
-        ttft_jitter_ms: 0,
-        prefill_tokens_per_s: 0.0,
-        request_slots: None,
-        health_delay: Duration::ZERO,
+        output_tokens: OutputTokenConfig::fixed(2),
         kv_cache: Arc::new(Mutex::new(KvCacheState::new(10_000))),
-        stats_events: test_stats_events(),
+        ..test_state()
     };
     let app = Router::new()
         .route("/v1/responses", post(responses))
         .with_state(state);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test server should bind");
-    let addr = listener.local_addr().expect("local address should exist");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("test server should serve");
-    });
+    let (addr, server) = spawn_test_app(app).await;
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("test client should connect");
     let request_body = serde_json::json!({
         "model": "request-model",
         "input": "hello",
         "stream": false,
     })
     .to_string();
-    stream
-            .write_all(
-                format!(
-                    "POST /v1/responses HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nx-request-id: req-responses-nonstream\r\nx-input-tokens: 7\r\n\r\n{request_body}",
-                    request_body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("request should write");
-
-    let response = read_to_end(&mut stream).await;
+    let response = json_response(
+        addr,
+        "POST",
+        "/v1/responses",
+        "connection: close\r\nx-request-id: req-responses-nonstream\r\nx-input-tokens: 5",
+        &request_body,
+    )
+    .await;
     assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
     assert!(response.contains("stream=true"));
 
@@ -604,6 +1085,17 @@ async fn read_to_end(stream: &mut tokio::net::TcpStream) -> String {
         .await
         .expect("response should read to end");
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+async fn raw_http_request(addr: std::net::SocketAddr, request: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("test client should connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("request should write");
+    read_to_end(&mut stream).await
 }
 
 async fn read_until_contains(

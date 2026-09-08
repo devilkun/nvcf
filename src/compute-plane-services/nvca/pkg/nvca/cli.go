@@ -219,6 +219,7 @@ func newCobraCommand(
 				LowLatencyStreamingEnabled:          featureflag.LowLatencyStreaming.Enabled(),
 				PVCRebindEnabled:                    featureflag.PVCRebind.Enabled(),
 				MultiNodeWorkloadsEnabled:           featureflag.MultiNodeWorkloads.Enabled(),
+				ClientMetricsEnabled:                featureflag.ClientMetrics.Enabled(),
 				FeatureFlagFetcher:                  featureflag.DefaultFetcher,
 				ICMSRequestAckRetryTimeout:          cfg.Agent.ICMSRequestAckRetryTimeout,
 				NVCAOperatorVersion:                 cfg.Agent.OperatorVersion,
@@ -313,7 +314,9 @@ func setDefaults(cfg *nvcaconfig.Config) error {
 	if err := k8sutil.SetConfigDefaultResources(cfg); err != nil {
 		return err
 	}
-	cmdutil.SetEmptyValue(&cfg.Workload.DefaultStargateAddress, "llm-request-router.nvcf.svc.cluster.local:50071")
+	// NVCA no longer backfills a default LLM request-router address. The value
+	// rides down via worker EnvironmentB64 from nvcf-api as LLM_REQUEST_ROUTER_ADDRESS;
+	// STARGATE_ADDRESS is accepted as a legacy alias and is still injected downstream.
 	cmdutil.SetEmptyValue(&cfg.Authz.ClientID, os.Getenv(auth.ClientIDEnv))
 	cmdutil.SetEmptyValue(&cfg.Authz.ClientSecretKey, os.Getenv(auth.ClientSecretEnv))
 	return nil
@@ -328,6 +331,10 @@ func configureAndCheckCLI(log *logrus.Entry, opts *AgentOptions) error {
 	// Validate self-destruct flags
 	if opts.SkipSelfDestruct && opts.ForceSelfDestruct {
 		return fmt.Errorf("cannot enable both skip-self-destruct and force-self-destruct flags simultaneously")
+	}
+
+	if featureflag.SelfHosted.Enabled() && strings.TrimSpace(opts.ClusterID) == "" {
+		return fmt.Errorf("clusterID is required when %s feature flag is enabled", featureflag.SelfHosted.Key)
 	}
 
 	if featureflag.AttrHostIsolation.Enabled() {

@@ -29,7 +29,8 @@ CARGO_BAZEL_REPIN=1 bazel sync --only=nvcf_invocation_crates
 ```
 
 CI subproject id: `http-invocation`. Native Bazel validation and release wiring
-live in `tools/ci/subproject-validations.yaml`.
+live in `tools/ci/subproject-validations.yaml`, an internal GitLab CI config
+not present in this public snapshot.
 
 ## Cargo Development
 
@@ -50,4 +51,6 @@ tokens out of committed config and examples.
 - OSS mirror builds may need a public replacement for the `nvcr.io` distroless
   base image before `bazel build //...` works without NGC credentials.
 - Changes to request/response API shape may need follow-up changes in
-  `src/clis/nvcf-cli` so the CLI keeps parity with the service.
+  `src/clis/nvcf-cli` so the CLI keeps parity with the service. The
+  CLI is hand-written against the public types in
+  `crates/server/src/nvcf_api`.

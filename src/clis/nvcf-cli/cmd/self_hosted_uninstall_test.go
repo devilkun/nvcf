@@ -134,12 +134,12 @@ func TestUninstall_HelpListsAllFlags(t *testing.T) {
 func TestUninstall_ControlPlanePassesHelm4CompatToDestroy(t *testing.T) {
 	resetUninstallFlags(t)
 
-	stack := makeDownStack(t)
+	_, stack := makeDownStacks(t)
 	helmfileLog := installFakeHelmfile(t)
 
-	prevStack := selfHostedStack
-	t.Cleanup(func() { selfHostedStack = prevStack })
-	selfHostedStack = stack
+	prevStack := selfHostedControlPlaneStack
+	t.Cleanup(func() { selfHostedControlPlaneStack = prevStack })
+	selfHostedControlPlaneStack = stack
 
 	prevRuntimeResolver := resolveSelfHostedHelmRuntimeMode
 	t.Cleanup(func() { resolveSelfHostedHelmRuntimeMode = prevRuntimeResolver })
@@ -153,7 +153,7 @@ func TestUninstall_ControlPlanePassesHelm4CompatToDestroy(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "uninstall",
 		"--control-plane",
-		"--stack", stack,
+		"--control-plane-stack", stack,
 	})
 
 	require.NoError(t, rootCmd.Execute())

@@ -20,8 +20,5 @@ mod run;
 #[cfg(test)]
 mod tests;
 
-pub use kubectl::{
-    apply, collect_logs, delete, delete_backend_pod, scale_backend, stargate_metrics_endpoints,
-    wait_ready,
-};
+pub(crate) use kubectl::Kubectl;
 pub use run::{BenchmarkK8sRun, prepare_benchmark_k8s_run};

@@ -13,12 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
-
 use rand::{Rng, seq::IteratorRandom};
 
 #[cfg(test)]
-use super::LoadBalancerTestChoiceExt;
+use super::tests::LoadBalancerTestChoiceExt;
 use super::{LoadBalancer, LoadBalancerCandidateChoice, LoadBalancerRequest};
 use crate::routing_state::RoutedClusterSnapshot;
 
@@ -27,11 +25,7 @@ const REJECTION_SAMPLE_EXCLUSION_RATIO_DIVISOR: usize = 4;
 
 pub(super) struct RandomLoadBalancer;
 
-impl fmt::Display for RandomLoadBalancer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "random")
-    }
-}
+impl_display!(RandomLoadBalancer, "random");
 
 impl LoadBalancer for RandomLoadBalancer {
     fn choose_candidate(
@@ -148,10 +142,7 @@ mod tests {
 
     #[test]
     fn random_never_selects_excluded_clusters() {
-        let target = RoutingTargetKey {
-            routing_key: None,
-            model_id: "model".to_string(),
-        };
+        let target = RoutingTargetKey::new(None, "model");
         let excluded = HashSet::from(["excluded-a".to_string(), "excluded-b".to_string()]);
         let request = request(&target, Some(&excluded));
         let candidates = [
@@ -170,10 +161,7 @@ mod tests {
 
     #[test]
     fn random_skips_single_excluded_cluster_in_retry_set() {
-        let target = RoutingTargetKey {
-            routing_key: None,
-            model_id: "model".to_string(),
-        };
+        let target = RoutingTargetKey::new(None, "model");
         let excluded = HashSet::from(["cluster-0000".to_string()]);
         let request = request(&target, Some(&excluded));
         let candidates = (0..64)
@@ -190,10 +178,7 @@ mod tests {
 
     #[test]
     fn random_returns_none_when_all_candidates_are_excluded() {
-        let target = RoutingTargetKey {
-            routing_key: None,
-            model_id: "model".to_string(),
-        };
+        let target = RoutingTargetKey::new(None, "model");
         let excluded = HashSet::from(["excluded-a".to_string(), "excluded-b".to_string()]);
         let request = request(&target, Some(&excluded));
         let candidates = [candidate("excluded-a"), candidate("excluded-b")];

@@ -13,17 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: help clean build build-linux-amd64 test test-coverage-html test-manual start stop destroy destroy-all-ncp-local status ensure-context ensure-docker-config validate-compute-clusters print-compute-clusters start-control-plane deploy-control-plane-addons deploy-control-plane-endpoints build-and-deploy-control-plane-cluster destroy-control-plane start-compute-plane deploy-compute-plane-addons configure-compute-control-plane-dns deploy-compute-control-plane-endpoints build-and-deploy-compute-plane-cluster destroy-compute-plane build-and-deploy-multicluster destroy-multicluster test-multicluster-make setup-gateway-api check-gateway-api deploy-sample wait-for-deployment validate-deployment cleanup-sample build-and-deploy-cluster build-csi-smb deploy-csi-smb wait-for-csi-smb build-fake-gpu-operator deploy-fake-gpu-operator wait-for-fake-gpu-operator deploy-prometheus-crds uninstall-prometheus-crds deploy-kube-state-metrics wait-for-kube-state-metrics uninstall-kube-state-metrics build-credential-provider-multiarch
+.PHONY: help clean build test test-coverage-html test-manual start stop destroy destroy-all-ncp-local status ensure-cluster ensure-context ensure-docker-config validate-compute-clusters print-compute-clusters start-control-plane deploy-control-plane-addons deploy-control-plane-endpoints build-and-deploy-control-plane-cluster destroy-control-plane start-compute-plane deploy-compute-plane-addons configure-compute-control-plane-dns deploy-compute-control-plane-endpoints build-and-deploy-compute-plane-cluster destroy-compute-plane build-and-deploy-multicluster destroy-multicluster test-cluster-lifecycle-make test-destroy-all-ncp-local test-multicluster-make test-validate-gateway-route setup-gateway-api setup-metallb check-gateway-api deploy-sample deploy-nginx wait-for-nginx wait-for-gateway validate-gateway cleanup-nginx wait-for-deployment validate-deployment cleanup-sample build-and-deploy-cluster build-csi-smb deploy-csi-smb wait-for-csi-smb build-fake-gpu-operator deploy-fake-gpu-operator wait-for-fake-gpu-operator deploy-prometheus-crds uninstall-prometheus-crds deploy-kube-state-metrics wait-for-kube-state-metrics uninstall-kube-state-metrics build-credential-provider-multiarch
+
+.PHONY: test-gateway-timeout-compatibility
 
 # === Cluster Configuration ===
 CLUSTER_NAME := ncp-local
 K3D_CONFIG_FILE := k3d-config.yaml
+
+# Optional local overrides from tools/ncp-local-cluster/.env.
+# Command-line variables (make VAR=value) still win over this file;
+# shell-environment variables do NOT; use command-line overrides or remove
+# the .env entry to unset a value.
+ifneq (,$(wildcard .env))
+include .env
+export
+endif
 
 # === Multi-Cluster Configuration ===
 CONTROL_PLANE_CLUSTER_NAME ?= ncp-local-cp
 CONTROL_PLANE_CONFIG_FILE ?= k3d-config-control-plane.yaml
 CONTROL_PLANE_HTTP_PORT ?= 8080
 CONTROL_PLANE_HTTPS_PORT ?= 8443
+CONTROL_PLANE_GRPC_PORT ?= 9090
+CONTROL_PLANE_GRPC_PROXY_PORT ?= 10081
+CONTROL_PLANE_GRPC_WORKER_PORT ?= 10086
+CONTROL_PLANE_LLM_GRPC_PORT ?= 50071
+CONTROL_PLANE_LLM_QUIC_PORT ?= 50072
 CONTROL_PLANE_NATS_PORT ?= 4222
 CONTROL_PLANE_DOMAIN ?= nvcf-control-plane.test
 COMPUTE_CLUSTER_PREFIX ?= ncp-local-compute
@@ -32,6 +48,8 @@ COMPUTE_CLUSTER_NAME ?= $(COMPUTE_CLUSTER_PREFIX)-1
 COMPUTE_PLANE_CONFIG_FILE ?= k3d-config-compute-plane.yaml
 COMPUTE_CLUSTERS ?=
 GATEWAY_HTTP_PORT ?= $(CONTROL_PLANE_HTTP_PORT)
+GATEWAY_ROUTE_TIMEOUT_SECONDS ?= 60
+GATEWAY_ROUTE_RETRY_INTERVAL_SECONDS ?= 2
 
 # === Go Credential Provider Configuration ===
 GO_PROVIDER_PATH         := ./credential-provider-go
@@ -67,13 +85,8 @@ KSM_NAMESPACE := observability
 KSM_RELEASE := kube-state-metrics
 KSM_CHART := prometheus-community/kube-state-metrics
 
-# === Credential provider sample image ===
-SAMPLE_IMAGE_REGISTRY ?= nvcr.io
-SAMPLE_NGC_ORG ?= ngc-org
-SAMPLE_NGC_TEAM ?= ngc-team
-SAMPLE_IMAGE_NAME ?= alpine-k8s
-SAMPLE_IMAGE_TAG ?= 1.30.12
-SAMPLE_IMAGE ?=
+# === Sample workload image (public, multi-arch) ===
+SAMPLE_IMAGE ?= registry.k8s.io/e2e-test-images/agnhost:2.53
 
 # === Tool Check Macro ===
 # Usage: $(call require,<tool>,<install hint>)
@@ -87,11 +100,19 @@ ensure-cluster: ## Create cluster if it doesn't exist, otherwise skip
 	$(call require,kubectl,See https://kubernetes.io/docs/tasks/tools/)
 	@if ! k3d cluster get $(CLUSTER_NAME) >/dev/null 2>&1; then \
 		echo "Creating k3d cluster $(CLUSTER_NAME) using config $(K3D_CONFIG_FILE)..."; \
-		K3D_CLUSTER_NAME="$(CLUSTER_NAME)" \
+		if ! K3D_CLUSTER_NAME="$(CLUSTER_NAME)" \
 			CONTROL_PLANE_HTTP_PORT="$(CONTROL_PLANE_HTTP_PORT)" \
 			CONTROL_PLANE_HTTPS_PORT="$(CONTROL_PLANE_HTTPS_PORT)" \
+			CONTROL_PLANE_GRPC_PORT="$(CONTROL_PLANE_GRPC_PORT)" \
+			CONTROL_PLANE_GRPC_PROXY_PORT="$(CONTROL_PLANE_GRPC_PROXY_PORT)" \
+			CONTROL_PLANE_GRPC_WORKER_PORT="$(CONTROL_PLANE_GRPC_WORKER_PORT)" \
+			CONTROL_PLANE_LLM_GRPC_PORT="$(CONTROL_PLANE_LLM_GRPC_PORT)" \
+			CONTROL_PLANE_LLM_QUIC_PORT="$(CONTROL_PLANE_LLM_QUIC_PORT)" \
 			CONTROL_PLANE_NATS_PORT="$(CONTROL_PLANE_NATS_PORT)" \
-			k3d cluster create $(CLUSTER_NAME) --config $(K3D_CONFIG_FILE); \
+			k3d cluster create $(CLUSTER_NAME) --config $(K3D_CONFIG_FILE); then \
+			echo "ERROR Failed to create k3d cluster $(CLUSTER_NAME)." >&2; \
+			exit 1; \
+		fi; \
 		echo "OK Cluster $(CLUSTER_NAME) created."; \
 	else \
 		echo "OK Cluster $(CLUSTER_NAME) already exists. Skipping creation."; \
@@ -119,7 +140,10 @@ start: ensure-docker-config
 	@echo "========== START CLUSTER =========="
 	@$(MAKE) ensure-cluster
 	@echo "Ensuring cluster $(CLUSTER_NAME) is ready..."
-	@k3d cluster start $(CLUSTER_NAME) 2>/dev/null || echo "Cluster already running."
+	@if ! k3d cluster start $(CLUSTER_NAME); then \
+		echo "ERROR Failed to start k3d cluster $(CLUSTER_NAME)." >&2; \
+		exit 1; \
+	fi
 	@echo "OK Cluster $(CLUSTER_NAME) is running."
 	@$(MAKE) ensure-context
 
@@ -142,8 +166,8 @@ destroy-all-ncp-local: ## Discover and destroy every ncp-local* k3d cluster on t
 		echo "destroy-all-ncp-local requires jq; install it and retry." >&2; \
 		exit 1; \
 	}
-	@set -o pipefail; \
-	NAMES=$$(k3d cluster list -o json | jq -r '.[] | select(.name|startswith("ncp-local")) | .name'); \
+	@CLUSTERS_JSON=$$(k3d cluster list -o json) || exit $$?; \
+	NAMES=$$(printf '%s\n' "$$CLUSTERS_JSON" | jq -r '.[] | select(.name|startswith("ncp-local")) | .name') || exit $$?; \
 	if [ -z "$$NAMES" ]; then \
 		echo "No ncp-local* clusters present."; \
 		exit 0; \
@@ -233,12 +257,16 @@ deploy-compute-control-plane-endpoints: ## Deploy compute-cluster aliases for co
 	@# from the compute cluster reaches the control-plane LB container
 	@# over the docker network on the container ports, not the host
 	@# ports. Pass the literal container ports; do NOT forward
-	@# CONTROL_PLANE_HTTP_PORT / CONTROL_PLANE_NATS_PORT, which would
-	@# make compute aliases point at host-port:8080 (refused on the
-	@# container side).
+	@# CONTROL_PLANE_HTTP_PORT / CONTROL_PLANE_GRPC_PORT /
+	@# CONTROL_PLANE_NATS_PORT, which would make compute aliases point
+	@# at host-port:8080 (refused on the container side).
 	@CONTROL_PLANE_DOMAIN="$(CONTROL_PLANE_DOMAIN)" \
 		CONTROL_PLANE_CLUSTER_NAME="$(CONTROL_PLANE_CLUSTER_NAME)" \
 		CONTROL_PLANE_LB_HTTP_PORT=80 \
+		CONTROL_PLANE_LB_GRPC_PORT=9090 \
+		CONTROL_PLANE_LB_GRPC_WORKER_PORT=10086 \
+		CONTROL_PLANE_LB_LLM_GRPC_PORT=50071 \
+		CONTROL_PLANE_LB_LLM_QUIC_PORT=50072 \
 		CONTROL_PLANE_LB_NATS_PORT=4222 \
 		CLUSTER_NAME="$(COMPUTE_CLUSTER_NAME)" \
 		bash ./scripts/configure-control-plane-endpoints.sh
@@ -277,8 +305,20 @@ destroy-multicluster: validate-compute-clusters ## Destroy the default control-p
 		$(MAKE) CLUSTER_NAME="$$cluster" destroy || true; \
 	done
 
+test-cluster-lifecycle-make: ## Run dry Makefile tests for cluster lifecycle behavior
+	@tests/test-cluster-lifecycle-make.sh
+
 test-multicluster-make: ## Run dry Makefile tests for multi-cluster name derivation
 	@tests/test-multicluster-make.sh
+
+test-destroy-all-ncp-local: ## Run dry Makefile tests for host-wide local-cluster cleanup
+	@tests/test-destroy-all-ncp-local.sh
+
+test-validate-gateway-route: ## Run Gateway route retry tests
+	@tests/test-validate-gateway-route.sh
+
+test-gateway-timeout-compatibility: ## Run Envoy Gateway timeout capability tests
+	@tests/test-gateway-timeout-compatibility.sh
 
 # --- Load Balancer & Gateway API Setup ---
 setup-gateway-api:
@@ -312,16 +352,24 @@ check-gateway-api:
 
 # --- Application & Provider Deployment ---
 deploy-sample: # Depends on the cluster being up
-	@echo "========== CREDENTIAL PROVIDER VALIDATION =========="
+	@echo "========== SAMPLE WORKLOAD DEPLOYMENT =========="
 	@echo "Building and deploying sample application from ./sample directory..."
 	@SAMPLE_IMAGE="$(SAMPLE_IMAGE)" \
-		SAMPLE_IMAGE_REGISTRY="$(SAMPLE_IMAGE_REGISTRY)" \
-		SAMPLE_NGC_ORG="$(SAMPLE_NGC_ORG)" \
-		SAMPLE_NGC_TEAM="$(SAMPLE_NGC_TEAM)" \
-		SAMPLE_IMAGE_NAME="$(SAMPLE_IMAGE_NAME)" \
-		SAMPLE_IMAGE_TAG="$(SAMPLE_IMAGE_TAG)" \
 		bash ./scripts/render-sample.sh | kubectl apply -f -
 	@echo "Sample application deployment complete."
+
+validate-deployment: deploy-sample wait-for-deployment ## Deploy public sample and validate the cluster runs it
+	@echo "OK Sample deployment is ready"
+	@echo ""
+	@echo "OK The sample pod is serving HTTP using $(SAMPLE_IMAGE)"
+	@echo "OK This confirms that:"
+	@echo "   - The cluster can schedule and run a multi-arch sample workload"
+	@echo "   - Readiness and liveness probes against the HTTP server are passing"
+	@echo ""
+	@echo "INFO Deployment Details:"
+	@kubectl get deployment/sample -n sample -o wide
+	@echo ""
+	@kubectl get pods -l app=sample -n sample -o wide
 
 deploy-nginx:
 	@echo "Building and deploying nginx application from ./apps/nginx directory..."
@@ -364,20 +412,6 @@ wait-for-deployment: ## Wait for sample deployment to be ready (with polling loo
 		exit 1; \
 	fi
 
-validate-deployment: deploy-sample wait-for-deployment ## Deploy sample and validate credential provider is working
-	@echo "OK Deployment is ready and credential provider configuration is validated"
-	@echo ""
-	@echo "OK The sample pod successfully pulled the image from nvcr.io using the credential provider"
-	@echo "OK This confirms that:"
-	@echo "   - The credential provider binary is correctly mounted and executable"
-	@echo "   - The kubelet can communicate with the credential provider"
-	@echo "   - Authentication to NVIDIA Container Registry is working"
-	@echo ""
-	@echo "INFO Deployment Details:"
-	@kubectl get deployment/sample -n sample -o wide
-	@echo ""
-	@kubectl get pods -l app=sample -n sample -o wide
-
 wait-for-gateway: ## Wait for Gateway to be ready and HTTPRoute to be attached
 	@echo "Waiting for Gateway to be ready..."
 	@timeout=300; \
@@ -406,7 +440,9 @@ validate-gateway: deploy-nginx wait-for-nginx wait-for-gateway ## Validate Gatew
 	@echo ">>> Checking HTTPRoute status..."
 	@kubectl get httproute nginx-route -n sample -o jsonpath='{.status}' || echo "HTTPRoute status not available"
 	@echo ">>> Validating Gateway route (nginx.localhost)..."
-	@if curl -sSf http://nginx.localhost:$(GATEWAY_HTTP_PORT)/ >/dev/null 2>&1; then \
+	@if GATEWAY_ROUTE_TIMEOUT_SECONDS=$(GATEWAY_ROUTE_TIMEOUT_SECONDS) \
+		GATEWAY_ROUTE_RETRY_INTERVAL_SECONDS=$(GATEWAY_ROUTE_RETRY_INTERVAL_SECONDS) \
+		bash ./scripts/validate-gateway-route.sh http://nginx.localhost:$(GATEWAY_HTTP_PORT)/; then \
 		echo "OK Gateway route reachable at http://nginx.localhost:$(GATEWAY_HTTP_PORT)"; \
 	else \
 		echo "ERROR Gateway route validation failed"; \
@@ -572,7 +608,7 @@ build-credential-provider-multiarch: ## Build multi-arch credential provider bin
 	@ls -lh $(PROVIDER_LINUX_AMD64_OUTPUT_PATH) $(PROVIDER_LINUX_ARM64_OUTPUT_PATH)
 
 # Optional release helpers are loaded only when present.
-NCP_LOCAL_INTERNAL_RELEASE_MK ?= ../../nvidia-internal/tools/ncp-local-cluster/release.mk
+NCP_LOCAL_INTERNAL_RELEASE_MK ?= ../../../nvcf-internal/tools/ncp-local-cluster/release.mk
 -include $(NCP_LOCAL_INTERNAL_RELEASE_MK)
 
 # --- Cleanup & Help ---

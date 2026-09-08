@@ -33,6 +33,9 @@ ports:
   - port: 8443:443 # Host 8443 -> LoadBalancer port 443 (handled by klipper/servicelb)
     nodeFilters:
       - loadbalancer
+  - port: 10081:10081 # Host 10081 -> LoadBalancer port 10081 (handled by klipper/servicelb)
+    nodeFilters:
+      - loadbalancer
 
 options:
   k3d: # k3d-managed options

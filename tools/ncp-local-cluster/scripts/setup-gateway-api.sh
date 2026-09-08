@@ -63,10 +63,23 @@ helm upgrade --install ${ENVOY_GATEWAY_RELEASE_NAME} ${ENVOY_GATEWAY_CHART} \
     --wait
 log_info "OK Envoy Gateway Helm chart applied successfully."
 
+# Secure LLM worker streams require this field to disable Envoy's default
+# 15-second request timeout. Older CRDs silently prune the field on a regular
+# apply, so check the installed schema before creating Gateway resources.
+request_timeout_schema="$(
+    kubectl get crd backendtrafficpolicies.gateway.envoyproxy.io \
+        -o jsonpath='{range .spec.versions[?(@.name=="v1alpha1")]}{.name}{"\t"}{.served}{"\t"}{.schema.openAPIV3Schema.properties.spec.properties.timeout.properties.http.properties.requestTimeout.type}{"\n"}{end}'
+)"
+if ! grep -Eq '^v1alpha1[[:space:]]+true[[:space:]]+string$' <<<"${request_timeout_schema}"; then
+    log_error "The installed Envoy Gateway CRD does not support BackendTrafficPolicy spec.timeout.http.requestTimeout."
+    log_error "Install or upgrade the CRDs to a timeout-capable Envoy Gateway release before enabling secure LLM worker routes."
+    exit 1
+fi
+log_info "OK Envoy Gateway supports disabling the LLM worker request timeout."
+
 # Step 2: Apply GatewayClass and Gateway resources
 log_info "Applying Envoy Gateway configuration..."
-kubectl apply -f "${PROJECT_ROOT}/apps/envoy-gateway/gatewayclass.yaml"
-kubectl apply -f "${PROJECT_ROOT}/apps/envoy-gateway/gateway.yaml"
+kubectl apply -k "${PROJECT_ROOT}/apps/envoy-gateway"
 log_info "OK Envoy Gateway configuration applied."
 
 # Step 3: Wait for GatewayClass to become ready

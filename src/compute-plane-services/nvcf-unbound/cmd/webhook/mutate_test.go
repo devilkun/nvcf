@@ -185,6 +185,123 @@ func TestMutateDNS_SkipIfAlreadyConfigured(t *testing.T) {
 	}
 }
 
+func TestMutateDNS_SkipIfCacheOptedOut(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "test-namespace"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: "nginx",
+					Env:   []corev1.EnvVar{{Name: "NVCF_DISABLE_PROXY_CACHE", Value: "true"}},
+				},
+			},
+		},
+	}
+
+	patches := mutateDNS(pod)
+
+	if len(patches) != 0 {
+		t.Errorf("Expected 0 patches when opted out, got %d", len(patches))
+	}
+}
+
+func TestMutateDNS_SkipIfCacheOptedOutViaInitContainer(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "test-namespace"},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{
+				{
+					Name:  "download-ngc-model",
+					Image: "nvidia/cli",
+					Env:   []corev1.EnvVar{{Name: "NVCF_DISABLE_PROXY_CACHE", Value: "true"}},
+				},
+			},
+			Containers: []corev1.Container{
+				{Name: "app", Image: "nginx"},
+			},
+		},
+	}
+
+	patches := mutateDNS(pod)
+
+	if len(patches) != 0 {
+		t.Errorf("Expected 0 patches when opted out via init container, got %d", len(patches))
+	}
+}
+
+func TestMutateDNS_OptOutValueMustBeTrue(t *testing.T) {
+	// Any value other than the canonical "true" leaves caching on.
+	for _, val := range []string{"false", "1", "TRUE", ""} {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "test-namespace"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "app",
+						Image: "nginx",
+						Env:   []corev1.EnvVar{{Name: "NVCF_DISABLE_PROXY_CACHE", Value: val}},
+					},
+				},
+			},
+		}
+
+		patches := mutateDNS(pod)
+
+		if len(patches) != 2 {
+			t.Errorf("value %q: expected DNS mutation (2 patches), got %d", val, len(patches))
+		}
+	}
+}
+
+func TestCacheOptedOut(t *testing.T) {
+	optOut := []corev1.EnvVar{{Name: "NVCF_DISABLE_PROXY_CACHE", Value: "true"}}
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{
+			name: "no env",
+			pod:  &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}}},
+			want: false,
+		},
+		{
+			name: "container opted out",
+			pod:  &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: optOut}}}},
+			want: true,
+		},
+		{
+			name: "init container opted out",
+			pod:  &corev1.Pod{Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: "init", Env: optOut}}, Containers: []corev1.Container{{Name: "app"}}}},
+			want: true,
+		},
+		{
+			name: "wrong value",
+			pod:  &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{{Name: "NVCF_DISABLE_PROXY_CACHE", Value: "yes"}}}}}},
+			want: false,
+		},
+		{
+			// An earlier container with a non-"true" value must not mask a later
+			// container's opt-out.
+			name: "non-true in init container, true in app container",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Name: "init", Env: []corev1.EnvVar{{Name: "NVCF_DISABLE_PROXY_CACHE", Value: "false"}}}},
+				Containers:     []corev1.Container{{Name: "app", Env: optOut}},
+			}},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cacheOptedOut(tt.pod); got != tt.want {
+				t.Errorf("cacheOptedOut() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // ============================================================================
 // Certificate Mutation Tests
 // ============================================================================
@@ -623,11 +740,11 @@ func TestMutateCertificates_VerifyEnvVars(t *testing.T) {
 	}
 
 	expected := map[string]string{
-		"REQUESTS_CA_BUNDLE":                  "/etc/ssl/certs/ca-certificates.crt",
-		"SSL_CERT_FILE":                       "/etc/ssl/certs/ca-certificates.crt",
-		"AWS_CA_BUNDLE":                       "/etc/ssl/certs/ca-certificates.crt",
-		"NIM_SDK_USE_NATIVE_TLS":              "1",
-		"NIM_SDK_DOWNLOAD_MAX_RETRY_COUNT":    "8",
+		"REQUESTS_CA_BUNDLE":                   "/etc/ssl/certs/ca-certificates.crt",
+		"SSL_CERT_FILE":                        "/etc/ssl/certs/ca-certificates.crt",
+		"AWS_CA_BUNDLE":                        "/etc/ssl/certs/ca-certificates.crt",
+		"NIM_SDK_USE_NATIVE_TLS":               "1",
+		"NIM_SDK_DOWNLOAD_MAX_RETRY_COUNT":     "8",
 		"NIM_SDK_DOWNLOAD_BACKOFF_INTERVAL_MS": "500",
 	}
 
@@ -906,8 +1023,10 @@ func TestMutateCertificates_MountToInitContainers(t *testing.T) {
 
 	patches := mutateCertificates(pod)
 
-	// All 3 existing init containers should get the cert mount.
-	// After our 2 init containers are prepended, indices are 2, 3, 4.
+	// Only init containers matching *init* or *download* get the mount.
+	// After our 2 helper init containers are prepended, the consumer indices
+	// are: my-init-container=2 (init), download-ngc-model=3 (download),
+	// setup=4 (no match, skipped).
 	foundMounts := map[int]bool{}
 	for _, patch := range patches {
 		for _, idx := range []int{2, 3, 4} {
@@ -918,10 +1037,13 @@ func TestMutateCertificates_MountToInitContainers(t *testing.T) {
 		}
 	}
 
-	for _, idx := range []int{2, 3, 4} {
+	for _, idx := range []int{2, 3} {
 		if !foundMounts[idx] {
 			t.Errorf("Expected mount patch for init container at index %d", idx)
 		}
+	}
+	if foundMounts[4] {
+		t.Error("Did not expect mount patch for 'setup' init container (no *init*/*download* match)")
 	}
 }
 

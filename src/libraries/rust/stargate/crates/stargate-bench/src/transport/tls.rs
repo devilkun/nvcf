@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
-use rustls::pki_types::CertificateDer;
 
 use super::TransportBenchConfig;
 
@@ -56,20 +55,8 @@ pub(super) fn server_config(
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<GeneratedServerConfig> {
     let (cert_pem, key_pem) = stargate_tls::generate_self_signed_cert()?;
-    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*cert_pem)
-        .collect::<std::result::Result<_, _>>()
-        .context("parse benchmark server cert")?;
-    let key = rustls_pemfile::private_key(&mut &*key_pem)
-        .context("parse benchmark server key")?
-        .context("missing benchmark server key")?;
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .context("build benchmark server TLS config")?;
-    tls_config.alpn_protocols = alpn_protocols;
-    let mut server_config = ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?,
-    ));
+    let mut server_config =
+        stargate_tls::build_quic_server_config_from_pem(&cert_pem, &key_pem, alpn_protocols)?;
     server_config.transport_config(tuned_transport_config(config));
     Ok(GeneratedServerConfig {
         server_config,
@@ -82,20 +69,8 @@ fn client_config(
     alpn_protocols: Vec<Vec<u8>>,
     server_cert_pem: &[u8],
 ) -> Result<ClientConfig> {
-    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*server_cert_pem)
-        .collect::<std::result::Result<_, _>>()
-        .context("parse benchmark client root cert")?;
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in cert_chain {
-        roots.add(cert).context("add benchmark root cert")?;
-    }
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls_config.alpn_protocols = alpn_protocols;
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
-    ));
+    let mut client_config =
+        stargate_tls::build_trusted_quic_client_config_with_alpn(server_cert_pem, alpn_protocols)?;
     client_config.transport_config(tuned_transport_config(config));
     Ok(client_config)
 }

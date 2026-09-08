@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -61,18 +62,19 @@ func TestProfilerEntrypoint(t *testing.T) {
 }
 
 func TestSuccessfulEndToEnd(t *testing.T) {
+	lockFixedPorts(t)
 	zapLogger := setupLogs(t)
-	inferenceServerHost := "127.0.0.1:8000"
 	assetServerHost := "127.0.0.1:8001"
 	largeResponseServerHost := "127.0.0.1:8002"
 	ncaId := "test-nca-function-owner"
 
-	// Start inference mock
-	server, err := testutils.NewInferenceServer(inferenceServerHost)
+	// Start inference mock on an OS-assigned ephemeral port.
+	server, err := testutils.NewInferenceServer("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
+	inferencePort := server.Listener.Addr().(*net.TCPAddr).Port
 
 	// start asset mock
 	asset, err := testutils.NewAssetServer(assetServerHost)
@@ -89,11 +91,10 @@ func TestSuccessfulEndToEnd(t *testing.T) {
 	defer largeResponse.Close()
 
 	// start nats server
-	natsSuperCluster, err := testutils.NewNatsSuperCluster(t)
+	natsSuperCluster, err := newEmbeddedNats(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer natsSuperCluster.Shutdown()
 
 	// Start otel mock
 	mc, err := testutils.NewMockCollector(zapLogger)
@@ -107,7 +108,7 @@ func TestSuccessfulEndToEnd(t *testing.T) {
 		NVCFWorkerToken:          "fake-worker-token",
 		NVCFFqdn:                 "http://127.0.0.1:9090",
 		NVCFFqdnNATS:             natsSuperCluster.Clusters[0].Servers[0].ClientURL(),
-		InferencePort:            8000,
+		InferencePort:            inferencePort,
 		InferenceHealthEndpoint:  "/health",
 		OTELExporterOTLPEndpoint: "http://127.0.0.1:8360",
 		TracingAccessToken:       "fake-tracing-token",
@@ -590,17 +591,18 @@ func TestSuccessfulEndToEnd(t *testing.T) {
 }
 
 func TestSuccessfulEndToEndNonBackwardsCompatible(t *testing.T) {
+	lockFixedPorts(t)
 	zapLogger := setupLogs(t)
-	inferenceServerHost := "127.0.0.1:8000"
 	assetServerHost := "127.0.0.1:8001"
 	ncaId := "test-nca-function-owner"
 
-	// Start inference mock
-	server, err := testutils.NewInferenceServer(inferenceServerHost)
+	// Start inference mock on an OS-assigned ephemeral port.
+	server, err := testutils.NewInferenceServer("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
+	inferencePort := server.Listener.Addr().(*net.TCPAddr).Port
 
 	// start asset mock
 	asset, err := testutils.NewAssetServer(assetServerHost)
@@ -610,11 +612,10 @@ func TestSuccessfulEndToEndNonBackwardsCompatible(t *testing.T) {
 	defer asset.Close()
 
 	// start nats server
-	natsSuperCluster, err := testutils.NewNatsSuperCluster(t)
+	natsSuperCluster, err := newEmbeddedNats(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer natsSuperCluster.Shutdown()
 
 	// Start otel mock
 	mc, err := testutils.NewMockCollector(zapLogger)
@@ -628,7 +629,7 @@ func TestSuccessfulEndToEndNonBackwardsCompatible(t *testing.T) {
 		NVCFWorkerToken:                  "fake-worker-token",
 		NVCFFqdn:                         "http://127.0.0.1:9090",
 		NVCFFqdnNATS:                     natsSuperCluster.Clusters[0].Servers[0].ClientURL(),
-		InferencePort:                    8000,
+		InferencePort:                    inferencePort,
 		InferenceHealthEndpoint:          "/health",
 		OTELExporterOTLPEndpoint:         "http://127.0.0.1:8360",
 		TracingAccessToken:               "fake-tracing-token",
@@ -1263,18 +1264,19 @@ func handleGetRequestEncodedWorkRequest(ctx context.Context, nc *nats.Conn, work
 }
 
 func TestWorkerGracefulShutdown(t *testing.T) {
+	lockFixedPorts(t)
 	zapLogger := setupLogs(t)
-	inferenceServerHost := "127.0.0.1:8000"
 	assetServerHost := "127.0.0.1:8001"
 	largeResponseServerHost := "127.0.0.1:8002"
 	ncaId := "test-nca-function-owner"
 
-	// Start inference mock
-	server, err := testutils.NewInferenceServer(inferenceServerHost)
+	// Start inference mock on an OS-assigned ephemeral port.
+	server, err := testutils.NewInferenceServer("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
+	inferencePort := server.Listener.Addr().(*net.TCPAddr).Port
 
 	// start asset mock
 	asset, err := testutils.NewAssetServer(assetServerHost)
@@ -1291,11 +1293,10 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 	defer largeResponse.Close()
 
 	// start nats server
-	natsSuperCluster, err := testutils.NewNatsSuperCluster(t)
+	natsSuperCluster, err := newEmbeddedNats(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer natsSuperCluster.Shutdown()
 
 	// Start otel mock
 	mc, err := testutils.NewMockCollector(zapLogger)
@@ -1308,7 +1309,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 		NVCFWorkerToken:          "fake-worker-token",
 		NVCFFqdn:                 "http://127.0.0.1:9090",
 		NVCFFqdnNATS:             natsSuperCluster.Clusters[0].Servers[0].ClientURL(),
-		InferencePort:            8000,
+		InferencePort:            inferencePort,
 		InferenceHealthEndpoint:  "/health",
 		OTELExporterOTLPEndpoint: "http://127.0.0.1:8360",
 		TracingAccessToken:       "fake-tracing-token",
@@ -1551,18 +1552,19 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 }
 
 func TestLargeRequestConcurrency(t *testing.T) {
+	lockFixedPorts(t)
 	zapLogger := setupLogs(t)
-	inferenceServerHost := "127.0.0.1:8000"
 	assetServerHost := "127.0.0.1:8001"
 	largeResponseServerHost := "127.0.0.1:8002"
 	ncaId := "test-nca-function-owner"
 
-	// Start inference mock
-	server, err := testutils.NewInferenceServer(inferenceServerHost)
+	// Start inference mock on an OS-assigned ephemeral port.
+	server, err := testutils.NewInferenceServer("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
+	inferencePort := server.Listener.Addr().(*net.TCPAddr).Port
 
 	// start asset mock
 	asset, err := testutils.NewAssetServer(assetServerHost)
@@ -1579,11 +1581,10 @@ func TestLargeRequestConcurrency(t *testing.T) {
 	defer largeResponse.Close()
 
 	// start nats server
-	natsSuperCluster, err := testutils.NewNatsSuperCluster(t)
+	natsSuperCluster, err := newEmbeddedNats(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer natsSuperCluster.Shutdown()
 
 	// Start otel mock
 	mc, err := testutils.NewMockCollector(zapLogger)
@@ -1597,7 +1598,7 @@ func TestLargeRequestConcurrency(t *testing.T) {
 		NVCFWorkerToken:          "fake-worker-token",
 		NVCFFqdn:                 "http://127.0.0.1:9090",
 		NVCFFqdnNATS:             natsSuperCluster.Clusters[0].Servers[0].ClientURL(),
-		InferencePort:            8000,
+		InferencePort:            inferencePort,
 		InferenceHealthEndpoint:  "/health",
 		OTELExporterOTLPEndpoint: "http://127.0.0.1:8360",
 		TracingAccessToken:       "fake-tracing-token",

@@ -27,11 +27,24 @@ global:
     registry: nvcr.io
     repository: REPLACE_WITH_SAMPLE_NGC_ORG/REPLACE_WITH_SAMPLE_NGC_TEAM
 
-  nvcaOperator:
-    selfManaged:
-      icmsServiceURL: http://api.sis.svc.cluster.local:8080
-      revalServiceURL: http://reval.nvcf.svc.cluster.local:8080
-      natsURL: nats://nats.nats-system.svc.cluster.local:4222
+  workerEndpoints:
+    essServiceURL: http://ess-api.ess.svc.cluster.local:8080
+    invocationServiceURL: http://invocation.nvcf.svc.cluster.local:8080
+
+# Local BDD does not install the optional observability stack.
+observability:
+  profile: disabled
+
+# The published chart defaults target production-sized nodes. Keep the local
+# single-cluster fixture schedulable after the core services are placed.
+stateMetrics:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 cassandra:
   replicaCount: 1
@@ -49,9 +62,15 @@ openbao:
     # Single-node local cluster: hard anti-affinity would leave the 2nd replica Pending.
     replicas: 1
 
+# Pylon exits at startup when the API advertises its default HTTPS dummy OTLP
+# endpoint because the current binary has no OpenTelemetry TLS provider. Keep
+# worker telemetry on HTTP in this fixture until Pylon supports HTTPS OTLP.
+#
+# The stack derives the Pylon image from the effective sidecar registry and
+# repository when the LLM addon is enabled.
 api:
   env:
-    NVCF_SIDECARS_LLM_ROUTER_CLIENT_IMAGE: nvcr.io/REPLACE_WITH_SAMPLE_NGC_ORG/REPLACE_WITH_SAMPLE_NGC_TEAM/stargate-client:0.2.0
+    MANAGEMENT_OTLP_TRACING_ENDPOINT: http://dummy:8282
 
 # LLM gateway talks to nvcf-api over plaintext gRPC in local dev
 # (api.nvcf.svc.cluster.local:9090 has no TLS).
@@ -70,14 +89,19 @@ addons:
       metrics:
         serviceMonitor:
           enabled: false
-
-agentConfig:
-  mergeConfig: |
-    cluster:
-      validationPolicy:
-        name: Unrestricted
-    workload:
-      stargateQUICInsecure: true
+      loadBalancer:
+        config: |
+          {
+            "default": "power-of-two",
+            "request_algorithms": {
+              "power-of-two": "power-of-two",
+              "round-robin": "round-robin",
+              "random": "random"
+            }
+          }
+  vanityGateway:
+    enabled: true
+    replicaCount: 1
 
 # Gateway API Ingress (POC)
 # Application Developer role: Only HTTPRoutes
@@ -99,4 +123,6 @@ ingress:
         listenerName: nats
     routes:
       nats:
+        enabled: true
+      ess: 
         enabled: true

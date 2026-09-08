@@ -19,17 +19,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quinn::{ClientConfig, Endpoint};
-use rustls::RootCertStore;
 use stargate_forwarding::{
     HostnameMatcher, PeerTarget, RelayEndpointConfig, RelayEndpoints, build_relay_endpoints,
-    build_relay_transport_config, forward_quic_connection,
+    forward_quic_connection_until_shutdown,
 };
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::{error, info, warn};
 
-use crate::endpoints::TargetSnapshot;
+use crate::endpoints::{TargetSnapshot, ready_target_for_sni};
 use crate::metrics::RouterMetrics;
+use crate::tls::{build_router_server_config, build_upstream_client_config};
 
 #[derive(Clone, Debug)]
 pub struct QuicRouterConfig {
@@ -41,26 +41,176 @@ pub struct QuicRouterConfig {
     pub relay_keep_alive_interval: Option<Duration>,
     pub tls_cert_pem: Option<Vec<u8>>,
     pub tls_key_pem: Option<Vec<u8>>,
+    /// Dedicated upstream trust bundle. The serving certificate remains a
+    /// compatibility fallback when this is absent.
+    pub upstream_tls_cert_pem: Option<Vec<u8>>,
+    pub server_identity_reloader: Option<stargate_tls::ServerIdentityReloader>,
+    pub tls_reload_interval: Duration,
     pub quic_insecure: bool,
 }
 
-#[derive(Clone, Debug)]
-struct QuicRouterRuntimeConfig {
-    config: QuicRouterConfig,
+struct QuicRelay {
+    endpoints: RelayEndpoints,
     hostname_matcher: Option<HostnameMatcher>,
+    connect_timeout: Duration,
 }
 
-impl QuicRouterRuntimeConfig {
-    fn new(config: QuicRouterConfig) -> Self {
-        let hostname_matcher = HostnameMatcher::new(
-            &config.advertised_hostname_template,
-            &config.target_namespace,
+struct QuicRouterRuntime {
+    endpoint: Endpoint,
+    bound_addr: SocketAddr,
+    relay_config: RelayEndpointConfig,
+    relay: Arc<QuicRelay>,
+    connection_tasks: TaskTracker,
+    server_identity_reloader: Option<stargate_tls::ServerIdentityReloader>,
+    tls_reload_interval: Duration,
+}
+
+fn upstream_trust_pem(config: &QuicRouterConfig) -> Option<&[u8]> {
+    config
+        .upstream_tls_cert_pem
+        .as_deref()
+        .or(config.tls_cert_pem.as_deref())
+}
+
+impl QuicRouterRuntime {
+    fn bind(config: QuicRouterConfig, connection_tasks: TaskTracker) -> Result<Self> {
+        let relay_config = RelayEndpointConfig {
+            max_idle_timeout: config.relay_max_idle_timeout,
+            keep_alive_interval: config.relay_keep_alive_interval,
+        };
+        let client_config = build_client_config(upstream_trust_pem(&config), config.quic_insecure)?;
+        let server_config = match &config.server_identity_reloader {
+            // Serve the identity the reloader validated and owns. Reading the
+            // mounted files a second time here could pick up a different
+            // generation, which would leave the reloader treating the served
+            // identity as already current and never installing the replacement.
+            Some(reloader) => {
+                build_router_server_config(reloader.current_identity(), Vec::new(), relay_config)?
+            }
+            None => build_server_config(
+                config.tls_cert_pem.as_deref(),
+                config.tls_key_pem.as_deref(),
+                relay_config,
+            )?,
+        };
+        let endpoint = Endpoint::server(server_config, config.listen_addr)?;
+        let bound_addr = endpoint.local_addr()?;
+        let relay = Arc::new(QuicRelay {
+            endpoints: build_relay_endpoints(relay_config, client_config)?,
+            hostname_matcher: HostnameMatcher::new(
+                &config.advertised_hostname_template,
+                &config.target_namespace,
+            ),
+            connect_timeout: config.connect_timeout,
+        });
+
+        Ok(Self {
+            endpoint,
+            bound_addr,
+            relay_config,
+            relay,
+            connection_tasks,
+            server_identity_reloader: config.server_identity_reloader,
+            tls_reload_interval: config.tls_reload_interval,
+        })
+    }
+
+    async fn serve(
+        self,
+        targets: watch::Receiver<TargetSnapshot>,
+        metrics: Arc<RouterMetrics>,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
+        info!(
+            addr = %self.bound_addr,
+            relay_max_idle_timeout_ms = self.relay_config.max_idle_timeout.as_millis(),
+            relay_keep_alive_interval_ms =
+                self.relay_config.keep_alive_interval.map(|duration| duration.as_millis()),
+            "QUIC router listening"
         );
-        Self {
-            config,
-            hostname_matcher,
+        let reload_task = server_identity_reload_task(
+            self.server_identity_reloader,
+            self.endpoint.clone(),
+            self.relay_config,
+            self.tls_reload_interval,
+            metrics.clone(),
+            shutdown.clone(),
+        );
+        tokio::pin!(reload_task);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    self.endpoint.set_server_config(None);
+                    info!(
+                        active_connections = self.endpoint.open_connections(),
+                        "QUIC router stopped accepting new connections; draining active streams"
+                    );
+                    return Ok(());
+                }
+                result = &mut reload_task => {
+                    if let Err(error) = result {
+                        error!(component = "stargate-k8s-router-quic", %error, "TLS reload task stopped");
+                    }
+                    self.endpoint.close(0u32.into(), b"TLS reload task stopped");
+                    return Ok(());
+                }
+                incoming = self.endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        warn!("QUIC router endpoint stopped accepting");
+                        return Ok(());
+                    };
+                    let relay = self.relay.clone();
+                    let targets = targets.clone();
+                    let metrics = metrics.clone();
+                    let shutdown = shutdown.child_token();
+                    self.connection_tasks.spawn(async move {
+                        if let Err(error) = dispatch_incoming(
+                            incoming,
+                            targets,
+                            relay,
+                            metrics,
+                            shutdown,
+                        ).await {
+                            warn!(%error, "QUIC router connection failed");
+                        }
+                    });
+                }
+            }
         }
     }
+}
+
+/// Reloads the router listener identity, or waits forever when none is mounted.
+async fn server_identity_reload_task(
+    reloader: Option<stargate_tls::ServerIdentityReloader>,
+    endpoint: Endpoint,
+    relay_config: RelayEndpointConfig,
+    poll_interval: Duration,
+    metrics: Arc<RouterMetrics>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let Some(reloader) = reloader else {
+        return std::future::pending().await;
+    };
+    let status = metrics.tls_identity();
+    status.set_validity(reloader.current_validity());
+    metrics.refresh_tls_certificate_expiry();
+    let outcome_metrics = metrics.clone();
+    stargate_tls::ServerIdentityReloadTask {
+        component: "stargate-k8s-router-quic",
+        reloader,
+        endpoint,
+        build_server_config: Box::new(move |identity| {
+            build_router_server_config(identity, Vec::new(), relay_config)
+        }),
+        poll_interval,
+        status,
+    }
+    .run(shutdown, move |outcome| {
+        outcome_metrics.observe_server_identity_reload(outcome);
+        outcome_metrics.refresh_tls_certificate_expiry();
+    })
+    .await
 }
 
 pub async fn serve_quic_router(
@@ -68,62 +218,25 @@ pub async fn serve_quic_router(
     targets: watch::Receiver<TargetSnapshot>,
     metrics: Arc<RouterMetrics>,
     shutdown: CancellationToken,
+    connection_tasks: TaskTracker,
 ) -> Result<()> {
-    let relay_config = RelayEndpointConfig {
-        max_idle_timeout: config.relay_max_idle_timeout,
-        keep_alive_interval: config.relay_keep_alive_interval,
-    };
-    let server_config = build_server_config(
-        config.tls_cert_pem.as_deref(),
-        config.tls_key_pem.as_deref(),
-        relay_config,
-    )?;
-    let endpoint = Endpoint::server(server_config, config.listen_addr)?;
-    let bound_addr = endpoint.local_addr()?;
-    let client_config = build_client_config(config.tls_cert_pem.as_deref(), config.quic_insecure)?;
-    let relay_endpoints = Arc::new(build_relay_endpoints(relay_config, client_config)?);
-    let config = Arc::new(QuicRouterRuntimeConfig::new(config));
-    info!(
-        addr = %bound_addr,
-        relay_max_idle_timeout_ms = relay_config.max_idle_timeout.as_millis(),
-        relay_keep_alive_interval_ms =
-            relay_config.keep_alive_interval.map(|duration| duration.as_millis()),
-        "QUIC router listening"
-    );
-
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                endpoint.close(0u32.into(), b"shutdown");
-                return Ok(());
-            }
-            incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else {
-                    warn!("QUIC router endpoint stopped accepting");
-                    return Ok(());
-                };
-                let targets = targets.clone();
-                let relay_endpoints = relay_endpoints.clone();
-                let metrics = metrics.clone();
-                let config = config.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = dispatch_incoming(incoming, targets, relay_endpoints, metrics, config).await {
-                        warn!(%error, "QUIC router connection failed");
-                    }
-                });
-            }
-        }
-    }
+    QuicRouterRuntime::bind(config, connection_tasks)?
+        .serve(targets, metrics, shutdown)
+        .await
 }
 
 async fn dispatch_incoming(
     incoming: quinn::Incoming,
     targets: watch::Receiver<TargetSnapshot>,
-    relay_endpoints: Arc<RelayEndpoints>,
+    relay: Arc<QuicRelay>,
     metrics: Arc<RouterMetrics>,
-    config: Arc<QuicRouterRuntimeConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
-    let connection = incoming.await.context("accept QUIC connection")?;
+    let connection = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Ok(()),
+        connection = incoming => connection.context("accept QUIC connection")?,
+    };
     let sni = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -131,133 +244,59 @@ async fn dispatch_incoming(
 
     let route = {
         let snapshot = targets.borrow();
-        match route_for_sni(sni.as_deref(), &snapshot, &config) {
-            QuicRoute::Ready {
-                target,
-                server_name,
-            } => QuicDispatchRoute::Ready {
-                target_pod: target.pod_name.clone(),
-                peer: PeerTarget {
-                    dial_addr: target.quic_addr.clone(),
-                    server_name: server_name.to_string(),
-                },
+        ready_target_for_sni(sni.as_deref(), &snapshot, relay.hostname_matcher.as_ref()).map(
+            |(target, server_name)| {
+                (
+                    target.pod_name.clone(),
+                    PeerTarget {
+                        dial_addr: target.quic_addr.clone(),
+                        server_name: server_name.to_string(),
+                    },
+                )
             },
-            QuicRoute::MissingSni => QuicDispatchRoute::MissingSni,
-            QuicRoute::UnknownSni => QuicDispatchRoute::UnknownSni,
-            QuicRoute::TargetUnavailable => QuicDispatchRoute::TargetUnavailable,
-        }
+        )
     };
     let peer = match route {
-        QuicDispatchRoute::Ready { target_pod, peer } => {
+        Ok((target_pod, peer)) => {
             metrics.observe_quic_connection("accepted");
             info!(
-                target_pod = %target_pod,
+                %target_pod,
                 peer = %peer.dial_addr,
                 server_name = %peer.server_name,
                 "relaying QUIC connection to stargate target"
             );
             peer
         }
-        QuicDispatchRoute::MissingSni => {
-            metrics.observe_quic_connection("missing_sni");
-            connection.close(0u32.into(), b"missing target SNI");
-            return Ok(());
-        }
-        QuicDispatchRoute::UnknownSni => {
-            metrics.observe_quic_connection("unknown_sni");
-            connection.close(0u32.into(), b"unknown target SNI");
-            return Ok(());
-        }
-        QuicDispatchRoute::TargetUnavailable => {
-            metrics.observe_quic_connection("target_unavailable");
-            connection.close(0u32.into(), b"target stargate not ready");
+        Err(rejection) => {
+            let (metric, reason) = rejection.metric_and_reason();
+            metrics.observe_quic_connection(metric);
+            connection.close(0u32.into(), reason);
             return Ok(());
         }
     };
-    match forward_quic_connection(
+    let relay_result = forward_quic_connection_until_shutdown(
         connection,
         &peer,
-        &relay_endpoints,
-        config.config.connect_timeout,
+        &relay.endpoints,
+        relay.connect_timeout,
+        shutdown.cancelled_owned(),
     )
-    .await
-    {
-        Ok(()) => {
-            metrics.observe_quic_connection("completed");
-            Ok(())
-        }
-        Err(error) => {
-            metrics.observe_quic_connection("relay_error");
-            Err(error)
-        }
-    }
-}
-
-enum QuicDispatchRoute {
-    Ready {
-        target_pod: String,
-        peer: PeerTarget,
-    },
-    MissingSni,
-    UnknownSni,
-    TargetUnavailable,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QuicRoute<'a> {
-    Ready {
-        target: &'a crate::endpoints::PodTarget,
-        server_name: &'a str,
-    },
-    MissingSni,
-    UnknownSni,
-    TargetUnavailable,
-}
-
-fn route_for_sni<'a>(
-    sni: Option<&'a str>,
-    targets: &'a TargetSnapshot,
-    config: &QuicRouterRuntimeConfig,
-) -> QuicRoute<'a> {
-    let Some(sni) = sni else {
-        return QuicRoute::MissingSni;
-    };
-    let Some(pod_name) = config
-        .hostname_matcher
-        .as_ref()
-        .and_then(|matcher| matcher.extract_pod(sni))
-    else {
-        return QuicRoute::UnknownSni;
-    };
-    let Some(target) = targets.target_for_pod_ref(pod_name) else {
-        return QuicRoute::TargetUnavailable;
-    };
-
-    QuicRoute::Ready {
-        target,
-        server_name: sni,
-    }
+    .await;
+    metrics.observe_quic_connection(if relay_result.is_ok() {
+        "completed"
+    } else {
+        "relay_error"
+    });
+    relay_result
 }
 
 fn build_client_config(cert_pem: Option<&[u8]>, insecure: bool) -> Result<ClientConfig> {
-    if insecure {
-        return stargate_tls::build_insecure_quic_client_config();
-    }
-    let cert_data = cert_pem.context("TLS cert required when --quic-insecure is not set")?;
-    let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut &*cert_data) {
-        roots
-            .add(cert.context("failed to parse router target cert PEM")?)
-            .context("failed to add router target cert to root store")?;
-    }
-
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    Ok(ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
-    )))
+    build_upstream_client_config(
+        cert_pem,
+        insecure,
+        Vec::new(),
+        "TLS cert required when --quic-insecure is not set",
+    )
 }
 
 fn build_server_config(
@@ -265,53 +304,41 @@ fn build_server_config(
     key_pem: Option<&[u8]>,
     relay_config: RelayEndpointConfig,
 ) -> Result<quinn::ServerConfig> {
-    let (cert_owned, key_owned);
-    let (cert_data, key_data) = match (cert_pem, key_pem) {
-        (Some(c), Some(k)) => (c, k),
-        (Some(_), None) => {
-            anyhow::bail!("router TLS key required when TLS cert is provided");
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("router TLS cert required when TLS key is provided");
-        }
-        _ => {
-            info!("no router TLS cert/key provided, generating self-signed certificate");
-            let (c, k) = stargate_tls::generate_self_signed_cert()?;
-            cert_owned = c;
-            key_owned = k;
-            (cert_owned.as_slice(), key_owned.as_slice())
-        }
-    };
-    let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut &*cert_data)
-            .collect::<std::result::Result<_, _>>()
-            .context("failed to parse router cert PEM")?;
-    let key = rustls_pemfile::private_key(&mut &*key_data)
-        .context("failed to parse router key PEM")?
-        .context("no private key found in router key PEM")?;
-    let mut server_config = quinn::ServerConfig::with_single_cert(cert_chain, key)
-        .context("build router QUIC server config failed")?;
-    server_config.transport_config(build_relay_transport_config(relay_config)?);
-    Ok(server_config)
+    match (cert_pem, key_pem) {
+        (Some(_), None) => anyhow::bail!("router TLS key required when TLS cert is provided"),
+        (None, Some(_)) => anyhow::bail!("router TLS cert required when TLS key is provided"),
+        _ => {}
+    }
+    if cert_pem.is_none() && key_pem.is_none() {
+        info!("no router TLS cert/key provided, generating self-signed certificate");
+    }
+    let identity = stargate_tls::ServerTlsIdentity::from_optional_pem(
+        cert_pem.map(ToOwned::to_owned),
+        key_pem.map(ToOwned::to_owned),
+    )?;
+    build_router_server_config(&identity, Vec::new(), relay_config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::hint::black_box;
     use std::time::Instant;
 
-    use crate::endpoints::PodTarget;
+    use crate::endpoints::{PodTarget, SniRouteRejection};
     use crate::perf_tests::assert_twenty_percent_faster;
 
-    fn cert_and_key() -> (Vec<u8>, Vec<u8>) {
+    fn install_crypto_provider() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    fn cert_and_key() -> (Vec<u8>, Vec<u8>) {
+        install_crypto_provider();
         stargate_tls::generate_self_signed_cert().expect("self-signed cert should generate")
     }
 
     fn cert_and_key_for_names(names: Vec<String>) -> (Vec<u8>, Vec<u8>) {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        install_crypto_provider();
         stargate_tls::generate_self_signed_cert_for_names(names)
             .expect("self-signed cert should generate")
     }
@@ -326,37 +353,73 @@ mod tests {
             relay_keep_alive_interval: Some(Duration::from_secs(5)),
             tls_cert_pem: None,
             tls_key_pem: None,
+            upstream_tls_cert_pem: None,
+            server_identity_reloader: None,
+            tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
             quic_insecure: true,
         }
     }
 
+    #[test]
+    fn explicit_upstream_trust_precedes_serving_certificate() {
+        let mut config = test_config();
+        config.tls_cert_pem = Some(b"serving certificate".to_vec());
+        config.upstream_tls_cert_pem = Some(b"upstream CA".to_vec());
+
+        assert_eq!(upstream_trust_pem(&config), Some(b"upstream CA".as_slice()));
+    }
+
+    #[test]
+    fn serving_certificate_remains_upstream_trust_fallback() {
+        let mut config = test_config();
+        config.tls_cert_pem = Some(b"serving certificate".to_vec());
+
+        assert_eq!(
+            upstream_trust_pem(&config),
+            Some(b"serving certificate".as_slice())
+        );
+    }
+
     fn snapshot_with_quic_target(pod_name: &str, quic_addr: SocketAddr) -> TargetSnapshot {
-        TargetSnapshot::initialized(BTreeMap::from([(
-            pod_name.to_string(),
-            PodTarget {
-                pod_name: pod_name.to_string(),
-                grpc_addr: "127.0.0.1:50071".to_string(),
-                quic_addr: quic_addr.to_string(),
-            },
-        )]))
+        TargetSnapshot::initialized([PodTarget {
+            pod_name: pod_name.to_string(),
+            grpc_addr: "127.0.0.1:50071".to_string(),
+            quic_addr: quic_addr.to_string(),
+        }])
     }
 
     fn synthetic_snapshot(count: usize) -> TargetSnapshot {
-        TargetSnapshot::initialized(
-            (0..count)
-                .map(|index| {
-                    let pod_name = format!("stargate-{index}");
-                    (
-                        pod_name.clone(),
-                        PodTarget {
-                            pod_name,
-                            grpc_addr: format!("10.0.0.{index}:50071"),
-                            quic_addr: format!("10.0.0.{index}:50072"),
-                        },
-                    )
-                })
-                .collect::<BTreeMap<_, _>>(),
+        TargetSnapshot::initialized((0..count).map(|index| {
+            let pod_name = format!("stargate-{index}");
+            PodTarget {
+                pod_name,
+                grpc_addr: format!("10.0.0.{index}:50071"),
+                quic_addr: format!("10.0.0.{index}:50072"),
+            }
+        }))
+    }
+
+    fn matcher(config: &QuicRouterConfig) -> Option<HostnameMatcher> {
+        HostnameMatcher::new(
+            &config.advertised_hostname_template,
+            &config.target_namespace,
         )
+    }
+
+    fn assert_ready_route(
+        route: Result<(&PodTarget, &str), SniRouteRejection>,
+        expected_server_name: &str,
+    ) {
+        let (target, server_name) = route.expect("route should be ready");
+        assert_eq!(target.pod_name, "stargate-1");
+        assert_eq!(target.quic_addr, "127.0.0.1:50072");
+        assert_eq!(server_name, expected_server_name);
+    }
+
+    fn assert_server_config_error(cert_pem: Option<&[u8]>, key_pem: Option<&[u8]>, expected: &str) {
+        let error = build_server_config(cert_pem, key_pem, RelayEndpointConfig::default())
+            .expect_err("server config should be rejected");
+        assert!(error.to_string().contains(expected), "unexpected: {error}");
     }
 
     fn server_config_from_pem(
@@ -386,12 +449,17 @@ mod tests {
         let router_addr = router_server.local_addr().expect("router local addr");
         let snapshot = snapshot_with_quic_target("stargate-1", target_addr);
         let (_targets_tx, targets_rx) = watch::channel(snapshot);
-        let relay_endpoints = Arc::new(
-            build_relay_endpoints(RelayEndpointConfig::default(), router_target_client_config)
-                .expect("relay endpoints"),
-        );
+        let config = test_config();
+        let relay = Arc::new(QuicRelay {
+            endpoints: build_relay_endpoints(
+                RelayEndpointConfig::default(),
+                router_target_client_config,
+            )
+            .expect("relay endpoints"),
+            hostname_matcher: matcher(&config),
+            connect_timeout: config.connect_timeout,
+        });
         let metrics = Arc::new(RouterMetrics::new().expect("router metrics"));
-        let config = Arc::new(QuicRouterRuntimeConfig::new(test_config()));
 
         let target_task = tokio::spawn(async move {
             let incoming = target_server.accept().await.expect("target should accept");
@@ -414,9 +482,15 @@ mod tests {
 
         let router_task = tokio::spawn(async move {
             let incoming = router_server.accept().await.expect("router should accept");
-            dispatch_incoming(incoming, targets_rx, relay_endpoints, metrics, config)
-                .await
-                .expect("router should dispatch incoming connection");
+            dispatch_incoming(
+                incoming,
+                targets_rx,
+                relay,
+                metrics,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("router should dispatch incoming connection");
         });
 
         let mut client_endpoint =
@@ -452,22 +526,38 @@ mod tests {
     #[test]
     fn server_config_rejects_cert_without_key() {
         let (cert, _) = cert_and_key();
-
-        let error =
-            build_server_config(Some(cert.as_slice()), None, RelayEndpointConfig::default())
-                .expect_err("key should be required");
-
-        assert!(error.to_string().contains("TLS key required"));
+        assert_server_config_error(Some(&cert), None, "TLS key required");
     }
 
     #[test]
     fn server_config_rejects_key_without_cert() {
         let (_, key) = cert_and_key();
+        assert_server_config_error(None, Some(&key), "TLS cert required");
+    }
 
-        let error = build_server_config(None, Some(key.as_slice()), RelayEndpointConfig::default())
-            .expect_err("cert should be required");
+    #[test]
+    fn quic_server_config_builds_with_provided_cert_key() {
+        let (cert, key) = cert_and_key();
+        assert!(
+            build_server_config(Some(&cert), Some(&key), RelayEndpointConfig::default()).is_ok()
+        );
+    }
 
-        assert!(error.to_string().contains("TLS cert required"));
+    #[test]
+    fn quic_server_config_generates_self_signed_identity_when_tls_absent() {
+        assert!(build_server_config(None, None, RelayEndpointConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn quic_server_config_rejects_invalid_cert_pem() {
+        let (_, key) = cert_and_key();
+        assert_server_config_error(Some(b"not a cert"), Some(&key), "no certificate found");
+    }
+
+    #[test]
+    fn quic_server_config_rejects_invalid_key_pem() {
+        let (cert, _) = cert_and_key();
+        assert_server_config_error(Some(&cert), Some(b"not a key"), "no private key found");
     }
 
     #[test]
@@ -475,49 +565,54 @@ mod tests {
         let error =
             build_client_config(None, false).expect_err("secure client config should require cert");
 
-        assert!(error.to_string().contains("TLS cert required"));
+        assert!(
+            error
+                .to_string()
+                .contains("TLS cert required when --quic-insecure is not set")
+        );
     }
 
     #[test]
     fn route_for_sni_returns_ready_peer_for_matching_target() {
         let target_addr: SocketAddr = "127.0.0.1:50072".parse().expect("valid target addr");
         let snapshot = snapshot_with_quic_target("stargate-1", target_addr);
-        let route = route_for_sni(
-            Some("stargate-1.stargate.external"),
-            &snapshot,
-            &QuicRouterRuntimeConfig::new(test_config()),
+        let config = test_config();
+        assert_ready_route(
+            ready_target_for_sni(
+                Some("stargate-1.stargate.external"),
+                &snapshot,
+                matcher(&config).as_ref(),
+            ),
+            "stargate-1.stargate.external",
         );
-
-        match route {
-            QuicRoute::Ready {
-                target,
-                server_name,
-            } => {
-                assert_eq!(target.pod_name, "stargate-1");
-                assert_eq!(target.quic_addr, "127.0.0.1:50072");
-                assert_eq!(server_name, "stargate-1.stargate.external");
-            }
-            route => panic!("unexpected route: {route:?}"),
-        }
     }
 
     #[test]
     fn route_for_sni_rejects_missing_unknown_and_unready_targets() {
         let target_addr: SocketAddr = "127.0.0.1:50072".parse().expect("valid target addr");
         let snapshot = snapshot_with_quic_target("stargate-1", target_addr);
-        let config = QuicRouterRuntimeConfig::new(test_config());
+        let config = test_config();
+        let matcher = matcher(&config);
 
         assert_eq!(
-            route_for_sni(None, &snapshot, &config),
-            QuicRoute::MissingSni
+            ready_target_for_sni(None, &snapshot, matcher.as_ref()),
+            Err(SniRouteRejection::MissingSni)
         );
         assert_eq!(
-            route_for_sni(Some("stargate-1.other.example"), &snapshot, &config),
-            QuicRoute::UnknownSni
+            ready_target_for_sni(
+                Some("stargate-1.other.example"),
+                &snapshot,
+                matcher.as_ref(),
+            ),
+            Err(SniRouteRejection::UnknownSni)
         );
         assert_eq!(
-            route_for_sni(Some("stargate-2.stargate.external"), &snapshot, &config),
-            QuicRoute::TargetUnavailable
+            ready_target_for_sni(
+                Some("stargate-2.stargate.external"),
+                &snapshot,
+                matcher.as_ref(),
+            ),
+            Err(SniRouteRejection::TargetUnavailable)
         );
     }
 
@@ -529,25 +624,16 @@ mod tests {
         config.advertised_hostname_template =
             "{pod_name}.{namespace}.stargate.external".to_string();
         config.target_namespace = "prod".to_string();
-        let config = QuicRouterRuntimeConfig::new(config);
+        let matcher = matcher(&config);
 
-        let route = route_for_sni(
-            Some("stargate-1.prod.stargate.external"),
-            &snapshot,
-            &config,
+        assert_ready_route(
+            ready_target_for_sni(
+                Some("stargate-1.prod.stargate.external"),
+                &snapshot,
+                matcher.as_ref(),
+            ),
+            "stargate-1.prod.stargate.external",
         );
-
-        match route {
-            QuicRoute::Ready {
-                target,
-                server_name,
-            } => {
-                assert_eq!(target.pod_name, "stargate-1");
-                assert_eq!(target.quic_addr, "127.0.0.1:50072");
-                assert_eq!(server_name, "stargate-1.prod.stargate.external");
-            }
-            route => panic!("unexpected route: {route:?}"),
-        }
     }
 
     #[test]
@@ -556,21 +642,19 @@ mod tests {
         const BASELINE_NS_PER_OP: f64 = 265.32;
 
         let snapshot = synthetic_snapshot(128);
-        let config = QuicRouterRuntimeConfig::new(test_config());
+        let config = test_config();
+        let matcher = matcher(&config);
         let iterations = 1_000_000usize;
         let started = Instant::now();
         let mut checksum = 0usize;
 
         for _ in 0..iterations {
-            match route_for_sni(
+            match ready_target_for_sni(
                 black_box(Some("stargate-64.stargate.external")),
                 black_box(&snapshot),
-                black_box(&config),
+                black_box(matcher.as_ref()),
             ) {
-                QuicRoute::Ready {
-                    target,
-                    server_name,
-                } => {
+                Ok((target, server_name)) => {
                     checksum = checksum
                         .wrapping_add(target.pod_name.len())
                         .wrapping_add(target.quic_addr.len())
@@ -594,7 +678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quic_router_relays_custom_bidi_streams_by_sni() {
+    async fn quic_router_relays_raw_quic_bidi_streams_by_sni() {
         let (router_cert, router_key) = cert_and_key();
         let (target_cert, target_key) = cert_and_key();
         assert_bidi_relay(
@@ -604,6 +688,183 @@ mod tests {
             build_client_config(None, true).expect("insecure relay client config"),
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    async fn handshake_trusting(addr: SocketAddr, server_name: &str, trusted: &[u8]) -> Result<()> {
+        let mut client = Endpoint::client("127.0.0.1:0".parse().expect("client bind address"))?;
+        client.set_default_client_config(build_client_config(Some(trusted), false)?);
+        let connection = client.connect(addr, server_name)?.await?;
+        connection.close(0u32.into(), b"test complete");
+        Ok(())
+    }
+
+    /// Drives the Raw QUIC listener reload task end to end: a rotated generation
+    /// is served to new handshakes, and an inconsistent generation is rejected
+    /// while the last-known-good identity keeps serving.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_router_reloads_projected_server_identity() {
+        install_crypto_provider();
+        let server_name = "stargate-1.stargate.external";
+        let root = tempfile::TempDir::new().expect("create TLS test directory");
+        let (first_cert, first_key) = cert_and_key_for_names(vec![server_name.to_string()]);
+        let (second_cert, second_key) = cert_and_key_for_names(vec![server_name.to_string()]);
+        crate::tls::install_projected_identity(root.path(), "..2026_01", &first_cert, &first_key);
+
+        // A black-hole relay target keeps each downstream connection open while
+        // its upstream dial hangs, so the assertions only observe the handshake.
+        let black_hole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("black-hole upstream socket should bind");
+        let (_targets_tx, targets_rx) = watch::channel(snapshot_with_quic_target(
+            "stargate-1",
+            black_hole
+                .local_addr()
+                .expect("black-hole upstream address should be readable"),
+        ));
+
+        let mut config = test_config();
+        config.connect_timeout = Duration::from_secs(30);
+        config.tls_reload_interval = Duration::from_millis(20);
+        config.server_identity_reloader = Some(
+            stargate_tls::ServerIdentityReloader::load(
+                root.path().join("tls.crt"),
+                root.path().join("tls.key"),
+            )
+            .expect("initial identity should load"),
+        );
+
+        let metrics = Arc::new(RouterMetrics::new().expect("router metrics"));
+        let shutdown = CancellationToken::new();
+        let runtime = QuicRouterRuntime::bind(config, TaskTracker::new())
+            .expect("router should bind with a mounted identity");
+        let addr = runtime.bound_addr;
+        let router = tokio::spawn(runtime.serve(targets_rx, metrics.clone(), shutdown.clone()));
+
+        handshake_trusting(addr, server_name, &first_cert)
+            .await
+            .expect("initial identity should serve");
+
+        crate::tls::install_projected_identity(root.path(), "..2026_02", &second_cert, &second_key);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if handshake_trusting(addr, server_name, &second_cert)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "rotated identity was never served"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            handshake_trusting(addr, server_name, &first_cert)
+                .await
+                .is_err(),
+            "the replaced identity must stop being served"
+        );
+
+        // A certificate that does not match its key is an inconsistent
+        // generation. It must be rejected and leave the active identity alone.
+        crate::tls::install_projected_identity(root.path(), "..2026_bad", &first_cert, &second_key);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handshake_trusting(addr, server_name, &second_cert)
+            .await
+            .expect("a rejected generation must retain the last-known-good identity");
+        assert!(
+            metrics.gather().expect("metrics should encode").contains(
+                r#"tls_reloads_total{material_type="server_identity",result="rejected"} 1"#
+            ),
+            "a rejected generation must be counted"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), router).await;
+    }
+
+    #[tokio::test]
+    async fn quic_router_cancellation_stops_after_startup() {
+        install_crypto_provider();
+        let (_targets_tx, targets_rx) = watch::channel(TargetSnapshot::default());
+        let metrics = Arc::new(RouterMetrics::new().expect("router metrics"));
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_quic_router(
+                test_config(),
+                targets_rx,
+                metrics,
+                shutdown,
+                TaskTracker::new(),
+            ),
+        )
+        .await
+        .expect("router should observe cancellation");
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_router_shutdown_cancels_active_relay_and_drains_tracker() {
+        install_crypto_provider();
+        let upstream_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("black-hole upstream socket should bind");
+        let mut config = test_config();
+        config.connect_timeout = Duration::from_secs(30);
+        let snapshot = snapshot_with_quic_target(
+            "stargate-1",
+            upstream_socket
+                .local_addr()
+                .expect("black-hole upstream address should be readable"),
+        );
+        let (_targets_tx, targets_rx) = watch::channel(snapshot);
+        let metrics = Arc::new(RouterMetrics::new().expect("router metrics"));
+        let shutdown = CancellationToken::new();
+        let connection_tasks = TaskTracker::new();
+        let runtime = QuicRouterRuntime::bind(config, connection_tasks.clone())
+            .expect("router listener should bind");
+        let router_addr = runtime.bound_addr;
+        let router_task = tokio::spawn(runtime.serve(targets_rx, metrics, shutdown.clone()));
+
+        let mut client_endpoint =
+            Endpoint::client("127.0.0.1:0".parse().expect("valid client bind"))
+                .expect("client endpoint should bind");
+        client_endpoint.set_default_client_config(
+            build_client_config(None, true).expect("insecure client config should build"),
+        );
+        let client_connection = client_endpoint
+            .connect(router_addr, "stargate-1.stargate.external")
+            .expect("start router connection")
+            .await
+            .expect("router connection should establish");
+
+        let mut datagram = [0_u8; 2048];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            upstream_socket.recv_from(&mut datagram),
+        )
+        .await
+        .expect("active relay should attempt the upstream QUIC handshake")
+        .expect("black-hole upstream socket should receive a QUIC datagram");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), router_task)
+            .await
+            .expect("router root should stop after cancellation")
+            .expect("router task should not panic")
+            .expect("router root should return cleanly");
+        connection_tasks.close();
+        tokio::time::timeout(Duration::from_secs(1), connection_tasks.wait())
+            .await
+            .expect("active relay task should drain after cancellation");
+        client_connection.close(0u32.into(), b"test complete");
     }
 
     #[tokio::test]

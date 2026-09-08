@@ -21,8 +21,9 @@ Spec 8.4 of the combined SRD/SDD: the T1-T7 matrix that gates each release.
 ## Prerequisites
 
 - A host with k3d, helmfile, helm, and a working kubectl context.
-- `STACK_PATH` env var pointing at a checked-out `nvcf-self-managed-stack`.
-- `STACK_PATH_NEXT` env var (optional): second stack version for T5 (version-upgrade). T5 self-skips when unset.
+- `CONTROL_PLANE_STACK_PATH` env var pointing at a checked-out control-plane stack (`nvcf-self-managed-stack`).
+- `COMPUTE_PLANE_STACK_PATH` env var pointing at a checked-out compute-plane stack (`nvcf-compute-plane-stack`).
+- `CONTROL_PLANE_STACK_PATH_NEXT` and `COMPUTE_PLANE_STACK_PATH_NEXT` env vars (optional): second stack versions for T5 (version-upgrade). T5 self-skips when unset.
 - A valid admin JWT in `$NVCF_TOKEN` env var. Easiest source: `nvcf-cli init` (interactive), then extract the JWT from `~/.nvcf-cli.state`'s `token` field:
 
 ```bash
@@ -48,7 +49,8 @@ export E2E_CLUSTER_CREATE_CMD='make -C ../../ncp-local-cluster build-and-deploy-
 
 ```bash
 # From the monorepo root
-export STACK_PATH=/path/to/nvcf-self-managed-stack
+export CONTROL_PLANE_STACK_PATH=/path/to/nvcf-self-managed-stack
+export COMPUTE_PLANE_STACK_PATH=/path/to/nvcf-compute-plane-stack
 export NVCF_TOKEN=$(jq -r .token ~/.nvcf-cli.state)
 
 # Build the CLI under test
@@ -76,7 +78,7 @@ build-tooling MR that introduced the rest of the Bazel wiring.
 | T2 | ~10-12 min |
 | T3 | ~8 min |
 | T4 | ~8 min |
-| T5 | ~6 min (or skipped if `STACK_PATH_NEXT` is unset) |
+| T5 | ~6 min (or skipped if `CONTROL_PLANE_STACK_PATH_NEXT` and `COMPUTE_PLANE_STACK_PATH_NEXT` are unset) |
 | T6 | skipped (orchestrator lock not yet implemented; see test code) |
 | T7 | ~2 min |
 | Total | ~45-60 min (with T5 and T6 excluded) |

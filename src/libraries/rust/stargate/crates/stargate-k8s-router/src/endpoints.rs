@@ -16,8 +16,8 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice};
+use stargate_forwarding::HostnameMatcher;
 
 pub const ENDPOINT_SLICE_SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
@@ -30,19 +30,22 @@ pub struct PodTarget {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TargetSnapshot {
-    pub initialized: bool,
-    pub targets: BTreeMap<String, PodTarget>,
-    pub ready_targets: Vec<PodTarget>,
+    ready: Option<Vec<PodTarget>>,
 }
 
 impl TargetSnapshot {
-    pub fn initialized(targets: BTreeMap<String, PodTarget>) -> Self {
-        let ready_targets = targets.values().cloned().collect();
-        Self {
-            initialized: true,
-            targets,
-            ready_targets,
-        }
+    pub fn initialized(targets: impl IntoIterator<Item = PodTarget>) -> Self {
+        let ready = targets
+            .into_iter()
+            .map(|target| (target.pod_name.clone(), target))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        Self { ready: Some(ready) }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.ready.is_some()
     }
 
     pub fn target_for_pod(&self, pod_name: &str) -> Option<PodTarget> {
@@ -50,24 +53,60 @@ impl TargetSnapshot {
     }
 
     pub fn target_for_pod_ref(&self, pod_name: &str) -> Option<&PodTarget> {
-        self.targets.get(pod_name)
-    }
-
-    pub fn first_ready(&self, offset: usize) -> Option<PodTarget> {
-        self.first_ready_ref(offset).cloned()
+        let targets = self.ready_targets()?;
+        let index = targets
+            .binary_search_by(|target| target.pod_name.as_str().cmp(pod_name))
+            .ok()?;
+        targets.get(index)
     }
 
     pub fn first_ready_ref(&self, offset: usize) -> Option<&PodTarget> {
-        if self.ready_targets.is_empty() {
+        let targets = self.ready_targets()?;
+        if targets.is_empty() {
             return None;
         }
-        let index = offset % self.ready_targets.len();
-        self.ready_targets.get(index)
+        targets.get(offset % targets.len())
     }
 
     pub fn ready_count(&self) -> usize {
-        self.ready_targets.len()
+        self.ready_targets().map_or(0, <[PodTarget]>::len)
     }
+
+    pub fn ready_targets(&self) -> Option<&[PodTarget]> {
+        self.ready.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SniRouteRejection {
+    MissingSni,
+    UnknownSni,
+    TargetUnavailable,
+}
+
+impl SniRouteRejection {
+    pub(crate) fn metric_and_reason(self) -> (&'static str, &'static [u8]) {
+        match self {
+            Self::MissingSni => ("missing_sni", b"missing target SNI"),
+            Self::UnknownSni => ("unknown_sni", b"unknown target SNI"),
+            Self::TargetUnavailable => ("target_unavailable", b"target stargate not ready"),
+        }
+    }
+}
+
+pub(crate) fn ready_target_for_sni<'target, 'sni>(
+    sni: Option<&'sni str>,
+    targets: &'target TargetSnapshot,
+    hostname_matcher: Option<&HostnameMatcher>,
+) -> Result<(&'target PodTarget, &'sni str), SniRouteRejection> {
+    let sni = sni.ok_or(SniRouteRejection::MissingSni)?;
+    let pod_name = hostname_matcher
+        .and_then(|matcher| matcher.extract_pod(sni))
+        .ok_or(SniRouteRejection::UnknownSni)?;
+    let target = targets
+        .target_for_pod_ref(pod_name)
+        .ok_or(SniRouteRejection::TargetUnavailable)?;
+    Ok((target, sni))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,37 +120,24 @@ pub fn snapshot_from_slices<'a>(
     slices: impl IntoIterator<Item = &'a EndpointSlice>,
     config: &TargetBuildConfig,
 ) -> TargetSnapshot {
-    let mut targets = BTreeMap::new();
-    for slice in slices {
-        if !slice_belongs_to_service(slice, &config.service_name) {
-            continue;
-        }
-
-        let Some(ports) = slice.ports.as_deref() else {
-            continue;
-        };
-        let Some(grpc_port) = named_port(ports, &config.grpc_port_name, "TCP") else {
-            continue;
-        };
-        let Some(quic_port) = named_port(ports, &config.quic_port_name, "UDP") else {
-            continue;
-        };
-
-        for endpoint in &slice.endpoints {
-            let Some(target) = target_from_endpoint(endpoint, grpc_port, quic_port) else {
-                continue;
-            };
-            targets.insert(target.pod_name.clone(), target);
-        }
-    }
+    let targets = slices
+        .into_iter()
+        .filter(|slice| slice_belongs_to_service(slice, &config.service_name))
+        .filter_map(|slice| {
+            let ports = slice.ports.as_deref()?;
+            Some((
+                slice,
+                named_port(ports, &config.grpc_port_name, "TCP")?,
+                named_port(ports, &config.quic_port_name, "UDP")?,
+            ))
+        })
+        .flat_map(|(slice, grpc_port, quic_port)| {
+            slice
+                .endpoints
+                .iter()
+                .filter_map(move |endpoint| target_from_endpoint(endpoint, grpc_port, quic_port))
+        });
     TargetSnapshot::initialized(targets)
-}
-
-pub fn snapshot_from_slice_store(
-    slices: &BTreeMap<String, EndpointSlice>,
-    config: &TargetBuildConfig,
-) -> TargetSnapshot {
-    snapshot_from_slices(slices.values(), config)
 }
 
 fn slice_belongs_to_service(slice: &EndpointSlice, service_name: &str) -> bool {
@@ -124,28 +150,22 @@ fn slice_belongs_to_service(slice: &EndpointSlice, service_name: &str) -> bool {
 }
 
 fn named_port(ports: &[EndpointPort], name: &str, protocol: &str) -> Option<u16> {
-    ports.iter().find_map(|port| {
-        if port.name.as_deref() != Some(name) {
-            return None;
-        }
-        if !port
-            .protocol
-            .as_deref()
-            .unwrap_or("TCP")
-            .eq_ignore_ascii_case(protocol)
-        {
-            return None;
-        }
-        let value = port.port?;
-        u16::try_from(value).ok().filter(|p| *p > 0)
-    })
+    let port = ports.iter().find(|port| {
+        port.name.as_deref() == Some(name)
+            && port
+                .protocol
+                .as_deref()
+                .unwrap_or("TCP")
+                .eq_ignore_ascii_case(protocol)
+    })?;
+    u16::try_from(port.port?).ok().filter(|port| *port > 0)
 }
 
 fn target_from_endpoint(endpoint: &Endpoint, grpc_port: u16, quic_port: u16) -> Option<PodTarget> {
     if !endpoint_is_ready(endpoint.conditions.as_ref()) {
         return None;
     }
-    let pod_name = endpoint_pod_name(endpoint)?;
+    let pod_name = endpoint_pod_name(endpoint)?.to_owned();
     let address = endpoint.addresses.first()?;
     Some(PodTarget {
         pod_name,
@@ -156,23 +176,16 @@ fn target_from_endpoint(endpoint: &Endpoint, grpc_port: u16, quic_port: u16) -> 
 
 fn endpoint_is_ready(conditions: Option<&EndpointConditions>) -> bool {
     let ready = conditions.and_then(|c| c.ready).unwrap_or(true);
-    let serving = conditions.and_then(|c| c.serving).unwrap_or(true);
     let terminating = conditions.and_then(|c| c.terminating).unwrap_or(false);
-    ready && serving && !terminating
+    ready && !terminating
 }
 
-fn endpoint_pod_name(endpoint: &Endpoint) -> Option<String> {
-    if let Some(name) = endpoint.target_ref.as_ref().and_then(pod_target_name) {
-        return Some(name);
-    }
-    endpoint.hostname.clone()
-}
-
-fn pod_target_name(target_ref: &ObjectReference) -> Option<String> {
-    if target_ref.kind.as_deref().is_some_and(|kind| kind != "Pod") {
-        return None;
-    }
-    target_ref.name.clone()
+fn endpoint_pod_name(endpoint: &Endpoint) -> Option<&str> {
+    endpoint
+        .target_ref
+        .as_ref()
+        .filter(|target| target.kind.as_deref().is_none_or(|kind| kind == "Pod"))
+        .and_then(|target| target.name.as_deref())
 }
 
 fn socket_addr(address: &str, port: u16) -> String {
@@ -186,6 +199,7 @@ fn socket_addr(address: &str, port: u16) -> String {
 mod tests {
     use super::*;
     use crate::perf_tests::assert_twenty_percent_faster;
+    use k8s_openapi::api::core::v1::ObjectReference;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::hint::black_box;
     use std::time::Instant;
@@ -240,21 +254,109 @@ mod tests {
         }
     }
 
+    fn target(name: &str, ip: &str) -> PodTarget {
+        PodTarget {
+            pod_name: name.to_string(),
+            grpc_addr: format!("{ip}:50071"),
+            quic_addr: format!("{ip}:50072"),
+        }
+    }
+
+    fn conditions(
+        ready: Option<bool>,
+        serving: Option<bool>,
+        terminating: Option<bool>,
+    ) -> Option<EndpointConditions> {
+        Some(EndpointConditions {
+            ready,
+            serving,
+            terminating,
+        })
+    }
+
     fn many_targets(count: usize) -> TargetSnapshot {
-        let targets = (0..count)
+        let targets: Vec<_> = (0..count)
             .map(|index| {
                 let pod_name = format!("stargate-{index}");
-                (
-                    pod_name.clone(),
-                    PodTarget {
-                        pod_name,
-                        grpc_addr: format!("10.0.0.{index}:50071"),
-                        quic_addr: format!("10.0.0.{index}:50072"),
-                    },
-                )
+                target(&pod_name, &format!("10.0.0.{index}"))
             })
             .collect();
         TargetSnapshot::initialized(targets)
+    }
+
+    #[test]
+    fn initialized_snapshot_owns_one_stable_ready_target_sequence() {
+        let snapshot = TargetSnapshot::initialized(vec![
+            target("stargate-1", "10.0.0.11"),
+            target("stargate-0", "10.0.0.10"),
+        ]);
+
+        assert!(snapshot.is_initialized());
+        assert_eq!(
+            snapshot
+                .first_ready_ref(0)
+                .map(|target| target.pod_name.as_str()),
+            Some("stargate-0")
+        );
+        assert_eq!(
+            snapshot
+                .first_ready_ref(1)
+                .map(|target| target.pod_name.as_str()),
+            Some("stargate-1")
+        );
+        assert_eq!(
+            snapshot
+                .target_for_pod_ref("stargate-1")
+                .map(|target| target.grpc_addr.as_str()),
+            Some("10.0.0.11:50071")
+        );
+        assert!(std::ptr::eq(
+            snapshot
+                .first_ready_ref(1)
+                .expect("ordered target should exist"),
+            snapshot
+                .target_for_pod_ref("stargate-1")
+                .expect("named target should exist")
+        ));
+        assert!(!TargetSnapshot::default().is_initialized());
+    }
+
+    #[test]
+    fn initialized_snapshot_normalizes_duplicate_pods_by_last_observation() {
+        let snapshot = TargetSnapshot::initialized([
+            target("stargate-0", "10.0.0.10"),
+            target("stargate-0", "10.0.0.11"),
+        ]);
+
+        assert_eq!(snapshot.ready_count(), 1);
+        assert_eq!(
+            snapshot
+                .target_for_pod_ref("stargate-0")
+                .map(|target| target.grpc_addr.as_str()),
+            Some("10.0.0.11:50071")
+        );
+    }
+
+    #[test]
+    fn snapshot_normalizes_duplicate_pod_targets_across_slices() {
+        let first = slice(
+            "slice-a",
+            vec![endpoint("request-router-abc", "10.0.0.10", None)],
+        );
+        let replacement = slice(
+            "slice-b",
+            vec![endpoint("request-router-abc", "10.0.0.11", None)],
+        );
+
+        let snapshot = snapshot_from_slices([&first, &replacement], &config());
+
+        assert_eq!(snapshot.ready_count(), 1);
+        assert_eq!(
+            snapshot
+                .target_for_pod("request-router-abc")
+                .map(|target| target.grpc_addr),
+            Some("10.0.0.11:50071".to_string())
+        );
     }
 
     #[test]
@@ -264,25 +366,51 @@ mod tests {
             vec![endpoint(
                 "stargate-0",
                 "10.0.0.10",
-                Some(EndpointConditions {
-                    ready: Some(true),
-                    serving: Some(true),
-                    terminating: Some(false),
-                }),
+                conditions(Some(true), Some(true), Some(false)),
             )],
         );
 
         let snapshot = snapshot_from_slices([&slice], &config());
 
-        assert!(snapshot.initialized);
+        assert!(snapshot.is_initialized());
         assert_eq!(
             snapshot.target_for_pod("stargate-0"),
-            Some(PodTarget {
-                pod_name: "stargate-0".to_string(),
-                grpc_addr: "10.0.0.10:50071".to_string(),
-                quic_addr: "10.0.0.10:50072".to_string(),
-            })
+            Some(target("stargate-0", "10.0.0.10"))
         );
+    }
+
+    #[test]
+    fn snapshot_uses_target_ref_name_instead_of_endpoint_hostname_alias() {
+        let mut pod = endpoint("request-router-7d9c6f64f5-mz2qk", "10.0.0.10", None);
+        pod.hostname = Some("10-0-0-10".to_string());
+        let slice = slice("slice-a", vec![pod]);
+
+        let snapshot = snapshot_from_slices([&slice], &config());
+
+        assert_eq!(snapshot.ready_count(), 1);
+        assert!(
+            snapshot
+                .target_for_pod("request-router-7d9c6f64f5-mz2qk")
+                .is_some()
+        );
+        assert!(snapshot.target_for_pod("10-0-0-10").is_none());
+    }
+
+    #[test]
+    fn snapshot_ignores_hostname_alias_without_pod_target_ref() {
+        let slice = slice(
+            "slice-a",
+            vec![Endpoint {
+                addresses: vec!["10.0.0.10".to_string()],
+                hostname: Some("10-0-0-10".to_string()),
+                ..Endpoint::default()
+            }],
+        );
+
+        let snapshot = snapshot_from_slices([&slice], &config());
+
+        assert_eq!(snapshot.ready_count(), 0);
+        assert!(snapshot.target_for_pod("10-0-0-10").is_none());
     }
 
     #[test]
@@ -295,40 +423,45 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_excludes_unready_serving_false_and_terminating_endpoints() {
+    fn snapshot_includes_published_warming_endpoint() {
+        let slice = slice(
+            "slice-a",
+            vec![endpoint(
+                "warming",
+                "10.0.0.10",
+                conditions(Some(true), Some(false), Some(false)),
+            )],
+        );
+
+        let snapshot = snapshot_from_slices([&slice], &config());
+
+        assert_eq!(
+            snapshot.target_for_pod("warming"),
+            Some(target("warming", "10.0.0.10"))
+        );
+    }
+
+    #[test]
+    fn snapshot_excludes_unready_and_terminating_endpoints() {
         let slice = slice(
             "slice-a",
             vec![
                 endpoint(
                     "unready",
                     "10.0.0.10",
-                    Some(EndpointConditions {
-                        ready: Some(false),
-                        ..EndpointConditions::default()
-                    }),
-                ),
-                endpoint(
-                    "not-serving",
-                    "10.0.0.11",
-                    Some(EndpointConditions {
-                        serving: Some(false),
-                        ..EndpointConditions::default()
-                    }),
+                    conditions(Some(false), Some(false), Some(false)),
                 ),
                 endpoint(
                     "terminating",
-                    "10.0.0.12",
-                    Some(EndpointConditions {
-                        terminating: Some(true),
-                        ..EndpointConditions::default()
-                    }),
+                    "10.0.0.11",
+                    conditions(Some(true), Some(true), Some(true)),
                 ),
             ],
         );
 
         let snapshot = snapshot_from_slices([&slice], &config());
 
-        assert!(snapshot.targets.is_empty());
+        assert_eq!(snapshot.ready_count(), 0);
     }
 
     #[test]
@@ -338,10 +471,7 @@ mod tests {
             vec![endpoint(
                 "stargate-0",
                 "10.0.0.10",
-                Some(EndpointConditions {
-                    ready: Some(true),
-                    ..EndpointConditions::default()
-                }),
+                conditions(Some(true), None, None),
             )],
         );
         slice.ports = Some(vec![EndpointPort {
@@ -353,7 +483,7 @@ mod tests {
 
         let snapshot = snapshot_from_slices([&slice], &config());
 
-        assert!(snapshot.targets.is_empty());
+        assert_eq!(snapshot.ready_count(), 0);
     }
 
     #[test]

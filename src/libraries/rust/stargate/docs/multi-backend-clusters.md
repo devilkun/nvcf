@@ -1,6 +1,6 @@
 # Multi-Backend Cluster Routing
 
-> Type: Reference. Source: implemented Stargate and pylon cluster routing behavior.
+Source: implemented Stargate and pylon cluster routing behavior.
 
 Stargate routes at cluster level and executes at backend level.
 
@@ -10,7 +10,7 @@ cluster.
 ## Identities
 
 - `inference_server_id`: concrete pylon/backend registration id. It remains the
-  QUIC pool key, response header, and compatibility metric label.
+  QUIC pool key, response header, and metric label.
 - `cluster_id`: logical hardware/capacity domain. Empty means
   `cluster_id == inference_server_id`.
 - routing target: `(routing_key, model_id)`.
@@ -21,15 +21,31 @@ Pylon supports `--cluster-id`; default is `--inference-server-id`.
 
 ```text
 (routing_key, model_id)
-  -> cluster_id
-     -> active backend_id set
-     -> aggregated cluster snapshot
+  -> active target generation
+     -> active backend count
+     -> cluster_id
+        -> exact registration-cluster generation
+        -> shared immutable backend publications
+           -> exact registration generation
+           -> exported routing data
+        -> aggregated cluster snapshot
 
 backend_id
-  -> registration stream
+  -> exact running registration
   -> QUIC/reverse tunnel delivery target
-  -> latest per-model backend snapshot
+  -> latest per-model backend publication
 ```
+
+Target cluster membership, active-backend count, and final retirement change
+as one generation. The final empty generation retires while its top-level map
+entry is exclusively owned; a stale registration update retries against the
+replacement target instead of publishing into detached state.
+
+Overlapping registrations in one `(routing_key, cluster_id)` scope share one
+registration-cluster generation. It retires at the true zero-registration
+boundary. Routed cleanup matches exact registration and cluster-generation
+identity, so delayed cleanup cannot remove a same-ID replacement or mix a
+fresh cluster lifetime with retired routing state.
 
 Proxy flow:
 
@@ -37,9 +53,13 @@ Proxy flow:
 request
   -> find active clusters for RoutingTargetKey
   -> load balancer chooses cluster_id
-  -> state round-robins an active backend_id in that cluster
-  -> proxy over that backend's QUIC path
+  -> state round-robins a shared immutable backend publication in that cluster
+  -> proxy and same-backend retries retain that exact publication
 ```
+
+A later heartbeat replaces the stored backend publication. In-flight requests
+retain the immutable snapshot they selected, so request routing does not
+deep-clone full backend stats and identity on selection or reconnect retry.
 
 ## Aggregation
 
@@ -62,9 +82,20 @@ Cluster latest-wins fields:
 - `total_query_input_size`
 - `queue_time_estimate_ms_by_priority`
 
-Special case:
+- `last_mean_input_tps` is the sum of active backend reports.
 
-- `last_mean_input_tps = max(local_calibration_floor, sum(active runtime backend input TPS))`
+`RoutedClusterSnapshot.rtt` is the unweighted arithmetic mean of the latest
+forwarded `/health` RTT publication from every current active backend in the
+cluster. Each backend contributes exactly once. Inserting a backend, replacing
+its publication on heartbeat, or removing it recomputes the mean before load
+balancers read the snapshot. The calculation uses `Duration`'s nanosecond
+precision and truncates any fractional nanosecond toward zero without summing
+whole durations, so valid RTT inputs cannot overflow the aggregate.
+
+Every Pylon bootstraps its own input TPS before registration. Shared-hardware
+clusters use `--initial-input-tps` as a per-Pylon contribution; do not copy a
+cluster-wide total to every Pylon. Once startup completes, the Pylon registers
+the same authoritative runtime snapshot with every discovered Stargate.
 
 Latest-wins uses Stargate receive time and only active backend snapshots. If the
 source backend disappears, recompute from remaining active snapshots.
@@ -73,14 +104,17 @@ source backend disappears, recompute from remaining active snapshots.
 
 All algorithms choose from cluster snapshots.
 
-- `power-of-two`: compares aggregated cluster load.
-- `groq-multiregion`: uses aggregated stats and representative RTT.
+- `power-of-n`: compares aggregated cluster load.
+- `wait-and-widen`: uses aggregated stats and representative RTT.
+- `pulsar-wait-and-widen`: combines Pulsar ranking with WaitAndWiden fallback.
 - `round-robin`: rounds across clusters.
 - `random`: picks a cluster.
 - `pulsar`: hashes by `cluster_id`, not `backend_id`.
 
 Backend selection inside a chosen cluster is independent of the algorithm and
-uses per-cluster round robin.
+uses per-cluster round robin. Load balancers consume the representative RTT
+from the shared cluster snapshot; they do not aggregate backend RTTs
+independently.
 
 ## Retries
 

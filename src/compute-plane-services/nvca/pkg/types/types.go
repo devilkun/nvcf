@@ -263,6 +263,9 @@ type ICMSInstanceStatusUpdateRequest struct {
 	SystemFailure    string                   `json:"systemFailure,omitempty"`
 	MessageBatchID   string                   `json:"messageBatchId,omitempty"`
 	InstanceIPs      []string                 `json:"instanceIps,omitempty"`
+	// FailureCategory is NVCA-only (not sent to ICMS). Same value as
+	// nvca_workload_result_total's failure_category; stamped on K8s Event annotations for FnDs.
+	FailureCategory string `json:"-"`
 }
 
 type ICMSRequestUpdateInfo struct {
@@ -295,11 +298,20 @@ func (m MaintenanceMode) String() string {
 	return string(m)
 }
 
+// AllMaintenanceModes lists every MaintenanceMode value, used to
+// zero-initialize the maintenance-mode metric so all series appear on the
+// first Prometheus scrape.
+var AllMaintenanceModes = []MaintenanceMode{
+	MaintenanceModeNone,
+	MaintenanceModeCordon,
+	MaintenanceModeCordonAndDrain,
+}
+
 // HealthStatusRequest is the payload type for reporting NVCA health to ICMS.
 type HealthStatusRequest struct {
 	Status              HealthStatus            `json:"status,omitempty"`
 	UpgradeStatus       NVCAUpgradeStatus       `json:"upgradeStatus,omitempty"`
-	GPUUsage            map[GPUName]GPUResource `json:"gpuUsage,omitempty"`
+	GPUUsage            map[GPUName]GPUResource `json:"gpuUsage"`
 	ClusterOwnerNCAID   string                  `json:"clusterOwnerNcaID,omitempty"`
 	NVCAAgentVersion    string                  `json:"nvcaAgentVersion,omitempty"`
 	NVCAOperatorVersion string                  `json:"nvcaOperatorVersion,omitempty"`

@@ -34,24 +34,25 @@ import collections
 import json
 import sys
 
-# Greenfield coordinated calibration removes client-supplied completion from
-# registration and changes the value-bearing completion directive field into
-# an opaque RUN assignment token. Only the assigned pylon submits capacity
-# through SubmitClusterCalibration. Keep this allowance exact so future
-# protobuf breaks still fail after this PR merges.
+# Calibration is now entirely local Pylon startup behavior. The wire protocol
+# intentionally removes its RPC, messages, enum, registration flag, and ACK
+# directives. Keep this allowance exact so future protobuf breaks still fail.
 PROTO_PATH = "crates/proto/proto/stargate.proto"
 expected_messages_by_rule = {
+    "ENUM_NO_DELETE": [
+        'Previously present enum "CalibrationState" was deleted from file.',
+    ],
     "FIELD_NO_DELETE": [
-        'Previously present field "3" with name "calibration_state" on message "InferenceServerModelRegistration" was deleted.',
+        'Previously present field "2" with name "model_calibration_directives" on message "InferenceServerAck" was deleted.',
+        'Previously present field "6" with name "coordinated_calibration" on message "InferenceServerRegistration" was deleted.',
     ],
-    "FIELD_SAME_JSON_NAME": [
-        'Field "3" with name "assignment_token" on message "ModelCalibrationDirective" changed option "json_name" from "lastMeanInputTps" to "assignmentToken".',
+    "MESSAGE_NO_DELETE": [
+        'Previously present message "ModelCalibrationDirective" was deleted from file.',
+        'Previously present message "SubmitClusterCalibrationRequest" was deleted from file.',
+        'Previously present message "SubmitClusterCalibrationResponse" was deleted from file.',
     ],
-    "FIELD_SAME_NAME": [
-        'Field "3" on message "ModelCalibrationDirective" changed name from "last_mean_input_tps" to "assignment_token".',
-    ],
-    "FIELD_SAME_TYPE": [
-        'Field "3" with name "assignment_token" on message "ModelCalibrationDirective" changed type from "double" to "string".',
+    "RPC_NO_DELETE": [
+        'Previously present RPC "SubmitClusterCalibration" on service "StargateControlPlane" was deleted.',
     ],
 }
 allowed = collections.Counter(
@@ -91,10 +92,10 @@ if extra or missing:
         for (path, rule, message), count in sorted(extra.items()):
             print(f"- {path} {rule} x{count}: {message}", file=sys.stderr)
     if missing:
-        print("expected owner-only coordinated-calibration changes were not observed:", file=sys.stderr)
+        print("expected calibration-removal changes were not observed:", file=sys.stderr)
         for (path, rule, message), count in sorted(missing.items()):
             print(f"- {path} {rule} x{count}: {message}", file=sys.stderr)
     sys.exit(1)
 
-print("buf breaking: only the expected owner-only coordinated-calibration changes were detected")
+print("buf breaking: only the expected calibration-removal changes were detected")
 PY

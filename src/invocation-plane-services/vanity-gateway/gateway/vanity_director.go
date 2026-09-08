@@ -19,8 +19,11 @@ package gateway
 
 import (
 	config "ai-api-gateway-service/gateway_config"
+	"ai-api-gateway-service/middleware"
 	"ai-api-gateway-service/pool"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +40,10 @@ import (
 
 const NVCFPollSeconds string = "NVCF-POLL-SECONDS"
 const defaultNVCFPollSeconds config.SessionTimeoutSeconds = 300
+
+// 499 (nginx's non-standard "client closed request"). Telemetry-only: the
+// disconnected client can't receive it; it distinguishes a disconnect from a 502.
+const statusClientClosedRequest = 499
 
 // writeFunctionStatusError writes a 503 or 410 response if the function is offline or expired.
 // name is used in the EOL detail message; pass empty string for vanity/path-based endpoints.
@@ -74,8 +81,49 @@ func writeFunctionStatusError(writer http.ResponseWriter, offlineMessage string,
 	return false
 }
 
-func writeBadGatewayProblem(writer http.ResponseWriter, _ *http.Request, err error) {
-	zap.L().Warn("proxy request failed", zap.Error(err))
+// clientClosedRequest is true only when the inbound request context is canceled
+// (the authoritative disconnect signal); a transport error wrapping
+// context.Canceled with a live context stays a genuine upstream fault (502).
+func clientClosedRequest(request *http.Request) bool {
+	return request != nil && errors.Is(request.Context().Err(), context.Canceled)
+}
+
+func addGatewayProxyOutcome(request *http.Request, outcome middleware.GatewayProxyOutcome) {
+	if request == nil {
+		return
+	}
+	middleware.AddGatewayProxyOutcomeMetricAttribute(request.Context(), outcome)
+	trace.SpanFromContext(request.Context()).SetAttributes(traceAttrGatewayProxyOutcome.String(string(outcome)))
+}
+
+// writeProxyError maps a canceled inbound request to 499; all other ReverseProxy
+// ErrorHandler failures remain 502.
+func writeProxyError(writer http.ResponseWriter, request *http.Request, err error) {
+	if clientClosedRequest(request) {
+		addGatewayProxyOutcome(request, middleware.GatewayProxyOutcomeClientCanceled)
+		zap.L().Debug("proxy request canceled",
+			zap.String(string(middleware.GatewayProxyOutcomeMetricAttribute), string(middleware.GatewayProxyOutcomeClientCanceled)),
+			zap.Error(err),
+		)
+		writer.Header().Set("Content-Type", "application/problem+json")
+		writer.WriteHeader(statusClientClosedRequest)
+		_ = json.NewEncoder(writer).Encode(ProblemDetails{
+			Type:   "about:blank",
+			Title:  "Client Closed Request",
+			Status: statusClientClosedRequest,
+			Detail: "Client closed the request before a response was produced.",
+		})
+		return
+	}
+	writeBadGatewayProblem(writer, request, err)
+}
+
+func writeBadGatewayProblem(writer http.ResponseWriter, request *http.Request, err error) {
+	addGatewayProxyOutcome(request, middleware.GatewayProxyOutcomeProxyError)
+	zap.L().Warn("proxy request failed",
+		zap.String(string(middleware.GatewayProxyOutcomeMetricAttribute), string(middleware.GatewayProxyOutcomeProxyError)),
+		zap.Error(err),
+	)
 	writer.Header().Set("Content-Type", "application/problem+json")
 	writer.WriteHeader(http.StatusBadGateway)
 	_ = json.NewEncoder(writer).Encode(ProblemDetails{
@@ -97,6 +145,7 @@ type execTarget struct {
 	functionID        string
 	functionVersionID string
 	sessionTimeout    config.SessionTimeoutSeconds
+	customHeaders     config.CustomHeaders
 }
 
 type VanityExecRequest struct {
@@ -105,6 +154,7 @@ type VanityExecRequest struct {
 	PathOverride      *string
 	UsePexec          bool
 	SessionTimeout    config.SessionTimeoutSeconds
+	CustomHeaders     config.CustomHeaders
 	EOL               time.Time
 	OfflineMessage    string
 }
@@ -117,8 +167,8 @@ type ProblemDetails struct {
 	Detail string `json:"detail"`
 }
 
-func NewVanityDirector(nvcfApiHost string, transport http.RoundTripper) (*VanityDirector, error) {
-	rp := &httputil.ReverseProxy{
+func newGatewayReverseProxy(transport http.RoundTripper) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
 		Director: func(request *http.Request) {
 			// already directed, needed to be able to error
 		},
@@ -126,8 +176,12 @@ func NewVanityDirector(nvcfApiHost string, transport http.RoundTripper) (*Vanity
 		BufferPool:     pool.ByteSlice,
 		Transport:      transport,
 		ModifyResponse: modifyTooManyRequestsResponse,
-		ErrorHandler:   writeBadGatewayProblem,
+		ErrorHandler:   writeProxyError,
 	}
+}
+
+func NewVanityDirector(nvcfApiHost string, transport http.RoundTripper) (*VanityDirector, error) {
+	rp := newGatewayReverseProxy(transport)
 	nvcfApiUrl, err := url.Parse(nvcfApiHost)
 	if err != nil || nvcfApiUrl.Scheme == "" || nvcfApiUrl.Host == "" {
 		return nil, fmt.Errorf("invalid NVCF API host: %s", nvcfApiHost)
@@ -135,12 +189,13 @@ func NewVanityDirector(nvcfApiHost string, transport http.RoundTripper) (*Vanity
 	return &VanityDirector{rp: rp, nvcfApiHost: nvcfApiUrl.Host, nvcfApiScheme: nvcfApiUrl.Scheme}, nil
 }
 
-func buildExecTarget(functionID string, functionVersionID string, pathOverride *string, usePexec bool, sessionTimeout config.SessionTimeoutSeconds) execTarget {
+func buildExecTarget(functionID string, functionVersionID string, pathOverride *string, usePexec bool, sessionTimeout config.SessionTimeoutSeconds, customHeaders config.CustomHeaders) execTarget {
 	target := execTarget{
 		path:              pathOverride,
 		functionID:        functionID,
 		functionVersionID: functionVersionID,
 		sessionTimeout:    sessionTimeout,
+		customHeaders:     customHeaders,
 	}
 	if !usePexec {
 		return target
@@ -175,6 +230,13 @@ func applyExecTarget(request *http.Request, apiScheme string, apiHost string, ta
 	}
 	request.Host = ""
 	setPollingHeaderIfNotPresent(request, target.sessionTimeout)
+	applyCustomHeaders(request, target.customHeaders)
+}
+
+func applyCustomHeaders(request *http.Request, headers config.CustomHeaders) {
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
 }
 
 func (d *VanityDirector) ServeExec(target VanityExecRequest, writer http.ResponseWriter, request *http.Request) error {
@@ -188,7 +250,7 @@ func (d *VanityDirector) ServeExec(target VanityExecRequest, writer http.Respons
 		return nil
 	}
 
-	applyExecTarget(request, d.nvcfApiScheme, d.nvcfApiHost, buildExecTarget(target.FunctionID, target.FunctionVersionID, target.PathOverride, target.UsePexec, target.SessionTimeout))
+	applyExecTarget(request, d.nvcfApiScheme, d.nvcfApiHost, buildExecTarget(target.FunctionID, target.FunctionVersionID, target.PathOverride, target.UsePexec, target.SessionTimeout, target.CustomHeaders))
 
 	// Set Deprecation header if EOL is set but not yet expired
 	if !target.EOL.IsZero() {
@@ -199,7 +261,7 @@ func (d *VanityDirector) ServeExec(target VanityExecRequest, writer http.Respons
 	rp := *d.rp
 	rp.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, err error) {
 		proxyErr = err
-		writeBadGatewayProblem(writer, request, err)
+		writeProxyError(writer, request, err)
 	}
 	rp.ServeHTTP(writer, request)
 	return proxyErr

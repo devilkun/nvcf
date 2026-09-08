@@ -19,6 +19,7 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +33,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
@@ -40,14 +44,103 @@ import (
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/servicetier"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
 	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
+
+func TestStargateProviderMetricsIncludeFunctionID(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	oldMeterProvider := otel.GetMeterProvider()
+	otel.SetMeterProvider(meterProvider)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(oldMeterProvider)
+		_ = meterProvider.Shutdown(context.Background())
+	})
+
+	p := &StargateProvider{
+		upstreamRequestsTotal:   telemetry.UpstreamRequestsTotal(),
+		upstreamRequestDuration: telemetry.UpstreamRequestDuration(),
+	}
+	p.recordUpstreamRequest(
+		context.Background(),
+		&requestctx.RequestContext{RoutingKey: "fn-upstream"},
+		time.Now().Add(-time.Millisecond),
+		http.StatusOK,
+		nil,
+	)
+	p.recordUpstreamRequest(
+		context.Background(),
+		nil,
+		time.Now().Add(-time.Millisecond),
+		http.StatusOK,
+		nil,
+	)
+
+	var resourceMetrics metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &resourceMetrics))
+	want := map[string]map[string]bool{
+		"llm_api_gateway_upstream_requests_total": {
+			"fn-upstream": false,
+			"none":        false,
+		},
+		"llm_api_gateway_upstream_request_duration_seconds": {
+			"fn-upstream": false,
+			"none":        false,
+		},
+	}
+	for _, scope := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			functionIDs, ok := want[metric.Name]
+			if !ok {
+				continue
+			}
+			for functionID := range functionIDs {
+				if metricHasFunctionID(metric.Data, functionID) {
+					functionIDs[functionID] = true
+				}
+			}
+		}
+	}
+	for name, functionIDs := range want {
+		for functionID, found := range functionIDs {
+			if !found {
+				t.Fatalf("metric %q missing function_id=%s", name, functionID)
+			}
+		}
+	}
+}
+
+func metricHasFunctionID(data metricdata.Aggregation, want string) bool {
+	hasFunctionID := func(attrs attribute.Set) bool {
+		value, ok := attrs.Value(attribute.Key("function_id"))
+		return ok && value.AsString() == want
+	}
+	switch typed := data.(type) {
+	case metricdata.Sum[int64]:
+		for _, point := range typed.DataPoints {
+			if hasFunctionID(point.Attributes) {
+				return true
+			}
+		}
+	case metricdata.Histogram[float64]:
+		for _, point := range typed.DataPoints {
+			if hasFunctionID(point.Attributes) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing.T) {
 	t.Parallel()
 
+	promptCacheKey := "chat-prompt-cache-key"
+	cacheAffinityKey := fmt.Sprintf("mt:v1:session:%x", sha256.Sum256([]byte(promptCacheKey)))
 	request := &NormalizedRequest{
 		ChatRequest: &models.ChatCompletionRequest{
-			Model: "upstream-model",
+			Model:          "upstream-model",
+			PromptCacheKey: &promptCacheKey,
 			Messages: &[]models.ChatMessage{
 				{
 					Role:    models.ChatCompletionRoleUser,
@@ -72,7 +165,7 @@ func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing
 		Model:            "upstream-model",
 		RoutingMethod:    "experimental_method",
 		TargetRegion:     "us-west1",
-		CacheAffinityKey: "mt:v1:header:hash",
+		CacheAffinityKey: cacheAffinityKey,
 	}
 
 	wantEstimate := routingTokenEstimate(request)
@@ -93,7 +186,8 @@ func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing
 		require.Equal(t, "fn-abc", r.Header.Get(headerRoutingKey))
 		require.Equal(t, "upstream-model", r.Header.Get(headerModel))
 		require.Equal(t, "experimental_method", r.Header.Get(headerRoutingMethod))
-		require.Equal(t, "mt:v1:header:hash", r.Header.Get(headerCacheAffinityKey))
+		require.Equal(t, cacheAffinityKey, r.Header.Get(headerCacheAffinityKey))
+		require.NotEqual(t, promptCacheKey, r.Header.Get(headerCacheAffinityKey))
 		require.Equal(t, fmt.Sprintf("%d", wantEstimate), r.Header.Get(headerInputTokens))
 		require.Equal(t, fmt.Sprintf("%d", wantEstimate), r.Header.Get(headerTokenEstimate))
 
@@ -104,6 +198,8 @@ func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing
 		require.NotNil(t, payload.StreamOptions)
 		require.NotNil(t, payload.StreamOptions.IncludeUsage)
 		require.True(t, ptr.Deref(payload.StreamOptions.IncludeUsage))
+		require.NotNil(t, payload.PromptCacheKey)
+		require.Equal(t, promptCacheKey, ptr.Deref(payload.PromptCacheKey))
 		require.NotNil(t, payload.Messages)
 		require.Len(t, *payload.Messages, 1)
 		require.Equal(t, models.ChatCompletionRoleUser, (*payload.Messages)[0].Role)
@@ -803,6 +899,174 @@ func TestStargateProviderProxyForwardsRoutingMethod(t *testing.T) {
 		require.Equal(t, "mt:v1:header:proxy-hash", r.Header.Get(headerCacheAffinityKey))
 		require.Equal(t, "11", r.Header.Get(headerInputTokens))
 		require.Equal(t, "29", r.Header.Get(headerTokenEstimate))
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				headerContentType: []string{contentTypeJSON},
+			},
+			Body:    io.NopCloser(strings.NewReader(`{"object":"list","data":[]}`)),
+			Request: r,
+		}, nil
+	})}
+
+	response, err := provider.Proxy(context.Background(), reqCtx, request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+
+	require.Equal(t, http.StatusOK, response.StatusCode)
+}
+
+func TestStargateProviderNewOutboundRequestForwardsPriority(t *testing.T) {
+	t.Parallel()
+
+	request := &NormalizedRequest{
+		ChatRequest: &models.ChatCompletionRequest{
+			Model: "upstream-model",
+			Messages: &[]models.ChatMessage{
+				{
+					Role:    models.ChatCompletionRoleUser,
+					Content: models.SingleTextContent("hello"),
+				},
+			},
+		},
+		InputTokens: 3,
+	}
+
+	provider, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+	require.NoError(t, err)
+
+	// A resolved priority is forwarded as the header value.
+	resolved, err := provider.newOutboundRequest(
+		&requestctx.RequestContext{RoutingKey: "fn-abc", Priority: ptr.To(uint32(3))},
+		request,
+		false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "3", resolved.Header.Get(headerPriority))
+
+	// An explicit zero (highest priority) is forwarded, distinct from unset.
+	zero, err := provider.newOutboundRequest(
+		&requestctx.RequestContext{RoutingKey: "fn-abc", Priority: ptr.To(uint32(0))},
+		request,
+		false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "0", zero.Header.Get(headerPriority))
+
+	// Unset priority omits the header entirely.
+	unset, err := provider.newOutboundRequest(
+		&requestctx.RequestContext{RoutingKey: "fn-abc"},
+		request,
+		false,
+	)
+	require.NoError(t, err)
+	require.Empty(t, unset.Header.Get(headerPriority))
+}
+
+func TestStargateProviderProxyForwardsPriority(t *testing.T) {
+	t.Parallel()
+
+	reqCtx := &requestctx.RequestContext{
+		RequestID:  "req-proxy",
+		RoutingKey: "fn-proxy",
+		Model:      "proxy-model",
+		Priority:   ptr.To(uint32(7)),
+	}
+	request := &ProxyRequest{
+		Method: http.MethodPost,
+		Path:   "/v1/embeddings",
+		Body:   io.NopCloser(strings.NewReader(`{"model":"proxy-model","input":"hello"}`)),
+		// A client-supplied X-Priority survives the header clone; the resolved
+		// value must replace it, not append to it.
+		Header: http.Header{headerPriority: []string{"9"}},
+	}
+
+	provider, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+	require.NoError(t, err)
+	provider.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+
+		require.Equal(t, []string{"7"}, r.Header.Values(headerPriority))
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				headerContentType: []string{contentTypeJSON},
+			},
+			Body:    io.NopCloser(strings.NewReader(`{"object":"list","data":[]}`)),
+			Request: r,
+		}, nil
+	})}
+
+	response, err := provider.Proxy(context.Background(), reqCtx, request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+
+	require.Equal(t, http.StatusOK, response.StatusCode)
+}
+
+func TestStargateProviderProxyStripsClientSuppliedPriorityWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	reqCtx := &requestctx.RequestContext{
+		RequestID:  "req-proxy",
+		RoutingKey: "fn-proxy",
+		Model:      "proxy-model",
+	}
+	request := &ProxyRequest{
+		Method: http.MethodPost,
+		Path:   "/v1/embeddings",
+		Body:   io.NopCloser(strings.NewReader(`{"model":"proxy-model","input":"hello"}`)),
+		// A client-supplied X-Priority survives the header clone; with no
+		// resolved priority it must be stripped, not forwarded.
+		Header: http.Header{headerPriority: []string{"9"}},
+	}
+
+	provider, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+	require.NoError(t, err)
+	provider.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+
+		require.Empty(t, r.Header.Values(headerPriority))
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				headerContentType: []string{contentTypeJSON},
+			},
+			Body:    io.NopCloser(strings.NewReader(`{"object":"list","data":[]}`)),
+			Request: r,
+		}, nil
+	})}
+
+	response, err := provider.Proxy(context.Background(), reqCtx, request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+
+	require.Equal(t, http.StatusOK, response.StatusCode)
+}
+
+func TestStargateProviderProxyOmitsPriorityWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	reqCtx := &requestctx.RequestContext{
+		RequestID:  "req-proxy",
+		RoutingKey: "fn-proxy",
+		Model:      "proxy-model",
+	}
+	request := &ProxyRequest{
+		Method: http.MethodPost,
+		Path:   "/v1/embeddings",
+		Body:   io.NopCloser(strings.NewReader(`{"model":"proxy-model","input":"hello"}`)),
+	}
+
+	provider, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+	require.NoError(t, err)
+	provider.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+
+		require.Empty(t, r.Header.Values(headerPriority))
 
 		return &http.Response{
 			StatusCode: http.StatusOK,

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -30,17 +30,23 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use pylon_lib::{
     BringupConfig, InferenceServerRegistrationClient, InferenceServerRegistrationConfig,
-    InferenceServerUpdateChannels, OutputTokenParserFactory, QuicHttpTunnelConfig,
-    QuicHttpTunnelHandle, start_quic_http_tunnel,
+    ModelInitialization, ModelLifecycleConfig, ModelLifecycleHandle, ModelSource,
+    PylonRuntimeState, QuicHttpTunnelConfig, QuicHttpTunnelHandle, StatsCollectorConfig,
+    TunnelTransportProtocol, start_model_lifecycle, start_quic_http_tunnel, start_stats_collector,
 };
 use serde::{Deserialize, Serialize};
 use stargate::auth::{AuthResult, WorkerAuthenticator};
 use stargate::discovery::Discovery;
-use stargate::proxy::ProxyTransportConfig;
-use stargate::runtime::{StargateRuntime, StargateRuntimeConfig};
+use stargate::proxy::{ProxyTransportConfig, QuicTunnelConfig};
+use stargate::runtime::{
+    BoundStargateListeners, ReverseTunnelConfig, StargateRuntime, StargateRuntimeConfig,
+    WarmupConfig,
+};
 use stargate_forwarding::{ForwardingResolver, PeerResolution, PeerTarget};
 use stargate_proto::pb::{InferenceServerStatus, StargateInfo};
 use tokio::net::TcpListener;
+
+pub mod sse;
 
 // ---------------------------------------------------------------------------
 // Test authenticator
@@ -149,11 +155,6 @@ impl Discovery for SharedDiscovery {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-pub fn ephemeral_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
-}
 
 pub fn bind_ephemeral() -> (SocketAddr, std::net::TcpListener) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -308,36 +309,12 @@ pub struct DummyState {
 }
 
 #[derive(Clone)]
-pub struct CountingDummyState {
-    pub model: String,
-    pub bringup_chat_requests: Arc<AtomicUsize>,
-    pub proxy_chat_requests: Arc<AtomicUsize>,
-}
-
-pub struct CountingDummyBackend {
-    pub addr: SocketAddr,
-    pub bringup_chat_requests: Arc<AtomicUsize>,
-    pub proxy_chat_requests: Arc<AtomicUsize>,
-}
-
-impl CountingDummyBackend {
-    pub fn bringup_chat_requests(&self) -> usize {
-        self.bringup_chat_requests.load(Ordering::SeqCst)
-    }
-
-    pub fn proxy_chat_requests(&self) -> usize {
-        self.proxy_chat_requests.load(Ordering::SeqCst)
-    }
-}
-
-#[derive(Clone)]
 pub struct LifecycleDummyState {
     pub model: String,
     health_ok: Arc<AtomicBool>,
     completions_ok: Arc<AtomicBool>,
     completion_tokens: Arc<AtomicU32>,
     health_requests: Arc<AtomicUsize>,
-    calibration_requests: Arc<AtomicUsize>,
     canary_requests: Arc<AtomicUsize>,
     proxy_requests: Arc<AtomicUsize>,
 }
@@ -348,7 +325,6 @@ pub struct LifecycleDummyBackend {
     completions_ok: Arc<AtomicBool>,
     completion_tokens: Arc<AtomicU32>,
     health_requests: Arc<AtomicUsize>,
-    calibration_requests: Arc<AtomicUsize>,
     canary_requests: Arc<AtomicUsize>,
 }
 
@@ -367,10 +343,6 @@ impl LifecycleDummyBackend {
 
     pub fn health_requests(&self) -> usize {
         self.health_requests.load(Ordering::SeqCst)
-    }
-
-    pub fn calibration_requests(&self) -> usize {
-        self.calibration_requests.load(Ordering::SeqCst)
     }
 
     pub fn canary_requests(&self) -> usize {
@@ -410,8 +382,16 @@ pub struct Delta {
 }
 
 pub async fn dummy_chat(State(state): State<DummyState>, Json(req): Json<ChatRequest>) -> Response {
+    dummy_chat_with_tokens(state.model, req, 3).await
+}
+
+async fn dummy_chat_with_tokens(
+    model: String,
+    req: ChatRequest,
+    completion_tokens: u32,
+) -> Response {
+    let prompt_tokens = req.messages.len().max(1);
     if req.stream == Some(true) {
-        let model = state.model.clone();
         let stream = async_stream::stream! {
             yield Ok::<_, std::convert::Infallible>(Event::default().data(
                 serde_json::to_string(&ChunkCompletion {
@@ -451,6 +431,17 @@ pub async fn dummy_chat(State(state): State<DummyState>, Json(req): Json<ChatReq
                     }],
                 }).unwrap(),
             ));
+            yield Ok(Event::default().data(serde_json::json!({
+                "id": "chunk-1",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens as usize,
+                },
+            }).to_string()));
             yield Ok(Event::default().data("[DONE]"));
         };
         return Sse::new(stream)
@@ -461,36 +452,19 @@ pub async fn dummy_chat(State(state): State<DummyState>, Json(req): Json<ChatReq
     Json(serde_json::json!({
         "id": "test-1",
         "object": "chat.completion",
-        "model": state.model,
+        "model": model,
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": "Hello world!" },
             "finish_reason": "stop",
         }],
         "usage": {
-            "prompt_tokens": req.messages.len().max(1),
-            "completion_tokens": 3,
-            "total_tokens": req.messages.len().max(1) + 3,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens as usize,
         },
     }))
     .into_response()
-}
-
-pub async fn counting_dummy_chat(
-    headers: HeaderMap,
-    State(state): State<CountingDummyState>,
-    Json(req): Json<ChatRequest>,
-) -> Response {
-    let is_bringup = headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|request_id| request_id.starts_with("bringup-"));
-    if is_bringup {
-        state.bringup_chat_requests.fetch_add(1, Ordering::SeqCst);
-    } else {
-        state.proxy_chat_requests.fetch_add(1, Ordering::SeqCst);
-    }
-    dummy_chat(State(DummyState { model: state.model }), Json(req)).await
 }
 
 pub async fn lifecycle_dummy_health(State(state): State<LifecycleDummyState>) -> Response {
@@ -507,18 +481,17 @@ pub async fn lifecycle_dummy_chat(
     State(state): State<LifecycleDummyState>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    let is_bringup = headers
+    let request_id = headers
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|request_id| request_id.starts_with("bringup-"));
-    if is_bringup && is_canary_request(&req) {
+        .unwrap_or_default();
+    let is_calibration = request_id.starts_with("calibration-");
+    let is_canary = request_id.starts_with("canary-");
+    if is_canary {
         state.canary_requests.fetch_add(1, Ordering::SeqCst);
-    } else if is_bringup {
-        state.calibration_requests.fetch_add(1, Ordering::SeqCst);
-    } else {
+    } else if !is_calibration {
         state.proxy_requests.fetch_add(1, Ordering::SeqCst);
     }
-
     if !state.completions_ok.load(Ordering::SeqCst) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -531,11 +504,11 @@ pub async fn lifecycle_dummy_chat(
             .into_response();
     }
 
+    let completion_tokens = state.completion_tokens.load(Ordering::SeqCst);
     if req.stream == Some(true) {
-        return dummy_chat(State(DummyState { model: state.model }), Json(req)).await;
+        return dummy_chat_with_tokens(state.model, req, completion_tokens).await;
     }
 
-    let completion_tokens = state.completion_tokens.load(Ordering::SeqCst);
     Json(serde_json::json!({
         "id": "test-1",
         "object": "chat.completion",
@@ -554,12 +527,6 @@ pub async fn lifecycle_dummy_chat(
     .into_response()
 }
 
-fn is_canary_request(req: &ChatRequest) -> bool {
-    req.messages
-        .iter()
-        .any(|message| message.get("content").and_then(|content| content.as_str()) == Some("1+1="))
-}
-
 pub fn base_config(
     id: &str,
     grpc_addr: SocketAddr,
@@ -570,13 +537,11 @@ pub fn base_config(
         grpc_listen_addr: grpc_addr,
         model_discovery_listen_addr: "127.0.0.1:0".parse().unwrap(),
         http_listen_addr: http_addr,
+        metrics_listen_addr: None,
         advertise_addr: grpc_addr,
         stargate_discovery_dns_name: "localhost".to_string(),
         remote_watch_stargate_urls: Vec::new(),
         grpc_pylon_dial_addr: None,
-        advertised_hostname_template: None,
-        pod_name: None,
-        pod_namespace: None,
         dns_poll_interval: Duration::from_secs(60),
         watch_heartbeat_interval: Duration::from_secs(60),
         registration_update_idle_timeout:
@@ -584,25 +549,211 @@ pub fn base_config(
         registration_update_max_idle_timeout:
             stargate::registration::DEFAULT_REGISTRATION_UPDATE_MAX_IDLE_TIMEOUT,
         proxy_transport: ProxyTransportConfig {
-            quic_connect_timeout: Duration::from_secs(5),
-            quic_request_timeout: Duration::from_secs(10),
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: Default::default(),
-            direct_quic_connections: 1,
+            quic: QuicTunnelConfig {
+                connect_timeout: Duration::from_secs(5),
+                request_timeout: Duration::from_secs(10),
+                tls_cert_pem: None,
+                server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
+                server_identity_reloader: None,
+                tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
+                quic_insecure: true,
+                tunnel_protocol: Default::default(),
+                direct_quic_connections: 1,
+            },
             retry: Default::default(),
         },
         lb_config_path: None,
         metrics_prefix: stargate::metrics::DEFAULT_PREFIX.to_string(),
-        reverse_tunnel_listen_addr: None,
-        reverse_tunnel_pylon_dial_addr: None,
-        reverse_tunnel_connect_timeout: Duration::from_secs(10),
+        forwarding: None,
+        authenticator: Arc::new(stargate::auth::OpenAuthenticator),
+        warmup: WarmupConfig::default(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelDirection {
+    Direct,
+    Reverse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TunnelTestCase {
+    pub direction: TunnelDirection,
+    pub protocol: TunnelTransportProtocol,
+}
+
+impl TunnelTestCase {
+    pub const fn direct(protocol: TunnelTransportProtocol) -> Self {
+        Self {
+            direction: TunnelDirection::Direct,
+            protocol,
+        }
+    }
+
+    pub const fn reverse(protocol: TunnelTransportProtocol) -> Self {
+        Self {
+            direction: TunnelDirection::Reverse,
+            protocol,
+        }
+    }
+
+    pub const fn reverse_tunnel(self) -> bool {
+        matches!(self.direction, TunnelDirection::Reverse)
+    }
+
+    pub const fn direction_label(self) -> &'static str {
+        match self.direction {
+            TunnelDirection::Direct => "direct",
+            TunnelDirection::Reverse => "reverse",
+        }
+    }
+
+    pub const fn protocol_label(self) -> &'static str {
+        match self.protocol {
+            TunnelTransportProtocol::RawQuic => "raw-quic",
+            TunnelTransportProtocol::Http3 => "http3",
+            TunnelTransportProtocol::WebTransport => "webtransport",
+        }
+    }
+}
+
+#[test]
+fn tunnel_test_case_reports_direction_and_protocol() {
+    let direct = TunnelTestCase::direct(TunnelTransportProtocol::Http3);
+    assert!(!direct.reverse_tunnel());
+    assert_eq!(direct.direction_label(), "direct");
+    assert_eq!(direct.protocol_label(), "http3");
+
+    let reverse = TunnelTestCase::reverse(TunnelTransportProtocol::WebTransport);
+    assert!(reverse.reverse_tunnel());
+    assert_eq!(reverse.direction_label(), "reverse");
+    assert_eq!(reverse.protocol_label(), "webtransport");
+}
+
+pub fn localhost_reverse_tunnel_config(listen_addr: SocketAddr) -> ReverseTunnelConfig {
+    ReverseTunnelConfig::bind(
+        listen_addr,
+        "localhost".to_string(),
+        None,
+        Duration::from_secs(10),
+    )
+    .expect("reverse tunnel listener should bind")
+}
+
+fn localhost_reverse_tunnel_config_with_socket(socket: std::net::UdpSocket) -> ReverseTunnelConfig {
+    ReverseTunnelConfig::from_bound_socket(
+        socket,
+        "localhost".to_string(),
+        None,
+        Duration::from_secs(10),
+    )
+}
+
+fn ephemeral_loopback_addr() -> SocketAddr {
+    "127.0.0.1:0"
+        .parse()
+        .expect("loopback ephemeral address must parse")
+}
+
+fn base_ephemeral_config(id: &str) -> StargateRuntimeConfig {
+    base_config(id, ephemeral_loopback_addr(), ephemeral_loopback_addr())
+}
+
+enum TestDiscovery {
+    SelfOnly,
+    Shared(Arc<Mutex<Vec<StargateInfo>>>),
+}
+
+struct BuiltTestRuntime {
+    grpc_addr: SocketAddr,
+    model_discovery_addr: SocketAddr,
+    http_addr: SocketAddr,
+    runtime: StargateRuntime,
+}
+
+impl BuiltTestRuntime {
+    fn standard(self) -> (SocketAddr, SocketAddr, StargateRuntime) {
+        (self.grpc_addr, self.http_addr, self.runtime)
+    }
+
+    fn with_model_discovery(self) -> (SocketAddr, SocketAddr, SocketAddr, StargateRuntime) {
+        (
+            self.grpc_addr,
+            self.model_discovery_addr,
+            self.http_addr,
+            self.runtime,
+        )
+    }
+}
+
+fn build_test_runtime(
+    id: &str,
+    mut config: StargateRuntimeConfig,
+    discovery: TestDiscovery,
+    reverse_tunnel: Option<ReverseTunnelConfig>,
+) -> BuiltTestRuntime {
+    let listeners =
+        BoundStargateListeners::bind(&mut config).expect("Stargate test listeners should bind");
+    let grpc_addr = config.grpc_listen_addr;
+    let model_discovery_addr = config.model_discovery_listen_addr;
+    let http_addr = config.http_listen_addr;
+    let discovery: Box<dyn Discovery> = match discovery {
+        TestDiscovery::SelfOnly => Box::new(SelfDiscovery::new(id, grpc_addr, http_addr)),
+        TestDiscovery::Shared(peers) => {
+            Box::new(SharedDiscovery::new(id, grpc_addr, http_addr, peers))
+        }
+    };
+    BuiltTestRuntime {
+        grpc_addr,
+        model_discovery_addr,
+        http_addr,
+        runtime: StargateRuntime::new(config, discovery, listeners, reverse_tunnel),
+    }
+}
+
+fn reverse_tunnel_config(
+    reverse_addr: SocketAddr,
+    reverse_socket: Option<std::net::UdpSocket>,
+) -> ReverseTunnelConfig {
+    match reverse_socket {
+        Some(socket) => localhost_reverse_tunnel_config_with_socket(socket),
+        None => localhost_reverse_tunnel_config(reverse_addr),
     }
 }
 
 pub fn make_stargate_runtime(id: &str) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    make_stargate_runtime_with_lb(id, None)
+    // Use a long warmup duration so tests that rely on 503 during warmup
+    // (e.g. readyz_returns_503_during_warmup) behave correctly without
+    // needing a specific WarmupConfig at the call site.
+    let mut config = base_ephemeral_config(id);
+    config.warmup = WarmupConfig {
+        warmup_duration: Duration::from_secs(60),
+        ..WarmupConfig::default()
+    };
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, None).standard()
+}
+
+pub fn make_stargate_runtime_for_tunnel_case(
+    id: &str,
+    case: TunnelTestCase,
+) -> (SocketAddr, SocketAddr, Option<String>, StargateRuntime) {
+    let mut config = base_ephemeral_config(id);
+    config.proxy_transport.quic.tunnel_protocol = case.protocol;
+
+    let reverse_tunnel = case
+        .reverse_tunnel()
+        .then(|| localhost_reverse_tunnel_config(ephemeral_loopback_addr()));
+
+    let reverse_target = reverse_tunnel
+        .as_ref()
+        .map(|reverse| format!("localhost:{}", reverse.listen_addr().port()));
+    let built = build_test_runtime(id, config, TestDiscovery::SelfOnly, reverse_tunnel);
+    (
+        built.grpc_addr,
+        built.http_addr,
+        reverse_target,
+        built.runtime,
+    )
 }
 
 pub fn make_stargate_runtime_with_watch_intervals(
@@ -610,80 +761,46 @@ pub fn make_stargate_runtime_with_watch_intervals(
     discovery_poll_interval: Duration,
     watch_heartbeat_interval: Duration,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SelfDiscovery::new(id, grpc_addr, http_addr);
-    let mut config = base_config(id, grpc_addr, http_addr);
+    let mut config = base_ephemeral_config(id);
     config.dns_poll_interval = discovery_poll_interval;
     config.watch_heartbeat_interval = watch_heartbeat_interval;
-    let runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener);
-    (grpc_addr, http_addr, runtime)
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, None).standard()
 }
 
 pub fn make_stargate_runtime_with_auth(
     id: &str,
     authenticator: Arc<dyn stargate::auth::WorkerAuthenticator>,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SelfDiscovery::new(id, grpc_addr, http_addr);
-    let config = base_config(id, grpc_addr, http_addr);
-    let runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener)
-        .with_authenticator(authenticator);
-    (grpc_addr, http_addr, runtime)
+    let mut config = base_ephemeral_config(id);
+    config.authenticator = authenticator;
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, None).standard()
 }
 
 pub fn make_stargate_runtime_with_model_discovery(
     id: &str,
 ) -> (SocketAddr, SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (model_discovery_addr, model_discovery_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SelfDiscovery::new(id, grpc_addr, http_addr);
-    let mut config = base_config(id, grpc_addr, http_addr);
-    config.model_discovery_listen_addr = model_discovery_addr;
-    let runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_model_discovery_listener(model_discovery_listener)
-        .with_http_listener(http_listener);
-    (grpc_addr, model_discovery_addr, http_addr, runtime)
+    let mut config = base_ephemeral_config(id);
+    config.model_discovery_listen_addr = ephemeral_loopback_addr();
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, None).with_model_discovery()
 }
 
 pub fn make_stargate_runtime_with_auth_and_model_discovery(
     id: &str,
     authenticator: Arc<dyn stargate::auth::WorkerAuthenticator>,
 ) -> (SocketAddr, SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (model_discovery_addr, model_discovery_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SelfDiscovery::new(id, grpc_addr, http_addr);
-    let mut config = base_config(id, grpc_addr, http_addr);
-    config.model_discovery_listen_addr = model_discovery_addr;
-    let runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_model_discovery_listener(model_discovery_listener)
-        .with_http_listener(http_listener)
-        .with_authenticator(authenticator);
-    (grpc_addr, model_discovery_addr, http_addr, runtime)
+    let mut config = base_ephemeral_config(id);
+    config.model_discovery_listen_addr = ephemeral_loopback_addr();
+    config.authenticator = authenticator;
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, None).with_model_discovery()
 }
 
 pub fn make_stargate_runtime_with_lb(
     id: &str,
     lb_config_path: Option<String>,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SelfDiscovery::new(id, grpc_addr, http_addr);
-    let mut config = base_config(id, grpc_addr, http_addr);
+    let mut config = base_ephemeral_config(id);
     config.lb_config_path = lb_config_path;
-    let runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener);
-    (grpc_addr, http_addr, runtime)
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, None).standard()
 }
 
 pub fn make_stargate_runtime_with_reverse(
@@ -700,20 +817,10 @@ pub fn make_stargate_runtime_with_reverse_and_lb(
     reverse_socket: Option<std::net::UdpSocket>,
     lb_config_path: Option<String>,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SelfDiscovery::new(id, grpc_addr, http_addr);
-    let mut config = base_config(id, grpc_addr, http_addr);
-    config.advertised_hostname_template = Some("localhost".to_string());
+    let mut config = base_ephemeral_config(id);
     config.lb_config_path = lb_config_path;
-    config.reverse_tunnel_listen_addr = Some(reverse_addr);
-    let mut runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener);
-    if let Some(socket) = reverse_socket {
-        runtime = runtime.with_reverse_tunnel_socket(socket);
-    }
-    (grpc_addr, http_addr, runtime)
+    let reverse_tunnel = reverse_tunnel_config(reverse_addr, reverse_socket);
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, Some(reverse_tunnel)).standard()
 }
 
 pub fn make_stargate_runtime_with_reverse_and_auth(
@@ -722,20 +829,10 @@ pub fn make_stargate_runtime_with_reverse_and_auth(
     reverse_socket: Option<std::net::UdpSocket>,
     authenticator: Arc<dyn stargate::auth::WorkerAuthenticator>,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SelfDiscovery::new(id, grpc_addr, http_addr);
-    let mut config = base_config(id, grpc_addr, http_addr);
-    config.advertised_hostname_template = Some("localhost".to_string());
-    config.reverse_tunnel_listen_addr = Some(reverse_addr);
-    let mut runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener)
-        .with_authenticator(authenticator);
-    if let Some(socket) = reverse_socket {
-        runtime = runtime.with_reverse_tunnel_socket(socket);
-    }
-    (grpc_addr, http_addr, runtime)
+    let mut config = base_ephemeral_config(id);
+    config.authenticator = authenticator;
+    let reverse_tunnel = reverse_tunnel_config(reverse_addr, reverse_socket);
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, Some(reverse_tunnel)).standard()
 }
 
 /// Creates a stargate runtime backed by a `SharedDiscovery` so that multiple
@@ -744,15 +841,9 @@ pub fn make_stargate_runtime_with_shared_discovery(
     id: &str,
     peers: Arc<Mutex<Vec<StargateInfo>>>,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SharedDiscovery::new(id, grpc_addr, http_addr, peers);
-    let mut config = base_config(id, grpc_addr, http_addr);
+    let mut config = base_ephemeral_config(id);
     config.dns_poll_interval = Duration::from_secs(1);
-    let runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener);
-    (grpc_addr, http_addr, runtime)
+    build_test_runtime(id, config, TestDiscovery::Shared(peers), None).standard()
 }
 
 /// Creates a stargate runtime backed by `SharedDiscovery` and configured with
@@ -762,16 +853,10 @@ pub fn make_stargate_runtime_with_shared_discovery_and_remote_watch_urls(
     peers: Arc<Mutex<Vec<StargateInfo>>>,
     remote_watch_stargate_urls: Vec<String>,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SharedDiscovery::new(id, grpc_addr, http_addr, peers);
-    let mut config = base_config(id, grpc_addr, http_addr);
+    let mut config = base_ephemeral_config(id);
     config.dns_poll_interval = Duration::from_secs(1);
     config.remote_watch_stargate_urls = remote_watch_stargate_urls;
-    let runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener);
-    (grpc_addr, http_addr, runtime)
+    build_test_runtime(id, config, TestDiscovery::Shared(peers), None).standard()
 }
 
 /// Like `make_stargate_runtime_with_shared_discovery` but with reverse tunnel enabled.
@@ -781,20 +866,16 @@ pub fn make_stargate_runtime_with_shared_discovery_and_reverse(
     reverse_addr: SocketAddr,
     reverse_socket: Option<std::net::UdpSocket>,
 ) -> (SocketAddr, SocketAddr, StargateRuntime) {
-    let (grpc_addr, grpc_listener) = bind_ephemeral();
-    let (http_addr, http_listener) = bind_ephemeral();
-    let discovery = SharedDiscovery::new(id, grpc_addr, http_addr, peers);
-    let mut config = base_config(id, grpc_addr, http_addr);
+    let mut config = base_ephemeral_config(id);
     config.dns_poll_interval = Duration::from_secs(1);
-    config.advertised_hostname_template = Some("localhost".to_string());
-    config.reverse_tunnel_listen_addr = Some(reverse_addr);
-    let mut runtime = StargateRuntime::new(config, Box::new(discovery))
-        .with_grpc_listener(grpc_listener)
-        .with_http_listener(http_listener);
-    if let Some(socket) = reverse_socket {
-        runtime = runtime.with_reverse_tunnel_socket(socket);
-    }
-    (grpc_addr, http_addr, runtime)
+    let reverse_tunnel = reverse_tunnel_config(reverse_addr, reverse_socket);
+    build_test_runtime(
+        id,
+        config,
+        TestDiscovery::Shared(peers),
+        Some(reverse_tunnel),
+    )
+    .standard()
 }
 
 /// Starts a dummy HTTP backend with chat completions and health endpoints.
@@ -814,29 +895,6 @@ pub async fn start_dummy_backend(model: &str) -> SocketAddr {
     addr
 }
 
-pub async fn start_counting_dummy_backend(model: &str) -> CountingDummyBackend {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let bringup_chat_requests = Arc::new(AtomicUsize::new(0));
-    let proxy_chat_requests = Arc::new(AtomicUsize::new(0));
-    let app = Router::new()
-        .route("/v1/chat/completions", post(counting_dummy_chat))
-        .route("/health", axum::routing::get(|| async { "ok" }))
-        .with_state(CountingDummyState {
-            model: model.to_string(),
-            bringup_chat_requests: bringup_chat_requests.clone(),
-            proxy_chat_requests: proxy_chat_requests.clone(),
-        });
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    CountingDummyBackend {
-        addr,
-        bringup_chat_requests,
-        proxy_chat_requests,
-    }
-}
-
 pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -844,7 +902,6 @@ pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend
     let completions_ok = Arc::new(AtomicBool::new(true));
     let completion_tokens = Arc::new(AtomicU32::new(1));
     let health_requests = Arc::new(AtomicUsize::new(0));
-    let calibration_requests = Arc::new(AtomicUsize::new(0));
     let canary_requests = Arc::new(AtomicUsize::new(0));
     let proxy_requests = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
@@ -856,7 +913,6 @@ pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend
             completions_ok: completions_ok.clone(),
             completion_tokens: completion_tokens.clone(),
             health_requests: health_requests.clone(),
-            calibration_requests: calibration_requests.clone(),
             canary_requests: canary_requests.clone(),
             proxy_requests: proxy_requests.clone(),
         });
@@ -869,7 +925,6 @@ pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend
         completions_ok,
         completion_tokens,
         health_requests,
-        calibration_requests,
         canary_requests,
     }
 }
@@ -878,33 +933,25 @@ pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend
 /// Returns `(http_addr, quic_url, tunnel_handle)`. Callers must hold the
 /// tunnel handle for the test's lifetime; dropping it shuts down the tunnel.
 pub async fn start_dummy_inst(model: &str) -> (SocketAddr, String, QuicHttpTunnelHandle) {
+    start_dummy_inst_with_models(model, &[model.to_string()]).await
+}
+
+pub async fn start_dummy_inst_with_models(
+    model: &str,
+    model_ids: &[String],
+) -> (SocketAddr, String, QuicHttpTunnelHandle) {
     let addr = start_dummy_backend(model).await;
 
-    let tunnel = start_quic_http_tunnel(QuicHttpTunnelConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("http://{addr}"),
-    ))
-    .await
-    .expect("tunnel failed to start");
+    let mut config =
+        QuicHttpTunnelConfig::new("127.0.0.1:0".parse().unwrap(), format!("http://{addr}"));
+    config.forwarding.runtime_state =
+        PylonRuntimeState::new(InferenceServerStatus::Active, model_ids);
+    let tunnel = start_quic_http_tunnel(config)
+        .await
+        .expect("tunnel failed to start");
     let tunnel_addr = tunnel.listen_addr();
     let quic_url = format!("quic://{tunnel_addr}");
     (addr, quic_url, tunnel)
-}
-
-pub async fn start_counting_dummy_inst(
-    model: &str,
-) -> (CountingDummyBackend, String, QuicHttpTunnelHandle) {
-    let backend = start_counting_dummy_backend(model).await;
-
-    let tunnel = start_quic_http_tunnel(QuicHttpTunnelConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("http://{}", backend.addr),
-    ))
-    .await
-    .expect("tunnel failed to start");
-    let tunnel_addr = tunnel.listen_addr();
-    let quic_url = format!("quic://{tunnel_addr}");
-    (backend, quic_url, tunnel)
 }
 
 /// Polls the stargate `/healthz` endpoint until it responds 200.
@@ -1182,7 +1229,8 @@ pub fn init_crypto() {
 
 pub struct BackendHandle {
     reg_client: InferenceServerRegistrationClient,
-    _channels: InferenceServerUpdateChannels,
+    _model_lifecycle: ModelLifecycleHandle,
+    _runtime_state: PylonRuntimeState,
     _tunnel: Option<QuicHttpTunnelHandle>,
 }
 
@@ -1205,8 +1253,8 @@ pub async fn start_and_register_backend(
         backend_id,
         model,
         reverse_tunnel,
-        // These tests exercise routing/discovery behavior, not calibration, so
-        // skip bringup to keep registration deterministic by default.
+        // These tests exercise routing/discovery behavior, so skip ongoing
+        // bringup to keep registration deterministic by default.
         BringupConfig {
             enabled: false,
             ..BringupConfig::default()
@@ -1223,53 +1271,126 @@ pub async fn start_and_register_backend_with_bringup(
     bringup: BringupConfig,
 ) -> BackendHandle {
     let backend_addr = start_dummy_backend(model).await;
+    let stats_config = StatsCollectorConfig::default();
+    let (runtime_state, observations) = PylonRuntimeState::observed(
+        InferenceServerStatus::Active,
+        &[],
+        stats_config.observation_channel_capacity,
+        None,
+    );
 
     let (inference_server_url, upstream_http_base_url, tunnel) = if reverse_tunnel {
         let url = format!("http://{backend_addr}");
         (url.clone(), url, None)
     } else {
-        let tunnel = start_quic_http_tunnel(QuicHttpTunnelConfig::new(
+        let mut config = QuicHttpTunnelConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             format!("http://{backend_addr}"),
-        ))
-        .await
-        .expect("tunnel failed to start");
+        );
+        config.forwarding.runtime_state = runtime_state.clone();
+        let tunnel = start_quic_http_tunnel(config)
+            .await
+            .expect("tunnel failed to start");
         let quic_url = format!("quic://{}", tunnel.listen_addr());
         (quic_url, format!("http://{backend_addr}"), Some(tunnel))
     };
 
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: seeds.to_vec(),
-                inference_server_id: backend_id.to_string(),
-                cluster_id: String::new(),
-                inference_server_url,
-                upstream_http_base_url: Some(upstream_http_base_url),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel,
-                bringup,
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
+    let stats_collector = start_stats_collector(stats_config, observations, runtime_state.clone());
+    let model_lifecycle = start_model_lifecycle(
+        ModelLifecycleConfig {
+            upstream_http_base_url: upstream_http_base_url.clone(),
+            source: ModelSource::Static(BTreeSet::from([model.to_string()])),
+            initialization: ModelInitialization::ConfiguredInputTps {
+                input_tps: 1.0,
+                pin: true,
             },
-            vec![model.to_string()],
-        )
+            bringup,
+            health_paths: pylon_lib::UpstreamHealthPaths::default(),
+            startup_health_wait: std::time::Duration::ZERO,
+        },
+        runtime_state.clone(),
+        &stats_collector,
+        None,
+    )
+    .await
+    .expect("model lifecycle failed to start");
+    let mut reg_client = InferenceServerRegistrationClient::default();
+    reg_client
+        .start(test_registration_config(
+            seeds.to_vec(),
+            backend_id,
+            inference_server_url,
+            upstream_http_base_url,
+            runtime_state.clone(),
+            reverse_tunnel,
+        ))
         .expect("registration failed");
 
     BackendHandle {
         reg_client,
-        _channels: channels,
+        _model_lifecycle: model_lifecycle,
+        _runtime_state: runtime_state,
         _tunnel: tunnel,
+    }
+}
+
+pub fn direct_registration_config(
+    seeds: Vec<String>,
+    inference_server_id: &str,
+    inference_server_url: String,
+    upstream_http_base_url: String,
+    runtime_state: PylonRuntimeState,
+) -> InferenceServerRegistrationConfig {
+    test_registration_config(
+        seeds,
+        inference_server_id,
+        inference_server_url,
+        upstream_http_base_url,
+        runtime_state,
+        false,
+    )
+}
+
+pub fn reverse_registration_config(
+    seeds: Vec<String>,
+    inference_server_id: &str,
+    upstream_http_base_url: String,
+    runtime_state: PylonRuntimeState,
+) -> InferenceServerRegistrationConfig {
+    test_registration_config(
+        seeds,
+        inference_server_id,
+        upstream_http_base_url.clone(),
+        upstream_http_base_url,
+        runtime_state,
+        true,
+    )
+}
+
+fn test_registration_config(
+    seeds: Vec<String>,
+    inference_server_id: &str,
+    inference_server_url: String,
+    _upstream_http_base_url: String,
+    runtime_state: PylonRuntimeState,
+    reverse_tunnel: bool,
+) -> InferenceServerRegistrationConfig {
+    InferenceServerRegistrationConfig {
+        seeds,
+        inference_server_id: inference_server_id.to_string(),
+        cluster_id: String::new(),
+        inference_server_url,
+        forwarding: pylon_lib::TunnelForwardingConfig {
+            runtime_state,
+            ..Default::default()
+        },
+        min_update_interval: Duration::from_millis(100),
+        reverse_tunnel,
+        tls_cert_pem: None,
+        grpc_tls_ca_cert_pem: None,
+        quic_insecure: true,
+        tunnel_protocol: Default::default(),
+        auth_token_provider: None,
     }
 }
 

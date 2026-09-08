@@ -2,9 +2,9 @@
 
 This sample supports three networking environments for multi-node GPU testing:
 
-- **AWS GB200 / EFA** -- Uses [Elastic Fabric Adapter](https://aws.amazon.com/hpc/efa/) for inter-node communication. The container, override, and `cluster_type` are configured for EFA-specific libraries and environment variables.
-- **AWS GB300 / DRA RoCE** -- Uses AWS network DRA with `roce.networking.k8s.aws` claims for GB300 clusters.
-- **NCP / Mellanox (mlx5)** -- Uses Mellanox ConnectX NICs (mlx5 driver) for RDMA networking. This is the default configuration and can be reused for any cluster with Mellanox/InfiniBand networking.
+- AWS GB200 / EFA: Uses [Elastic Fabric Adapter](https://aws.amazon.com/hpc/efa/) for inter-node communication. The chart profile configures EFA-specific resources and annotations.
+- AWS GB300 / DRA RoCE: Uses AWS network DRA with `roce.networking.k8s.aws` claims for GB300 clusters.
+- NCP / Mellanox (mlx5): Uses Mellanox ConnectX NICs (mlx5 driver) for RDMA networking. This is the default chart profile and can be reused for any cluster with Mellanox/InfiniBand networking.
 
 ## Configuration Setup
 
@@ -55,48 +55,38 @@ This base image includes Mellanox OFED drivers for RDMA/InfiniBand networking.
 
 ## Setup Override
 
-Copy the sample override file for your target environment:
+Copy the single sample override file:
 
-**AWS GB200 / EFA:**
 ```bash
-cp aws-gb200-override.yaml.sample aws-gb200-override.yaml
+cp override.yaml.sample override.yaml
 ```
 
-This override requests `vpc.amazonaws.com/efa` device resources and includes the `disable-auto-efa` pod annotation required for EFA on AWS.
+The sample sets `clusterProfile: auto`. In auto mode, Helm looks at the target Kubernetes cluster during rendering and selects one of the built-in profiles:
 
-**AWS GB300 / DRA RoCE:**
+- `aws-gb300` when `DeviceClass/roce.networking.k8s.aws` exists in `resource.k8s.io/v1`
+- `aws-gb200` when any node advertises allocatable `vpc.amazonaws.com/efa`
+- `ncp-gb200` when any node advertises allocatable `nvidia.com/mlnxnics`
+
+Auto mode needs render-time permission to read `DeviceClass` resources and list `Node` resources. If the renderer cannot use live lookup, set the profile explicitly:
+
 ```bash
-cp aws-gb300-override.yaml.sample aws-gb300-override.yaml
+helm template test multi-node-test --set clusterProfile=aws-gb200
+helm template test multi-node-test --set clusterProfile=aws-gb300
+helm template test multi-node-test --set clusterProfile=ncp-gb200
 ```
 
-This override enables AWS network DRA, disables EFA injection, and wires a `ResourceClaimTemplate` for `roce.networking.k8s.aws`.
+You can also set the same fallback in `override.yaml`:
 
-**NCP / Mellanox mlx5:**
-```bash
-cp ncp-gb200-override.yaml.sample ncp-gb200-override.yaml
+```yaml
+clusterProfile: aws-gb200
 ```
 
-This override requests `nvidia.com/mlnxnics` device resources for Mellanox NIC allocation. Use this as a starting point for any cluster with Mellanox/InfiniBand networking -- adjust the GPU count and NIC count to match your node topology.
-
-Edit the override file to match your deployment requirements:
-   - Update `nodesPerInstance` to match the number of nodes being tested
-   - Modify the `image.repository` and `tag` to point to your container image
+Top-level overrides remain supported for `nodesPerInstance`, `image`, `resources`, `podAnnotations`, `securityContext`, and `resourceClaimTemplate`. Use those only when the built-in profile needs local tuning.
 
 ## Deploy the Helm Chart
 
-**AWS GB200 / EFA:**
 ```bash
-ngc cf function deploy create --org <org> --deployment-specification <cluster>:<gpu-name>:<instance>:1:1 <function-id>:<version-id> --configuration-file aws-gb200-override.yaml
-```
-
-**AWS GB300 / DRA RoCE:**
-```bash
-ngc cf function deploy create --org <org> --deployment-specification <cluster>:<gpu-name>:<instance>:1:1 <function-id>:<version-id> --configuration-file aws-gb300-override.yaml
-```
-
-**NCP / Mellanox mlx5:**
-```bash
-ngc cf function deploy create --org <org> --deployment-specification <cluster>:<gpu-name>:<instance>:1:1 <function-id>:<version-id> --configuration-file ncp-gb200-override.yaml
+ngc cf function deploy create --org <org> --deployment-specification <cluster>:<gpu-name>:<instance>:1:1 <function-id>:<version-id> --configuration-file override.yaml
 ```
 
 ## Run test against endpoint
@@ -245,4 +235,5 @@ To list available testcases, you can run `nvbandwidth -l` in the container.
 - Bandwidth tests come from here: https://github.com/NVIDIA/nvbandwidth
 - Kubernetes 1.28 or newer is required due to Service using `apps.kubernetes.io/pod-index` label selector
 - Kubernetes 1.32 or newer is required for the AWS GB300 DRA path because the sample renders `ResourceClaimTemplate` with `resource.k8s.io/v1`
+- `clusterProfile: auto` requires Helm rendering against a live cluster. Offline rendering should use the default `ncp-gb200` profile or set `clusterProfile` explicitly.
 - The `cluster_type` parameter controls which networking environment variables are set for MPI. Use `"aws-gb200"` for the EFA fabric provider, `"aws-gb300"` for AWS network DRA with RoCE, or `"ncp-mlx5"` for InfiniBand with `NCCL_IB_DISABLE=0`, `NCCL_NVLS_DISABLE=1`, `NCCL_IB_GID_INDEX=3`, and `NCCL_NET_GDR_LEVEL=PHB`.

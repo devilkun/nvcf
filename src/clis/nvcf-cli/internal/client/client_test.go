@@ -20,6 +20,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log"
@@ -34,9 +35,12 @@ import (
 	"nvcf-cli/internal/state"
 
 	"github.com/spf13/viper"
+	"golang.org/x/oauth2"
 )
 
 func ptrInt(v int) *int { return &v }
+
+func ptrUint32(v uint32) *uint32 { return &v }
 
 type invokeRequestCaptureTransport struct {
 	req *http.Request
@@ -53,21 +57,28 @@ func (t *invokeRequestCaptureTransport) RoundTrip(req *http.Request) (*http.Resp
 }
 
 type updateRequestCaptureTransport struct {
-	req  *http.Request
-	body []byte
+	req          *http.Request
+	body         []byte
+	responseBody string
 }
 
 func (t *updateRequestCaptureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.req = req
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, err
+	if req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		t.body = body
 	}
-	t.body = body
+	responseBody := t.responseBody
+	if responseBody == "" {
+		responseBody = `{"ok":true}`
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		Body:       io.NopCloser(strings.NewReader(responseBody)),
 		Request:    req,
 	}, nil
 }
@@ -156,6 +167,36 @@ func TestBaseHTTPURLHost(t *testing.T) {
 				t.Errorf("baseHTTPURLHost(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNewClientOAuth2UsesConfiguredTLSConfig(t *testing.T) {
+	tlsConfig := &tls.Config{ServerName: "private-ca.example.test"}
+	client, err := NewClient(&Config{
+		AuthType:            AuthTypeOAuth2,
+		OAuth2ClientID:      "client-id",
+		OAuth2ClientSecret:  "client-secret",
+		OAuth2TokenEndpoint: "https://auth.example.test/token",
+		BaseHTTPURL:         "https://api.example.test",
+		BaseGRPCURL:         "127.0.0.1:0",
+		DefaultTimeout:      time.Second,
+		TLSConfig:           tlsConfig,
+	})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	defer client.Close()
+
+	oauthTransport, ok := client.httpClient.Transport.(*oauth2.Transport)
+	if !ok {
+		t.Fatalf("HTTP transport = %T, want *oauth2.Transport", client.httpClient.Transport)
+	}
+	baseTransport, ok := oauthTransport.Base.(*http.Transport)
+	if !ok {
+		t.Fatalf("OAuth2 base transport = %T, want *http.Transport", oauthTransport.Base)
+	}
+	if baseTransport.TLSClientConfig != tlsConfig {
+		t.Fatalf("TLSClientConfig = %p, want configured TLS config %p", baseTransport.TLSClientConfig, tlsConfig)
 	}
 }
 
@@ -538,6 +579,252 @@ func TestUpdateFunctionMetadataSendsModelUpdatesToFunctionEndpoint(t *testing.T)
 	}
 	if got, want := llmConfig["tokenRateLimit"], "1000-M"; got != want {
 		t.Fatalf("tokenRateLimit = %#v, want %q", got, want)
+	}
+}
+
+func TestCreateFunctionSendsLLMInvocationConfig(t *testing.T) {
+	capture := &updateRequestCaptureTransport{
+		responseBody: `{
+			"function": {
+				"id": "func-123",
+				"versionId": "ver-456",
+				"llmInvocationConfig": {
+					"priority": {
+						"defaultPriority": 0,
+						"perAccountPriority": {"account-1": 3}
+					}
+				}
+			}
+		}`,
+	}
+	client := &Client{
+		config:     &Config{Token: "token"},
+		baseURL:    "https://api.example.com",
+		httpClient: &http.Client{Transport: capture},
+	}
+
+	result, err := client.CreateFunction(context.Background(), &CreateFunctionRequest{
+		Name:          "llm-function",
+		InferenceURL:  "/v1/chat/completions",
+		InferencePort: 8000,
+		FunctionType:  "LLM",
+		LLMInvocationConfig: &LLMInvocationConfigDto{
+			Priority: &PriorityDto{
+				DefaultPriority: ptrUint32(0),
+				PerAccountPriority: map[string]uint32{
+					"account-1": 3,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateFunction returned error: %v", err)
+	}
+	if capture.req == nil {
+		t.Fatal("expected create request")
+	}
+	if got, want := capture.req.Method, http.MethodPost; got != want {
+		t.Fatalf("method = %q, want %q", got, want)
+	}
+	if got, want := capture.req.URL.Path, "/v2/nvcf/functions"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(capture.body, &payload); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	invocationConfig, ok := payload["llmInvocationConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("llmInvocationConfig = %#v, want object", payload["llmInvocationConfig"])
+	}
+	priority, ok := invocationConfig["priority"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("priority = %#v, want object", invocationConfig["priority"])
+	}
+	if got, want := priority["defaultPriority"], float64(0); got != want {
+		t.Fatalf("defaultPriority = %#v, want %#v", got, want)
+	}
+	perAccountPriority, ok := priority["perAccountPriority"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("perAccountPriority = %#v, want object", priority["perAccountPriority"])
+	}
+	if got, want := perAccountPriority["account-1"], float64(3); got != want {
+		t.Fatalf("perAccountPriority[account-1] = %#v, want %#v", got, want)
+	}
+	assertLLMInvocationConfig(t, result.Function.LLMInvocationConfig, 0, map[string]uint32{"account-1": 3})
+}
+
+func TestUpdateFunctionMetadataSendsAndClearsLLMInvocationConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *LLMInvocationConfigDto
+		assert func(*testing.T, map[string]interface{})
+	}{
+		{
+			name: "configured priority",
+			config: &LLMInvocationConfigDto{
+				Priority: &PriorityDto{
+					DefaultPriority: ptrUint32(7),
+				},
+			},
+			assert: func(t *testing.T, invocationConfig map[string]interface{}) {
+				t.Helper()
+				priority, ok := invocationConfig["priority"].(map[string]interface{})
+				if !ok {
+					t.Fatalf("priority = %#v, want object", invocationConfig["priority"])
+				}
+				if got, want := priority["defaultPriority"], float64(7); got != want {
+					t.Fatalf("defaultPriority = %#v, want %#v", got, want)
+				}
+			},
+		},
+		{
+			name:   "cleared configuration",
+			config: &LLMInvocationConfigDto{},
+			assert: func(t *testing.T, invocationConfig map[string]interface{}) {
+				t.Helper()
+				if len(invocationConfig) != 0 {
+					t.Fatalf("llmInvocationConfig = %#v, want empty object", invocationConfig)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capture := &updateRequestCaptureTransport{}
+			client := &Client{
+				config:     &Config{Token: "token"},
+				baseURL:    "https://api.example.com",
+				httpClient: &http.Client{Transport: capture},
+			}
+
+			err := client.UpdateFunctionMetadata(context.Background(), "func-123", "ver-456", &UpdateFunctionMetadataRequest{
+				LLMInvocationConfig: tt.config,
+			})
+			if err != nil {
+				t.Fatalf("UpdateFunctionMetadata returned error: %v", err)
+			}
+			if capture.req == nil {
+				t.Fatal("expected update request")
+			}
+			if got, want := capture.req.Method, http.MethodPut; got != want {
+				t.Fatalf("method = %q, want %q", got, want)
+			}
+			if got, want := capture.req.URL.Path, "/v2/nvcf/functions/func-123/versions/ver-456"; got != want {
+				t.Fatalf("path = %q, want %q", got, want)
+			}
+
+			var payload map[string]interface{}
+			if err := json.Unmarshal(capture.body, &payload); err != nil {
+				t.Fatalf("unmarshal request body: %v", err)
+			}
+			invocationConfig, ok := payload["llmInvocationConfig"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("llmInvocationConfig = %#v, want object", payload["llmInvocationConfig"])
+			}
+			tt.assert(t, invocationConfig)
+		})
+	}
+}
+
+func TestGetFunctionDecodesLLMInvocationConfig(t *testing.T) {
+	capture := &updateRequestCaptureTransport{
+		responseBody: functionResponseWithPriorityJSON,
+	}
+	client := &Client{
+		config:     &Config{Token: "token"},
+		baseURL:    "https://api.example.com",
+		httpClient: &http.Client{Transport: capture},
+	}
+
+	result, err := client.GetFunction(context.Background(), "func-123", "ver-456")
+	if err != nil {
+		t.Fatalf("GetFunction returned error: %v", err)
+	}
+	assertLLMInvocationConfig(t, result.Function.LLMInvocationConfig, 0, map[string]uint32{"account-1": 3})
+}
+
+func TestGetFunctionDetailsDecodesLLMInvocationConfig(t *testing.T) {
+	capture := &updateRequestCaptureTransport{
+		responseBody: functionResponseWithPriorityJSON,
+	}
+	client := &Client{
+		config:     &Config{Token: "token"},
+		baseURL:    "https://api.example.com",
+		httpClient: &http.Client{Transport: capture},
+	}
+
+	result, err := client.GetFunctionDetails(context.Background(), "func-123", "ver-456")
+	if err != nil {
+		t.Fatalf("GetFunctionDetails returned error: %v", err)
+	}
+	assertLLMInvocationConfig(t, result.LLMInvocationConfig, 0, map[string]uint32{"account-1": 3})
+
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal function details: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"defaultPriority":0`) {
+		t.Fatalf("JSON output %s does not preserve explicit defaultPriority 0", encoded)
+	}
+}
+
+func TestListFunctionsDecodesLLMInvocationConfig(t *testing.T) {
+	capture := &updateRequestCaptureTransport{
+		responseBody: `{"functions":[` + functionWithPriorityJSON + `]}`,
+	}
+	client := &Client{
+		config:     &Config{Token: "token"},
+		baseURL:    "https://api.example.com",
+		httpClient: &http.Client{Transport: capture},
+	}
+
+	result, err := client.ListFunctions(context.Background())
+	if err != nil {
+		t.Fatalf("ListFunctions returned error: %v", err)
+	}
+	if len(result.Functions) != 1 {
+		t.Fatalf("functions length = %d, want 1", len(result.Functions))
+	}
+	assertLLMInvocationConfig(t, result.Functions[0].LLMInvocationConfig, 0, map[string]uint32{"account-1": 3})
+}
+
+const functionWithPriorityJSON = `{
+	"id": "func-123",
+	"versionId": "ver-456",
+	"llmInvocationConfig": {
+		"priority": {
+			"defaultPriority": 0,
+			"perAccountPriority": {"account-1": 3}
+		}
+	}
+}`
+
+const functionResponseWithPriorityJSON = `{"function":` + functionWithPriorityJSON + `}`
+
+func assertLLMInvocationConfig(t *testing.T, config *LLMInvocationConfigDto, defaultPriority uint32, perAccountPriority map[string]uint32) {
+	t.Helper()
+	if config == nil {
+		t.Fatal("llmInvocationConfig is nil")
+	}
+	if config.Priority == nil {
+		t.Fatal("priority is nil")
+	}
+	if config.Priority.DefaultPriority == nil {
+		t.Fatal("defaultPriority is nil")
+	}
+	if got := *config.Priority.DefaultPriority; got != defaultPriority {
+		t.Fatalf("defaultPriority = %d, want %d", got, defaultPriority)
+	}
+	if len(config.Priority.PerAccountPriority) != len(perAccountPriority) {
+		t.Fatalf("perAccountPriority = %#v, want %#v", config.Priority.PerAccountPriority, perAccountPriority)
+	}
+	for account, want := range perAccountPriority {
+		if got := config.Priority.PerAccountPriority[account]; got != want {
+			t.Fatalf("perAccountPriority[%s] = %d, want %d", account, got, want)
+		}
 	}
 }
 
@@ -1178,6 +1465,9 @@ func TestLoadConfigUsesStateForActiveConfigFile(t *testing.T) {
 	t.Setenv("NVCF_TOKEN", "")
 	t.Setenv("NVCF_API_KEY", "")
 	t.Setenv("HOME", t.TempDir())
+	// Rebuild the state manager so it points at the temp HOME above;
+	// it is otherwise built at package init and reads the real one.
+	state.ResetDefaultStateManager()
 
 	configPath := filepath.Join(t.TempDir(), "nvcf-cli-local.yaml")
 	configBody := []byte(`
@@ -1221,5 +1511,92 @@ client_id: "nvcf-default"
 	}
 	if config.BaseHTTPURL != "http://api.localhost:8080" {
 		t.Fatalf("BaseHTTPURL = %q, want http://api.localhost:8080", config.BaseHTTPURL)
+	}
+}
+
+func TestLoadConfigAuthCredentials(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		// wantAuth is empty when LoadConfig must fail.
+		wantAuth AuthType
+		want     []string
+		omit     []string
+	}{
+		{
+			name: "nothing set",
+			want: []string{"NVCF_API_KEY or NVCF_TOKEN", "NVCF_OAUTH2_CLIENT_ID", "NVCF_OAUTH2_CLIENT_SECRET", "NVCF_OAUTH2_TOKEN_ENDPOINT"},
+		},
+		{
+			name: "partial oauth2 setup",
+			env: map[string]string{
+				"NVCF_OAUTH2_CLIENT_ID":     "client-id",
+				"NVCF_OAUTH2_CLIENT_SECRET": "client-secret",
+			},
+			want: []string{"NVCF_OAUTH2_TOKEN_ENDPOINT"},
+			omit: []string{"NVCF_OAUTH2_CLIENT_ID", "NVCF_OAUTH2_CLIENT_SECRET"},
+		},
+		{
+			name:     "api key set",
+			env:      map[string]string{"NVCF_API_KEY": "api-key"},
+			wantAuth: AuthTypeBearer,
+		},
+		{
+			name:     "token set",
+			env:      map[string]string{"NVCF_TOKEN": "token"},
+			wantAuth: AuthTypeBearer,
+		},
+		{
+			name: "complete oauth2 setup",
+			env: map[string]string{
+				"NVCF_OAUTH2_CLIENT_ID":      "client-id",
+				"NVCF_OAUTH2_CLIENT_SECRET":  "client-secret",
+				"NVCF_OAUTH2_TOKEN_ENDPOINT": "https://oauth2.localhost/token",
+			},
+			wantAuth: AuthTypeOAuth2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			viper.Reset()
+			viper.SetEnvPrefix("NVCF")
+			viper.AutomaticEnv()
+			t.Cleanup(func() { viper.Reset() })
+			t.Setenv("HOME", t.TempDir())
+			// Rebuild the state manager so it points at the temp HOME above;
+			// it is otherwise built at package init and reads the real one.
+			state.ResetDefaultStateManager()
+			for _, key := range []string{"NVCF_API_KEY", "NVCF_TOKEN", "NVCF_OAUTH2_CLIENT_ID", "NVCF_OAUTH2_CLIENT_SECRET", "NVCF_OAUTH2_TOKEN_ENDPOINT"} {
+				t.Setenv(key, "")
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+
+			config, err := LoadConfig()
+			if tc.wantAuth != "" {
+				if err != nil {
+					t.Fatalf("LoadConfig() error = %v, want success", err)
+				}
+				if config.AuthType != tc.wantAuth {
+					t.Fatalf("AuthType = %q, want %q", config.AuthType, tc.wantAuth)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("LoadConfig() = nil error, want missing credentials error")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name missing %s", err, want)
+				}
+			}
+			for _, omit := range tc.omit {
+				if strings.Contains(err.Error(), omit) {
+					t.Errorf("error %q names %s, which is set", err, omit)
+				}
+			}
+		})
 	}
 }

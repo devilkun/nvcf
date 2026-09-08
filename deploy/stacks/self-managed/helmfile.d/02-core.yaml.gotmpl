@@ -8,8 +8,19 @@ environments:
 
 repositories:
   - name: nvcf
+{{- if dig "global" "helm" "sources" "url" "" .Values }}
+    url: {{ .Values.global.helm.sources.url | quote }}
+    {{- if dig "global" "helm" "sources" "username" "" .Values }}
+    username: {{ dig "global" "helm" "sources" "username" "" .Values | quote }}
+    {{- end }}
+    {{- if dig "global" "helm" "sources" "password" "" .Values }}
+    password: {{ dig "global" "helm" "sources" "password" "" .Values | quote }}
+    {{- end }}
+{{- else }}
     url: {{ .Values.global.helm.sources.registry }}/{{ .Values.global.helm.sources.repository }}
     oci: true
+{{- end }}
+
 
 helmDefaults:
   createNamespace: true
@@ -33,34 +44,35 @@ releases:
 
   # --- NVCF Services ---
   - name: api-keys
-    version: 1.5.1
+    version: 1.7.0
     namespace: api-keys
     inherit:
       - template: service
 
   - name: sis
-    version: 1.17.0
+    version: 2.1.0
     namespace: sis
     inherit:
       - template: service
+    condition: icms.enabled
 
   - name: api
-    version: 1.21.1
+    version: 1.25.6
     namespace: nvcf
     inherit:
       - template: service
     needs:
       # not needed to start, but needed for bootstrapping account which is done with a script in the api helm chart
       - ess/ess-api
-                      
+
   - name: nvct-api
-    version: 1.3.1
+    version: 1.5.3
     namespace: nvcf
     inherit:
       - template: service
 
   - name: invocation-service
-    version: 1.5.4
+    version: 1.6.0
     namespace: nvcf
     inherit:
       - template: service
@@ -68,7 +80,7 @@ releases:
       - nvcf/api
 
   - name: grpc-proxy
-    version: 1.6.4
+    version: 1.7.2
     namespace: nvcf
     inherit:
       - template: service
@@ -77,7 +89,7 @@ releases:
 
   - name: ratelimiter
     chart: nvcf/helm-nvcf-rate-limiter
-    version: 1.0.2
+    version: 1.2.0
     namespace: nvcf
     condition: rateLimiter.enabled
     values:
@@ -88,20 +100,20 @@ releases:
       - nvcf/api
 
   - name: ess-api
-    version: 1.6.0
+    version: 1.8.1
     namespace: ess
     inherit:
       - template: service
 
   - name: notary-service
-    version: 1.4.1
+    version: 1.5.1
     namespace: nvcf
     inherit:
       - template: service
 
   - name: admin-issuer-proxy
     chart: nvcf/helm-admin-token-issuer-proxy
-    version: 1.3.2
+    version: 1.5.2
     namespace: api-keys
     values:
       - ../global.yaml.gotmpl
@@ -154,8 +166,11 @@ releases:
       release-group: services
 
   - name: llm-request-router
-    chart: nvcf/helm-nvcf-llm-request-router
-    version: 1.6.2
+    {{- $llmRequestRouterChartPath := dig "addons" "llm" "requestRouter" "chartPath" "" .Values }}
+    chart: {{ $llmRequestRouterChartPath | default "nvcf/helm-nvcf-llm-request-router" | quote }}
+    {{- if not $llmRequestRouterChartPath }}
+    version: 1.13.3
+    {{- end }}
     namespace: nvcf
     condition: addons.llm.enabled
     values:
@@ -167,7 +182,7 @@ releases:
 
   - name: llm-api-gateway
     chart: nvcf/helm-nvcf-llm-api-gateway
-    version: 1.2.0
+    version: 1.4.3
     namespace: nvcf
     condition: addons.llm.enabled
     values:
@@ -178,7 +193,7 @@ releases:
       release-group: services
 
   - name: vanity-gateway
-    version: 0.1.0-nvcf-10204.1
+    version: 0.4.1
     namespace: nvcf
     condition: addons.vanityGateway.enabled
     inherit:
@@ -188,13 +203,29 @@ releases:
     labels:
       release-group: services
 
+  - name: nvcf-ui
+    chart: nvcf/helm-nvcf-ui
+    version: 1.1.2
+    namespace: nvcf-ui
+    condition: addons.nvcfUi.enabled
+    values:
+      - ../global.yaml.gotmpl
+    labels:
+      release-group: services
+
   # --- Gateway API Ingress ---
   - name: ingress
-    chart: nvcf/nvcf-gateway-routes
-    version: 1.13.0
+    {{- $gatewayRoutesChartPath := dig "ingress" "gatewayApi" "chartPath" "" .Values }}
+    chart: {{ $gatewayRoutesChartPath | default "nvcf/nvcf-gateway-routes" | quote }}
+    {{- if not $gatewayRoutesChartPath }}
+    version: 1.18.0
+    {{- end }}
     needs:
       - nvcf/notary-service
       - api-keys/api-keys
+      {{- if dig "addons" "nvcfUi" "enabled" false .Values }}
+      - nvcf-ui/nvcf-ui
+      {{- end }}
     namespace: {{ .Values.ingress.gatewayApi.controllerNamespace }}
     condition: ingress.gatewayApi.enabled
     values:

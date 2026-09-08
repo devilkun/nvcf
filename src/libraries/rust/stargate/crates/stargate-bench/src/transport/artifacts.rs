@@ -59,7 +59,7 @@ pub fn write_transport_benchmark_artifacts(
         .with_context(|| format!("failed to write {}", report_path.display()))?;
 
     let multiple_trials = [
-        TransportKind::CustomProtocol,
+        TransportKind::RawQuic,
         TransportKind::Http3H3Quinn,
         TransportKind::WebTransportH3Quinn,
     ]

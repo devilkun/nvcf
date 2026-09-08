@@ -33,13 +33,23 @@ go_library(
         "olric_stats.go",
         "olric_store.go",
         "rate_limiter.go",
+        "version.go",
     ],
     importpath = "ratelimiter",
     visibility = ["//visibility:public"],
+    # Build-time stamping, resolved by tools/workspace_status.sh when bazel
+    # is invoked with --stamp (the CI release jobs pass it). STABLE_VERSION
+    # is the release semver, which is also the primary container tag, so the
+    # reported service.version matches the image tag. getVersion() prefers
+    # the VERSION env var, then this stamped value, then the Go VCS build
+    # info (absent under Bazel).
+    x_defs = {
+        "ratelimiter.version": "{STABLE_VERSION}",
+    },
     deps = [
-        "//credentials",
-        "//nvcf/pb",
-        "//pb",
+        "//src/invocation-plane-services/ratelimiter/credentials",
+        "//src/invocation-plane-services/ratelimiter/nvcf/pb",
+        "//src/invocation-plane-services/ratelimiter/pb",
         "@com_github_auth0_go_jwt_middleware_v2//jwks",
         "@com_github_auth0_go_jwt_middleware_v2//validator",
         "@com_github_carlmjohnson_versioninfo//:versioninfo",
@@ -90,10 +100,12 @@ go_test(
     srcs = [
         "nvcf_client_test.go",
         "rate_limiter_test.go",
+        "version_test.go",
     ],
     embed = [":ratelimiter"],
     deps = [
-        "//nvcf/pb",
+        "//src/invocation-plane-services/ratelimiter/nvcf/pb",
+        "@com_github_carlmjohnson_versioninfo//:versioninfo",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@com_github_ulule_limiter_v3//drivers/store/memory",

@@ -13,40 +13,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod calibration;
+use std::time::Duration;
+
 mod client;
 mod discovery;
 mod grpc_endpoint;
 mod reverse_tunnel;
 mod router_stream;
 mod state;
-mod task_lifecycle;
 #[cfg(test)]
 mod tests;
+mod topology;
 mod types;
 mod urls;
 
 pub use client::InferenceServerRegistrationClient;
-pub use state::CurrentModelStats;
-pub use types::{ClientError, InferenceServerRegistrationConfig, InferenceServerUpdateChannels};
+pub use types::{ClientError, InferenceServerRegistrationConfig};
 
-#[cfg(test)]
-use calibration::*;
-#[cfg(test)]
-use discovery::*;
-#[cfg(test)]
-use grpc_endpoint::*;
-#[cfg(test)]
-use reverse_tunnel::*;
-#[cfg(test)]
-use router_stream::*;
-#[cfg(test)]
-use state::*;
-use task_lifecycle::{
-    CLUSTER_CALIBRATION_SUBMISSION_TIMEOUT, NamedJoinHandle, REGISTRATION_TASK_SHUTDOWN_TIMEOUT,
-    REVERSE_TUNNEL_CONNECT_TIMEOUT, await_named_join_handle, registration_should_stop, should_stop,
-    sleep_until_registration_stop, stop_channel_changed,
-};
-#[cfg(test)]
-use types::RegistrationStartPlan;
 use urls::normalize_addr;
+
+const REVERSE_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

@@ -18,7 +18,10 @@ pub mod grpc;
 pub mod health;
 pub mod metrics;
 pub mod quic;
+mod tls;
 pub mod watcher;
+pub mod webtransport;
+mod webtransport_network;
 
 #[cfg(test)]
 pub(crate) mod perf_tests {

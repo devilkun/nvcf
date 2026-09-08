@@ -42,6 +42,7 @@ import (
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
 	nvcav2beta1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/miniservice"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce/kaischeduler"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/storage"
@@ -50,8 +51,9 @@ import (
 
 const (
 	defaultServiceAccountName = "default"
-	// serviceAccountName for all workload objects
-	serviceAccountName = "miniservice-instance-permissions"
+	// serviceAccountName for all workload objects. Sourced from pkg/miniservice so the name
+	// stays in sync with the admission webhook that must match this ServiceAccount.
+	serviceAccountName = miniservice.InstanceServiceAccountName
 
 	instanceRBACConfigMapName = "nvca-miniservice-rbac"
 	// This Role will be created externally in the requests namespace.
@@ -359,7 +361,7 @@ func (r *Reconciler) ensureImageCredentialUpdaterObjects(
 	// All Pods created by NVCA must use the same scheduler.
 	if r.FeatureFlagFetcher.IsFeatureFlagEnabled(featureflag.KAIScheduler) {
 		tprUpdaterInitJob.Spec.Template.Spec.SchedulerName = kaischeduler.SchedulerName
-		tprUpdaterInitJob.Spec.Template.Labels[kaischeduler.SchedulerQueueLabel] = kaischeduler.GetQName()
+		tprUpdaterInitJob.Spec.Template.Labels[kaischeduler.SchedulerQueueLabel] = kaischeduler.DefaultQueue
 	}
 
 	// Set TTL to 1 hour so jobs are cleaned up in case of terminal failure

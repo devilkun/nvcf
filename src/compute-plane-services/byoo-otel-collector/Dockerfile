@@ -54,13 +54,13 @@ RUN cd otelcol && \
 ####
 ### Stage 3: Create the final Distroless image for byoo-otel-collector
 ####
-FROM nvcr.io/nvidia/distroless/go:v4.0.4 AS byoo-otel-collector
+FROM nvcr.io/nvidia/distroless/go:v4.1.2 AS byoo-otel-collector
 
 WORKDIR /app
 
 COPY --from=builder /app/bin/byoo-otel-collector .
 COPY --from=builder-otelcol /app/output/otelcol-contrib .
 
-EXPOSE 14357/tcp 14358/tcp 13133/tcp 18888/tcp 19090/tcp
+EXPOSE 14357/tcp 14358/tcp 13133/tcp 18888/tcp 19090/tcp 19091/tcp
 
 ENTRYPOINT ["/app/byoo-otel-collector"]

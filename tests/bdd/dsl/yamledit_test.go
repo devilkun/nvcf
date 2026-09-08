@@ -87,10 +87,10 @@ list:
 `)
 
 	cases := []struct {
-		name    string
-		key     string
-		want    string
-		found   bool
+		name  string
+		key   string
+		want  string
+		found bool
 	}{
 		{"map leaf", "global.image.registry", "nvcr.io", true},
 		{"list index", "list[1]", "second", true},
@@ -111,6 +111,34 @@ list:
 			}
 		})
 	}
+}
+
+func TestRequireNonEmptyYAMLKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registration.yaml")
+	writeFile(t, path, `clusterID: cluster-123
+clusterGroupID: ""
+selfManaged:
+  identitySource: psat
+`)
+
+	if err := RequireNonEmptyYAMLKeys(path, []string{"clusterID", "selfManaged.identitySource"}); err != nil {
+		t.Fatalf("non-empty keys: %v", err)
+	}
+
+	t.Run("missing key", func(t *testing.T) {
+		err := RequireNonEmptyYAMLKeys(path, []string{"clusterID", "missingID"})
+		if err == nil || !strings.Contains(err.Error(), `row 2`) || !strings.Contains(err.Error(), `key "missingID" is missing`) {
+			t.Fatalf("err = %v, want row-specific missing-key error", err)
+		}
+	})
+
+	t.Run("empty value", func(t *testing.T) {
+		err := RequireNonEmptyYAMLKeys(path, []string{"clusterGroupID"})
+		if err == nil || !strings.Contains(err.Error(), `row 1`) || !strings.Contains(err.Error(), `key "clusterGroupID" is empty`) {
+			t.Fatalf("err = %v, want row-specific empty-value error", err)
+		}
+	})
 }
 
 func TestMatchYAMLSubtreeExactAndSubset(t *testing.T) {
@@ -175,6 +203,59 @@ func TestMatchYAMLSubtreeInterpolatesExpected(t *testing.T) {
 	}
 }
 
+func TestMatchYAMLDocumentSubsetInterpolatesExpected(t *testing.T) {
+	t.Setenv("BDD_TEST_GATEWAY", "gateway.example.invalid")
+	actual := `apiVersion: v1
+kind: ConfigMap
+data:
+  API_URL: http://gateway.example.invalid
+  EXTRA: preserved
+`
+	expected := `data:
+  API_URL: http://${BDD_TEST_GATEWAY}
+`
+	if err := MatchYAMLDocument(actual, expected, MatchSubset); err != nil {
+		t.Fatalf("document subset: %v", err)
+	}
+}
+
+func TestMatchYAMLDocumentHelmValuesSubset(t *testing.T) {
+	t.Setenv("BDD_TMP_COLLECTOR_ENABLED", "true")
+	actual := `selfManaged:
+  otelCollector:
+    enabled: true
+    imageTag: 0.157.9
+`
+	expected := `selfManaged:
+  otelCollector:
+    enabled: ${BDD_TMP_COLLECTOR_ENABLED}
+`
+	if err := MatchYAMLDocument(actual, expected, MatchSubset); err != nil {
+		t.Fatalf("Helm values subset: %v", err)
+	}
+}
+
+func TestMatchYAMLDocumentMismatchDoesNotExposeValues(t *testing.T) {
+	actual := `data:
+  token: actual-secret-value
+`
+	expected := `data:
+  token: expected-secret-value
+`
+	err := MatchYAMLDocument(actual, expected, MatchSubset)
+	if err == nil {
+		t.Fatal("expected mismatch")
+	}
+	if !strings.Contains(err.Error(), "data.token") {
+		t.Fatalf("error %q does not name the mismatched path", err)
+	}
+	for _, sensitive := range []string{"actual-secret-value", "expected-secret-value"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("error %q exposes %q", err, sensitive)
+		}
+	}
+}
+
 func TestSubstituteFileReplacesPlaceholder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "secrets.yaml")
@@ -189,6 +270,46 @@ func TestSubstituteFileReplacesPlaceholder(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "real-value") {
 		t.Fatalf("replacement missing:\n%s", got)
+	}
+}
+
+func TestSubstituteFileBlockReplacesExactBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "global.yaml.gotmpl")
+	writeFile(t, path, "before\nold one\nold two\nafter\n")
+
+	spec := "old one\nold two\n---\nnew one\nnew two"
+	if err := SubstituteFileBlock(path, spec); err != nil {
+		t.Fatalf("substitute block: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	if string(got) != "before\nnew one\nnew two\nafter\n" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestSubstituteFileBlockRejectsMalformedSpec(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "global.yaml.gotmpl")
+	writeFile(t, path, "old\n")
+
+	err := SubstituteFileBlock(path, "old\nnew")
+	if err == nil || !strings.Contains(err.Error(), "separator") {
+		t.Fatalf("err = %v, want separator error", err)
+	}
+}
+
+func TestSubstituteFileBlockRejectsMissingOldBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "global.yaml.gotmpl")
+	writeFile(t, path, "different\n")
+
+	err := SubstituteFileBlock(path, "old\n---\nnew")
+	if err == nil || !strings.Contains(err.Error(), "not present") {
+		t.Fatalf("err = %v, want missing old block error", err)
 	}
 }
 

@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"os"
 	"time"
@@ -33,8 +34,22 @@ import (
 // newClusterClientForSelfHosted is a package-level seam so unit tests can
 // inject a fake without hitting a real ICMS endpoint. Production callers use the
 // default factory; tests assign a closure that returns a fakeClusterClient.
+//
+// The factory threads selfHostedToken (the --token flag) into the underlying
+// *client.Config. When --token is supplied by a CI/non-interactive caller, the
+// admin JWT must be used as the Bearer on cluster-management requests. Without
+// this plumbing the SIS register call would race the auth-gate and hit /v1
+// with no Authorization header.
 var newClusterClientForSelfHosted = func(icmsURL string) (selfhosted.ClusterClient, error) {
-	return selfhosted.NewClusterClient(icmsURL)
+	return selfhosted.NewClusterClientWithToken(icmsURL, selfHostedToken)
+}
+
+// newClusterClientForSelfHostedWithTrust is the trust-aware seam used by the
+// compute-plane register flow (R-4): it applies the control-plane profile's
+// managementTls to the management-API client. Tests override it like the
+// plain factory above.
+var newClusterClientForSelfHostedWithTrust = func(icmsURL string, tlsCfg *tls.Config) (selfhosted.ClusterClient, error) {
+	return selfhosted.NewClusterClientWithTokenAndTrust(icmsURL, selfHostedToken, tlsCfg)
 }
 
 // loadClusterIdentityConfig is a package-level seam so unit tests can verify
@@ -104,28 +119,43 @@ func runSelfHostedInstall(c *cobra.Command, _ []string) error {
 		return fmt.Errorf("--compute-plane requires --cluster-name")
 	}
 
+	var stackSource, stackOCI string
+	if installControlPlane {
+		stackSource = selfHostedControlPlaneStack
+		stackOCI = builtInControlPlaneStackOCI()
+	} else {
+		stackSource = selfHostedComputePlaneStack
+		stackOCI = builtInComputePlaneStackOCI()
+	}
 	resolved, err := selfhosted.ResolveStack(c.Context(), selfhosted.StackOptions{
-		Source:        selfHostedStack,
-		BuiltInOCIRef: builtInStackOCI(),
+		Source:        stackSource,
+		BuiltInOCIRef: stackOCI,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(c.ErrOrStderr(), ">>> Resolving stack: %s\n", stackDescriptor(resolved))
 
+	helmRuntimeMode, err := resolveSelfHostedHelmRuntimeMode(c.Context())
+	if err != nil {
+		return fmt.Errorf("resolving helm runtime: %w", err)
+	}
+
 	if installControlPlane {
 		if err := selfhosted.Render(selfhosted.RenderOptions{
-			StackPath:   resolved.Path,
-			Env:         selfHostedEnv,
-			Apply:       !selfHostedNoApply,
-			KubeContext: selfHostedControlPlaneContext, // M+9: empty in single-cluster mode
-			Stdout:      c.OutOrStdout(),
-			Stderr:      c.ErrOrStderr(),
-			Ctx:         c.Context(),
+			StackPath:       resolved.Path,
+			Env:             selfHostedEnv,
+			Apply:           !selfHostedNoApply,
+			HelmRuntimeMode: helmRuntimeMode,
+			KubeContext:     selfHostedControlPlaneContext, // M+9: empty in single-cluster mode
+			Stdout:          c.OutOrStdout(),
+			Stderr:          c.ErrOrStderr(),
+			Ctx:             c.Context(),
 		}); err != nil {
 			return err
 		}
 		path, err := writeControlPlaneProfile(controlPlaneProfileWriteRequest{
+			Ctx:                 c.Context(),
 			StackPath:           resolved.Path,
 			ClusterName:         installClusterName,
 			NCAID:               installNCAID,
@@ -135,6 +165,7 @@ func runSelfHostedInstall(c *cobra.Command, _ []string) error {
 			ComputePlaneContext: selfHostedComputePlaneContext,
 			ICMSURL:             resolveICMSURL(selfHostedICMSURL),
 			NATSURL:             selfHostedNATSURL,
+			SourceRootCA:        !selfHostedNoApply,
 		})
 		if err != nil {
 			return fmt.Errorf("writing control-plane profile: %w", err)
@@ -212,17 +243,15 @@ func runSelfHostedInstall(c *cobra.Command, _ []string) error {
 		return fmt.Errorf("writing register-values: %w", err)
 	}
 
-	helmfileFile, selector := computePlaneTarget(resolved.Path)
 	return selfhosted.Render(selfhosted.RenderOptions{
-		StackPath:    resolved.Path,
-		HelmfileFile: helmfileFile,
-		Env:          selfHostedEnv,
-		Selector:     selector,
-		Apply:        !selfHostedNoApply,
-		KubeContext:  selfHostedComputePlaneContext, // M+9: empty in single-cluster mode
-		Stdout:       c.OutOrStdout(),
-		Stderr:       c.ErrOrStderr(),
-		Ctx:          c.Context(),
+		StackPath:       resolved.Path,
+		Env:             selfHostedEnv,
+		Apply:           !selfHostedNoApply,
+		HelmRuntimeMode: helmRuntimeMode,
+		KubeContext:     selfHostedComputePlaneContext, // M+9: empty in single-cluster mode
+		Stdout:          c.OutOrStdout(),
+		Stderr:          c.ErrOrStderr(),
+		Ctx:             c.Context(),
 		ExtraEnv: []string{
 			"CLUSTER_NAME=" + installClusterName,
 			"CLUSTER_ID=" + resp.ClusterID,
@@ -243,18 +272,6 @@ func authGatePhase5ForcedRefresh(ctx context.Context, sink progress.EventSink, p
 	return authGatePhase5(ctx, sink, p5Start)
 }
 
-// computePlaneTarget picks the helmfile target for the worker layer. If the
-// stack tree contains a top-level helmfile-nvca-operator.yaml.gotmpl (the
-// multi-cluster topology where compute-plane is split out from helmfile.d/),
-// use that file directly with no selector. Otherwise default to the bundled
-// layout: helmfile.d/ filtered by release-group=workers.
-func computePlaneTarget(stackPath string) (helmfileFile, selector string) {
-	if _, err := os.Stat(stackPath + "/helmfile-nvca-operator.yaml.gotmpl"); err == nil {
-		return "helmfile-nvca-operator.yaml.gotmpl", ""
-	}
-	return "", "release-group=workers"
-}
-
 func stackDescriptor(r *selfhosted.ResolvedStack) string {
 	if r.OCIRef != "" {
 		return r.OCIRef
@@ -262,16 +279,28 @@ func stackDescriptor(r *selfhosted.ResolvedStack) string {
 	return r.Path
 }
 
-// builtInStackOCI returns the digest-pinned default OCI URL baked at CLI build
-// time. The string literal is overwritten by ldflags in release builds; CI
-// publishes the matching artifact via M1.
-func builtInStackOCI() string {
-	if v := os.Getenv("NVCF_CLI_DEFAULT_STACK"); v != "" {
+// builtInControlPlaneStackOCI returns the digest-pinned default OCI URL for the
+// control-plane stack, baked at CLI build time via ldflags.
+func builtInControlPlaneStackOCI() string {
+	if v := os.Getenv("NVCF_CLI_DEFAULT_CONTROL_PLANE_STACK"); v != "" {
 		return v
 	}
-	return defaultStackOCI
+	return defaultControlPlaneStackOCI
 }
 
-// defaultStackOCI is set via -ldflags '-X nvcf-cli/cmd.defaultStackOCI=oci://…'.
-// Empty in dev builds; the user must pass --stack=.
-var defaultStackOCI = ""
+// builtInComputePlaneStackOCI returns the digest-pinned default OCI URL for the
+// compute-plane stack, baked at CLI build time via ldflags.
+func builtInComputePlaneStackOCI() string {
+	if v := os.Getenv("NVCF_CLI_DEFAULT_COMPUTE_PLANE_STACK"); v != "" {
+		return v
+	}
+	return defaultComputePlaneStackOCI
+}
+
+// defaultControlPlaneStackOCI is set via -ldflags '-X nvcf-cli/cmd.defaultControlPlaneStackOCI=oci://...'.
+// Empty in dev builds; the user must pass --control-plane-stack=.
+var defaultControlPlaneStackOCI = ""
+
+// defaultComputePlaneStackOCI is set via -ldflags '-X nvcf-cli/cmd.defaultComputePlaneStackOCI=oci://...'.
+// Empty in dev builds; pass --compute-plane-stack=.
+var defaultComputePlaneStackOCI = ""

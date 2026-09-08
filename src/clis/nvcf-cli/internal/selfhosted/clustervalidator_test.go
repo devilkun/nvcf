@@ -438,6 +438,16 @@ func TestBuildClusterValidatorJobShape(t *testing.T) {
 	assert.Equal(t, clusterValidatorAppLabel, labels["app.kubernetes.io/name"])
 	assert.Equal(t, "nvcf-cli", labels["app.kubernetes.io/managed-by"])
 	assert.Equal(t, "preflight", labels["app.kubernetes.io/component"])
+
+	// The validator must run in preflight mode so it skips the summary
+	// ConfigMap write (the metrics path needs the NVCA agent, which is not
+	// installed pre-flight).
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	assert.Equal(t, "true", env["VALIDATOR_PREFLIGHT"],
+		"preflight invocation must tag the validator so it does not attempt the metrics ConfigMap write")
 }
 
 func TestBuildClusterValidatorJobShape_WithPullSecret(t *testing.T) {

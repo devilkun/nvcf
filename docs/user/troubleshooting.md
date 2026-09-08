@@ -20,7 +20,7 @@ The base64-encoded Docker credential in `secrets.yaml` was incorrectly formatted
 **Incorrect (will fail):**
 
 ```bash
-# ❌ WRONG - Only encoding the API key
+# WRONG - Only encoding the API key
 echo -n 'nvapi-1234567890abcdef' | base64
 # Results in: bnZhcGktMTIzNDU2Nzg5MGFiY2RlZg==
 ```
@@ -28,7 +28,7 @@ echo -n 'nvapi-1234567890abcdef' | base64
 **Correct:**
 
 ```bash
-# ✅ CORRECT - Encoding the full credential in basic auth format
+# CORRECT - Encoding the full credential in basic auth format
 echo -n '$oauthtoken:nvapi-1234567890abcdef' | base64
 # Results in: JG9hdXRodG9rZW46bnZhcGktMTIzNDU2Nzg5MGFiY2RlZg==
 ```
@@ -69,6 +69,19 @@ echo -n '$oauthtoken:nvapi-1234567890abcdef' | base64
    # Test NGC login with your credential
    echo 'YOUR_BASE64_STRING' | base64 -d | IFS=: read username password
    docker login nvcr.io -u "$username" -p "$password"
+   ```
+
+### Registry Credential Change Not Taking Effect
+
+Task creation fails with a `Missing <TYPE> registry credential for hostname` error, or keeps using a previous value, shortly after you add, update, or delete a registry credential, even though `nvcf-cli registry-credential list` and `get` already show the new value.
+
+This is expected propagation delay, not a failure. Task processing caches each account's registry credentials for about 5 minutes (`nvct.nvcf.cache-ttl`, default `PT5M`), and picks up the change once that cached copy refreshes.
+
+- Wait up to about 5 minutes and retry the task.
+- To apply the change immediately, restart the task service:
+
+   ```bash
+   kubectl -n nvcf rollout restart deployment/nvct-api
    ```
 
 ## Identifying Deployment Issues
@@ -192,7 +205,7 @@ Fix your `secrets/<environment-name>-secrets.yaml` file, then follow the "Recove
    aws ecr describe-images --repository-name <your-ecr-repository-name> --region <your-region>
 
    # For NGC (if using)
-   ngc registry image list 0833294136851237/nvcf-ncp-staging/*
+   ngc registry image list nvidia/nvcf/*
    ```
 
 3. Check network connectivity from cluster to registry
@@ -508,6 +521,127 @@ If `helmfile destroy` hangs on NVCA cleanup (typically when functions are still 
 ```
 
 ## Database Issues
+
+### Cassandra Pods OOM During Initialization
+
+Symptoms:
+
+- Cassandra pods restart with `OOMKilled` or exit code `137`.
+- The `cassandra-migrations` job fails with a consistency-level error such as `Cannot achieve consistency level ALL`.
+- The install does not continue to OpenBao or NVCF services.
+
+Diagnosis:
+
+Check Cassandra pod restarts and the previous container state:
+
+```bash
+kubectl -n cassandra-system get pods
+kubectl -n cassandra-system describe pod cassandra-0 | grep -E "OOMKilled|Exit Code: 137|Last State"
+```
+
+Check the migration job log for the first failed keyspace:
+
+```bash
+kubectl -n cassandra-system logs job/cassandra-helm-nvcf-cassandra-migrations
+```
+
+Root cause:
+
+The Cassandra resource preset is too small for first boot, commit-log replay, or migration startup. The `small` preset is not recommended for cloud installs, and environments that still OOM on `xlarge` should move to `2xlarge`.
+
+Solution:
+
+Increase the preset in your environment file, then resync Cassandra:
+
+```yaml
+cassandra:
+  resourcesPreset: "2xlarge"
+```
+
+```bash
+HELMFILE_ENV=<environment-name> helmfile --selector name=cassandra sync
+```
+
+If Cassandra was interrupted during migration, also check for dirty migration state before rerunning the full install.
+
+### Cassandra Pods Restart Due to Startup Probe Failures
+
+Symptoms:
+
+- Cassandra pods restart repeatedly without an `OOMKilled` exit code.
+- `kubectl describe` shows `Startup probe failed` or `container killed: failed startup probe`.
+- The issue appears on resource-constrained nodes (Colima on Apple Silicon, low CPU quota, emulated architectures).
+
+Diagnosis:
+
+Check events on the Cassandra pod:
+
+```bash
+kubectl -n cassandra-system describe pod cassandra-0 | grep -A 2 "startup probe"
+```
+
+If the events show repeated startup probe failures before Cassandra finishes initializing, the probe window is too short for the available CPU.
+
+Root cause:
+
+The default startup probe runs `nodetool status` every 10 seconds with a 5-second timeout and allows 60 failures (10-minute window). Under CPU contention or architecture emulation, Cassandra initialization can take longer than this window.
+
+Solution:
+
+Relax the startup probe thresholds in your environment file to widen the window from 10 minutes to 30 minutes:
+
+```yaml
+cassandra:
+  startupProbe:
+    failureThreshold: 120
+    periodSeconds: 15
+    timeoutSeconds: 10
+```
+
+```bash
+HELMFILE_ENV=<environment-name> helmfile --selector name=cassandra sync
+```
+
+The `local` helmfile environment ships these relaxed defaults when using the self-managed stack.
+
+### Cassandra Migrations Fail After Dirty Migration State
+
+Symptoms:
+
+- The `cassandra-migrations` job fails repeatedly after Cassandra restarts during a previous migration attempt.
+- Logs show an error similar to `no migration found for version 0`, or another migration error that does not identify the failed keyspace state.
+- A row in a `schema_migrations.<keyspace>` table has `dirty=true`.
+
+Diagnosis:
+
+The migration bookkeeping tables live in the `schema_migrations` keyspace, with one table per application keyspace. Check the keyspace named in the migration logs:
+
+```bash
+CPASS=$(kubectl -n cassandra-system get secret cassandra \
+  -o jsonpath='{.data.cassandra-password}' | base64 -d)
+
+kubectl -n cassandra-system exec cassandra-0 -c cassandra -- \
+  /opt/bitnami/cassandra/bin/cqlsh -u cassandra -p "$CPASS" localhost \
+  -e "SELECT version, dirty FROM schema_migrations.<keyspace>;"
+```
+
+Root cause:
+
+`golang-migrate` marks a keyspace dirty when a migration attempt is interrupted. Cassandra DDL statements may already have committed, but the migration marker remains dirty and blocks the next run.
+
+Solution:
+
+First verify whether the failed migration's DDL was applied or needs manual reconciliation. After the schema matches the dirty version, clear the dirty flag and rerun the migration job:
+
+```bash
+kubectl -n cassandra-system exec cassandra-0 -c cassandra -- \
+  /opt/bitnami/cassandra/bin/cqlsh -u cassandra -p "$CPASS" localhost \
+  -e "UPDATE schema_migrations.<keyspace> SET dirty = false WHERE version = <version>;"
+
+HELMFILE_ENV=<environment-name> helmfile --selector name=cassandra sync
+```
+
+If more than one keyspace is dirty, repeat the diagnosis and reconciliation for each affected `schema_migrations.<keyspace>` table.
 
 ### Cassandra Migration Stuck Due to Missing ConfigMap
 
@@ -956,7 +1090,7 @@ echo "=============================================="
 
 ```
 
-[force-cleanup-nvcf.sh](samples/scripts/force-cleanup-nvcf.sh)
+[force-cleanup-nvcf.sh](https://raw.githubusercontent.com/NVIDIA/nvcf/main/docs/user/samples/scripts/force-cleanup-nvcf.sh)
 
 **Usage:**
 

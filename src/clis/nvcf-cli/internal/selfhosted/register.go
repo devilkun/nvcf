@@ -19,6 +19,7 @@ package selfhosted
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"strings"
 
@@ -100,7 +101,7 @@ type ClusterClient interface {
 // clusterLister is a narrow seam used by resolveExistingCluster so the
 // recovery-path logic can be unit-tested independently of the full adapter.
 type clusterLister interface {
-	ListClusters(ctx context.Context, sisURL, ncaID string) ([]client.SISCluster, error)
+	ListClusters(ctx context.Context, sisURL, ncaID string) ([]client.ICMSCluster, error)
 }
 
 // resolveExistingCluster handles the --ignore-existing recovery branch: the
@@ -131,12 +132,39 @@ type clusterClientAdapter struct {
 // NewClusterClient constructs a ClusterClient backed by the production
 // internal/client.Client. If sisURL is empty it falls back to
 // config.BaseHTTPURL loaded from the standard Viper sources (env vars, config
-// file, state file) — the same path used by every other CLI subcommand.
+// file, state file), the same path used by every other CLI subcommand.
 func NewClusterClient(sisURL string) (ClusterClient, error) {
+	return NewClusterClientWithToken(sisURL, "")
+}
+
+// NewClusterClientWithToken is like NewClusterClient but overrides the loaded
+// admin JWT with the supplied token when non-empty. Used by self-hosted up
+// and install when callers pass --token=<jwt> to skip nvcf-cli init in
+// CI/non-interactive flows. An empty token preserves the LoadConfig result so
+// existing behavior is unchanged.
+func NewClusterClientWithToken(sisURL, token string) (ClusterClient, error) {
+	return NewClusterClientWithTokenAndTrust(sisURL, token, nil)
+}
+
+// NewClusterClientWithTrust builds a cluster client whose management-API TLS
+// trust is set from tlsCfg (R-4: system/bundle built by managementtls).
+// Pass nil for default system trust. Trust is established before the client
+// makes any request to the management API (POR R-4).
+func NewClusterClientWithTrust(sisURL string, tlsCfg *tls.Config) (ClusterClient, error) {
+	return NewClusterClientWithTokenAndTrust(sisURL, "", tlsCfg)
+}
+
+// NewClusterClientWithTokenAndTrust combines the token override used by
+// non-interactive self-hosted flows with optional management-API TLS trust.
+func NewClusterClientWithTokenAndTrust(sisURL, token string, tlsCfg *tls.Config) (ClusterClient, error) {
 	cfg, err := client.LoadConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load client config: %w", err)
 	}
+	if token != "" {
+		cfg.Token = token
+	}
+	cfg.TLSConfig = tlsCfg
 	c, err := client.NewClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client: %w", err)

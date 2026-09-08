@@ -63,6 +63,7 @@ while [ $retry_count -lt $MAX_RETRIES ]; do
   else
     log_info "OpenBao service not responsive. Retrying in $RETRY_DELAY seconds..."
     retry_count=$((retry_count + 1))
+    sleep "$RETRY_DELAY"
   fi
 done
 
@@ -93,7 +94,7 @@ initialize_mount_lists
 # exits non-zero whenever any required task fails. The previous behavior
 # (warn-and-continue, exit 0 regardless) let misconfigured deployments
 # green the Helm hook Job while leaving OpenBao in a half-configured
-# state — surfacing later as a downstream service-cert outage instead of
+# state, surfacing later as a downstream service-cert outage instead of
 # a blocked deployment.
 #
 # Addons enter the accumulator only when they're explicitly enabled
@@ -162,13 +163,29 @@ else
   log_info "LLM addon disabled (ADDONS_LLM_ENABLED != true), skipping..."
 fi
 
+if [ "${ADDONS_NVCF_UI_ENABLED:-false}" = "true" ]; then
+  log_section "nvcf-ui addon enabled, running setup..."
+  if [ -f "/app/addons/nvcf-ui/setup_nvcf-ui.sh" ]; then
+    if ! bash -c "source /app/addons/nvcf-ui/setup_nvcf-ui.sh"; then
+      log_error "nvcf-ui addon setup failed"
+      FAILED_MIGRATIONS+=("addons/nvcf-ui/setup_nvcf-ui.sh")
+    else
+      log_success "nvcf-ui addon setup completed successfully"
+    fi
+  else
+    log_warn "nvcf-ui addon script not found at /app/addons/nvcf-ui/setup_nvcf-ui.sh"
+  fi
+else
+  log_info "nvcf-ui addon disabled (ADDONS_NVCF_UI_ENABLED != true), skipping..."
+fi
+
 if [ "${#FAILED_MIGRATIONS[@]}" -gt 0 ]; then
   log_error "Required-task failures (${#FAILED_MIGRATIONS[@]}):"
   for m in "${FAILED_MIGRATIONS[@]}"; do
     log_error "  - $m"
   done
   if [ "${MIGRATIONS_ALLOW_FAILURES:-false}" = "true" ]; then
-    log_warn "MIGRATIONS_ALLOW_FAILURES=true; exiting 0 despite ${#FAILED_MIGRATIONS[@]} failure(s) — investigate before next deploy"
+    log_warn "MIGRATIONS_ALLOW_FAILURES=true; exiting 0 despite ${#FAILED_MIGRATIONS[@]} failure(s); investigate before next deploy"
   else
     log_error "Exiting non-zero. Set MIGRATIONS_ALLOW_FAILURES=true only as an emergency rollback override"
     exit 1

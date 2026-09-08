@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 
@@ -30,11 +30,6 @@ pub(crate) struct KvCacheStats {
     pub(crate) kv_cache_evicted_tokens: u64,
 }
 
-#[derive(Debug, Clone)]
-struct KvCacheEntry {
-    tokens: u64,
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct KvCacheState {
     capacity_tokens: u64,
@@ -43,11 +38,11 @@ pub(crate) struct KvCacheState {
     miss_count: u64,
     eviction_count: u64,
     evicted_tokens: u64,
-    entries: HashMap<String, KvCacheEntry>,
+    entries: HashMap<String, u64>,
     lru: VecDeque<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KvCacheAccess {
     pub(crate) hit: bool,
     pub(crate) reused_input_tokens: u64,
@@ -74,13 +69,7 @@ impl KvCacheState {
     pub(crate) fn new(capacity_tokens: u64) -> Self {
         Self {
             capacity_tokens,
-            used_tokens: 0,
-            hit_count: 0,
-            miss_count: 0,
-            eviction_count: 0,
-            evicted_tokens: 0,
-            entries: HashMap::new(),
-            lru: VecDeque::new(),
+            ..Default::default()
         }
     }
 
@@ -91,50 +80,25 @@ impl KvCacheState {
     ) -> KvCacheAccess {
         // Mock cache counters saturate like telemetry so pathological tests cannot wrap them.
         let tokens = input_tokens as u64;
-        let Some(cache_affinity_key) = cache_affinity_key else {
-            self.miss_count = self.miss_count.saturating_add(1);
-            return KvCacheAccess {
-                hit: false,
-                reused_input_tokens: 0,
-                uncached_input_tokens: tokens,
-                evicted_entries: 0,
-                evicted_tokens: 0,
-            };
-        };
-        if self.capacity_tokens == 0 {
-            self.miss_count = self.miss_count.saturating_add(1);
-            return KvCacheAccess {
-                hit: false,
-                reused_input_tokens: 0,
-                uncached_input_tokens: tokens,
-                evicted_entries: 0,
-                evicted_tokens: 0,
-            };
-        }
-
-        let cached_tokens = self
-            .entries
-            .get(cache_affinity_key)
-            .map(|entry| entry.tokens);
-        if cached_tokens.is_some() {
-            self.lru.retain(|key| key != cache_affinity_key);
-            self.lru.push_back(cache_affinity_key.to_string());
-        }
+        let cached_tokens = cache_affinity_key
+            .filter(|_| self.capacity_tokens > 0)
+            .and_then(|cache_affinity_key| {
+                let tokens = self.entries.get(cache_affinity_key).copied()?;
+                self.lru.retain(|key| key != cache_affinity_key);
+                self.lru.push_back(cache_affinity_key.to_string());
+                Some(tokens)
+            });
         let reused_input_tokens = cached_tokens.unwrap_or(0).min(tokens);
         let uncached_input_tokens = tokens.saturating_sub(reused_input_tokens);
         let hit = reused_input_tokens > 0;
-        if hit {
-            self.hit_count = self.hit_count.saturating_add(1);
-        } else {
-            self.miss_count = self.miss_count.saturating_add(1);
-        }
+        self.hit_count = self.hit_count.saturating_add(u64::from(hit));
+        self.miss_count = self.miss_count.saturating_add(u64::from(!hit));
 
         KvCacheAccess {
             hit,
             reused_input_tokens,
             uncached_input_tokens,
-            evicted_entries: 0,
-            evicted_tokens: 0,
+            ..Default::default()
         }
     }
 
@@ -143,54 +107,44 @@ impl KvCacheState {
         cache_affinity_key: Option<&str>,
         input_tokens: usize,
     ) -> KvCacheCommit {
-        let Some(cache_affinity_key) = cache_affinity_key else {
+        let Some(cache_affinity_key) = cache_affinity_key.filter(|_| self.capacity_tokens > 0)
+        else {
             return KvCacheCommit::default();
         };
-        if self.capacity_tokens == 0 {
-            return KvCacheCommit::default();
-        }
 
         let tokens = input_tokens as u64;
-        let cached_tokens = self.entries.remove(cache_affinity_key).map(|entry| {
-            self.lru.retain(|key| key != cache_affinity_key);
-            self.used_tokens = self.used_tokens.saturating_sub(entry.tokens);
-            entry.tokens
-        });
+        let cached_tokens = self.entries.remove(cache_affinity_key);
+        self.lru.retain(|key| key != cache_affinity_key);
+        self.used_tokens = self.used_tokens.saturating_sub(cached_tokens.unwrap_or(0));
         let retained_tokens = cached_tokens.unwrap_or(0).max(tokens);
-        let mut evicted_entries = 0u64;
-        let mut evicted_tokens = 0u64;
+        let mut commit = KvCacheCommit::default();
         if retained_tokens <= self.capacity_tokens {
             // used_tokens is maintained as <= capacity, but saturating arithmetic avoids wrapping on bad input.
             while self.used_tokens.saturating_add(retained_tokens) > self.capacity_tokens {
                 let Some(evicted_key) = self.lru.pop_front() else {
                     break;
                 };
-                if let Some(evicted) = self.entries.remove(&evicted_key) {
-                    self.used_tokens = self.used_tokens.saturating_sub(evicted.tokens);
-                    evicted_entries = evicted_entries.saturating_add(1);
-                    evicted_tokens = evicted_tokens.saturating_add(evicted.tokens);
-                }
+                let evicted_tokens = self
+                    .entries
+                    .remove(&evicted_key)
+                    .expect("every LRU key must own a cache entry");
+                self.used_tokens = self.used_tokens.saturating_sub(evicted_tokens);
+                commit.evicted_entries = commit.evicted_entries.saturating_add(1);
+                commit.evicted_tokens = commit.evicted_tokens.saturating_add(evicted_tokens);
             }
-            self.entries.insert(
-                cache_affinity_key.to_string(),
-                KvCacheEntry {
-                    tokens: retained_tokens,
-                },
-            );
+            self.entries
+                .insert(cache_affinity_key.to_string(), retained_tokens);
             self.lru.push_back(cache_affinity_key.to_string());
             self.used_tokens = self.used_tokens.saturating_add(retained_tokens);
         } else if let Some(cached_tokens) = cached_tokens {
             // The reused prefix served this request, but the expanded prompt no longer fits for reuse.
-            evicted_entries = evicted_entries.saturating_add(1);
-            evicted_tokens = evicted_tokens.saturating_add(cached_tokens);
+            commit.evicted_entries = commit.evicted_entries.saturating_add(1);
+            commit.evicted_tokens = commit.evicted_tokens.saturating_add(cached_tokens);
         }
-        self.eviction_count = self.eviction_count.saturating_add(evicted_entries);
-        self.evicted_tokens = self.evicted_tokens.saturating_add(evicted_tokens);
+        self.eviction_count = self.eviction_count.saturating_add(commit.evicted_entries);
+        self.evicted_tokens = self.evicted_tokens.saturating_add(commit.evicted_tokens);
 
-        KvCacheCommit {
-            evicted_entries,
-            evicted_tokens,
-        }
+        commit
     }
 
     pub(crate) fn stats(&self, model: &str) -> KvCacheStats {
@@ -211,27 +165,18 @@ impl KvCacheState {
 
 pub(crate) fn insert_kv_cache_headers(headers: &mut HeaderMap, access: KvCacheAccess) {
     headers.insert(
-        HeaderName::from_static("x-kv-cache-hit"),
+        "x-kv-cache-hit",
         HeaderValue::from_static(if access.hit { "true" } else { "false" }),
     );
-    headers.insert(
-        HeaderName::from_static("x-kv-cache-evicted-entries"),
-        HeaderValue::from_str(&access.evicted_entries.to_string())
-            .expect("evicted entry count should be a valid header value"),
-    );
-    headers.insert(
-        HeaderName::from_static("x-kv-cache-evicted-tokens"),
-        HeaderValue::from_str(&access.evicted_tokens.to_string())
-            .expect("evicted token count should be a valid header value"),
-    );
-    headers.insert(
-        HeaderName::from_static("x-kv-cache-reused-input-tokens"),
-        HeaderValue::from_str(&access.reused_input_tokens.to_string())
-            .expect("reused input token count should be a valid header value"),
-    );
-    headers.insert(
-        HeaderName::from_static("x-kv-cache-uncached-input-tokens"),
-        HeaderValue::from_str(&access.uncached_input_tokens.to_string())
-            .expect("uncached input token count should be a valid header value"),
-    );
+    for (name, value) in [
+        ("x-kv-cache-evicted-entries", access.evicted_entries),
+        ("x-kv-cache-evicted-tokens", access.evicted_tokens),
+        ("x-kv-cache-reused-input-tokens", access.reused_input_tokens),
+        (
+            "x-kv-cache-uncached-input-tokens",
+            access.uncached_input_tokens,
+        ),
+    ] {
+        headers.insert(name, HeaderValue::from(value));
+    }
 }

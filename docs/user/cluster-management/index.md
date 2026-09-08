@@ -1,13 +1,15 @@
 # GPU Cluster Setup
 
-<Warning>
-Customers on NVCA versions older than 2.51.0 must upgrade to 2.51.0 before upgrading to 3.x to avoid workload and GPU accounting issues. See [Upgrade Advisory](#upgrade-advisory) below for the recommended upgrade path.
-
-</Warning>
-
-The **NVIDIA Cluster Agent (NVCA)** connects GPU clusters to the NVCF control plane, enabling them to act as deployment targets for Cloud Functions. NVCA is a function deployment orchestrator that registers a cluster's GPU resources, communicates with the control plane, and manages the lifecycle of function deployments on GPU nodes.
+The NVIDIA Cluster Agent (NVCA) connects GPU clusters to the NVCF control plane, enabling them to act as deployment targets for Cloud Functions. NVCA is a function deployment orchestrator that registers a cluster's GPU resources, communicates with the control plane, and manages the lifecycle of function deployments on GPU nodes.
 
 For a fresh install, use the [Quickstart](../quickstart.md). The one-click CLI flow can register a GPU cluster as part of the install. Use this section for manual cluster registration, standalone NVCA installation, and day-two cluster configuration.
+
+<Warning>
+If you pin NVCA separately from the recommended compute-plane stack, check the
+current NVCA version before upgrading to NVCA 3.x. Clusters running NVCA 2.51.0
+or earlier have version-specific upgrade guidance. See the
+[0.6.0 upgrade notes](https://docs.nvidia.com/nvcf/v0.6.0/0-6-0-release-notes#upgrade-notes).
+</Warning>
 
 After installing NVCA on a cluster:
 
@@ -28,9 +30,9 @@ After installing NVCA on a cluster:
 
   - The cluster must have the [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/getting-started.html#operator-install-guide) installed.
 
-    - If your cloud provider *does not* support the NVIDIA GPU Operator, [Manual Instance Configuration](./configuration.md) is possible, but **not recommended** due to lack of maintainability.
+    - If your cloud provider does not support the NVIDIA GPU Operator, [Manual Instance Configuration](./configuration.md) is possible, but not recommended due to lack of maintainability.
     - To get the most out of clusters with multi-node NVLink ([MNNVL](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dra-cds.html#dra-docs-compute-domains)) GPUs like [GB200](https://www.nvidia.com/en-us/data-center/gb200-nvl72/), the [NVIDIA GPU DRA driver](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dra-intro-install.html) must be installed. See the [nvlink-optimized-clusters](./configuration.md) for details.
-    - For development or testing environments **without physical GPUs**, install the [fake-gpu-operator](../fake-gpu-operator.md) instead.
+    - For development or testing environments without physical GPUs, install the [fake-gpu-operator](../fake-gpu-operator) instead.
 
 - Registering the cluster requires `kubectl` and `helm` installed.
 
@@ -38,56 +40,7 @@ After installing NVCA on a cluster:
 
 ### Supported Kubernetes Versions
 
-- Minimum Kubernetes Supported Version: `v1.25.0`
-- Maximum Kubernetes Supported Version `v1.32.x`
-
-## Upgrade Advisory
-
-<Warning>
-Customers on NVCA versions older than 2.51.0 must upgrade to 2.51.0 before upgrading to 3.x.
-
-NVCA 2.51.0 includes critical fixes for workload lifecycle management and GPU capacity accounting.
-Skipping this version may result in:
-
-- Incorrect GPU resource accounting on the cluster
-- Workload pods not being properly tracked or cleaned up
-- Cluster capacity reporting mismatches with the control plane
-
-Recommended upgrade path:
-
-| Current Version | Action |
-| --- | --- |
-| 2.50.5 or older | Upgrade to **2.51.0** first, verify cluster health, then upgrade to 3.0+ |
-| 2.51.0 | Upgrade directly to 3.0+ |
-
-To check your current NVCA version:
-
-```bash
-kubectl get nvcfbackend -n nvca-operator
-```
-
-The `VERSION` column shows the currently deployed NVCA version.
-
-To upgrade the NVCA operator:
-
-```bash
-helm upgrade nvca-operator -n nvca-operator \
-  --reuse-values \
-  --wait \
-  "${CHART_URL}" \
-  --username='$oauthtoken' \
-  --password="$(helm get values -n nvca-operator nvca-operator -o json | jq -r '.ngcConfig.serviceKey')" \
-  --set helmManaged.nvcaVersion="2.51.0"
-```
-
-After upgrading to 2.51.0, verify the cluster is healthy before proceeding to 3.x:
-
-```bash
-kubectl get nvcfbackend -n nvca-operator
-# Verify VERSION shows 2.51.0 and HEALTH shows healthy
-```
-
-</Warning>
+- Supported versions are the latest Kubernetes minor release and the two prior minor releases (N-2). See official Kubernetes docs for current supported [versions](https://kubernetes.io/releases/version-skew-policy/#supported-versions).
 
 ### Considerations
 

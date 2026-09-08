@@ -20,6 +20,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,7 @@ import (
 	"nvcf-cli/internal/state"
 
 	"github.com/spf13/viper"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -65,8 +67,9 @@ type Config struct {
 	OAuth2TokenEndpoint string
 
 	// Authentication tokens
-	APIKey string // General API operations token (NVCF_API_KEY)
-	Token  string // Function creation specific token (NVCF_TOKEN)
+	APIKey     string // General API operations token (NVCF_API_KEY)
+	Token      string // Function creation specific token (NVCF_TOKEN)
+	NVCTAPIKey string // NVCT-scoped API key for task operations (NVCF_NVCT_API_KEY)
 
 	// Account configuration
 	ClientID string // NVIDIA Cloud Account client ID (NVCF_CLIENT_ID)
@@ -75,6 +78,7 @@ type Config struct {
 	BaseHTTPURL    string
 	BaseGRPCURL    string
 	BaseInvokeURL  string // Dedicated endpoint for function invocations
+	BaseNVCTURL    string // Dedicated endpoint for NVIDIA Cloud Tasks (NVCT) API
 	ICMSURL        string // ICMS/SIS endpoint for self-hosted cluster registration
 	DefaultTimeout time.Duration
 	AuthType       AuthType
@@ -85,6 +89,12 @@ type Config struct {
 	APIHost    string // Host header for NVCF API requests (e.g., "api.gateway.example.com")
 	InvokeHost string // Host header for invocation requests (e.g., "invocation.gateway.example.com")
 	ICMSHost   string // Host header for SIS/ICMS requests; allows pairing icms_url=http://<bare-elb> with Host: sis.<elb> for gateway-routed self-hosted deployments where sis.<elb> does not DNS-resolve.
+	NVCTHost   string // Host header for NVCT (task) API requests; allows pairing base_nvct_url=http://<bare-gateway> with Host: tasks.<domain> for gateway-routed self-hosted deployments where tasks.<domain> does not DNS-resolve.
+
+	// TLSConfig, when set, establishes the management-API TLS trust (R-4):
+	// system roots or a configured CA bundle. It is applied to the HTTP transport
+	// without disabling certificate verification. Built by internal/selfhosted/managementtls.
+	TLSConfig *tls.Config
 
 	// Cluster mode configuration
 	ClusterMode    bool           // Enable cluster mode (uses kubectl instead of direct HTTP)
@@ -192,8 +202,9 @@ func LoadConfig() (*Config, error) {
 		OAuth2TokenEndpoint: getConfigValue("oauth2_token_endpoint"),
 
 		// Authentication tokens with state fallback (Viper maps: api_key → NVCF_API_KEY, token → NVCF_TOKEN)
-		APIKey: getTokenWithFallback("api_key", currentState.APIKey, currentState.APIKeyExpiration),
-		Token:  getTokenWithFallback("token", currentState.Token, currentState.TokenExpiration),
+		APIKey:     getTokenWithFallback("api_key", currentState.APIKey, currentState.APIKeyExpiration),
+		Token:      getTokenWithFallback("token", currentState.Token, currentState.TokenExpiration),
+		NVCTAPIKey: getTokenWithFallback("nvct_api_key", currentState.NVCTAPIKey, currentState.NVCTAPIKeyExpiration),
 
 		// Account configuration (Viper maps: client_id → NVCF_CLIENT_ID)
 		ClientID: getConfigValueWithDefault("client_id", "nvcf-default"),
@@ -202,6 +213,7 @@ func LoadConfig() (*Config, error) {
 		BaseHTTPURL:    getConfigValueWithDefault("base_http_url", "https://api.nvcf.nvidia.com"),
 		BaseGRPCURL:    getConfigValueWithDefault("grpc_url", getConfigValueWithDefault("base_grpc_url", "grpc.nvcf.nvidia.com:443")),
 		BaseInvokeURL:  getConfigValueWithDefault("invoke_url", getConfigValueWithDefault("base_http_url", "https://api.nvcf.nvidia.com")),
+		BaseNVCTURL:    getConfigValueWithDefault("base_nvct_url", "https://api.nvct.nvidia.com"),
 		ICMSURL:        getConfigValue("icms_url"),
 		DefaultTimeout: 300 * time.Second,
 		Debug:          viper.GetBool("debug"),
@@ -211,6 +223,7 @@ func LoadConfig() (*Config, error) {
 		APIHost:    getConfigValue("api_host"),
 		InvokeHost: getConfigValue("invoke_host"),
 		ICMSHost:   getConfigValue("icms_host"),
+		NVCTHost:   getConfigValue("nvct_host"),
 
 		// Cluster mode configuration (deprecated, always false)
 		ClusterMode:    false,
@@ -323,7 +336,7 @@ func LoadConfig() (*Config, error) {
 				missing = append(missing, "NVCF_OAUTH2_TOKEN_ENDPOINT")
 			}
 
-			return nil, fmt.Errorf("missing authentication credentials. Please set NVCF_API_KEY environment variable")
+			return nil, fmt.Errorf("missing authentication credentials, unset: %s", strings.Join(missing, ", "))
 		}
 	}
 
@@ -348,8 +361,9 @@ func LoadConfigWithoutAuth() (*Config, error) {
 		OAuth2TokenEndpoint: getConfigValue("oauth2_token_endpoint"),
 
 		// Authentication tokens with state fallback (Viper maps: api_key → NVCF_API_KEY, token → NVCF_TOKEN)
-		APIKey: getTokenWithFallback("api_key", currentState.APIKey, currentState.APIKeyExpiration),
-		Token:  getTokenWithFallback("token", currentState.Token, currentState.TokenExpiration),
+		APIKey:     getTokenWithFallback("api_key", currentState.APIKey, currentState.APIKeyExpiration),
+		Token:      getTokenWithFallback("token", currentState.Token, currentState.TokenExpiration),
+		NVCTAPIKey: getTokenWithFallback("nvct_api_key", currentState.NVCTAPIKey, currentState.NVCTAPIKeyExpiration),
 
 		// Account configuration (Viper maps: client_id → NVCF_CLIENT_ID)
 		ClientID: getConfigValueWithDefault("client_id", "nvcf-default"),
@@ -358,6 +372,7 @@ func LoadConfigWithoutAuth() (*Config, error) {
 		BaseHTTPURL:    getConfigValueWithDefault("base_http_url", "https://api.nvcf.nvidia.com"),
 		BaseGRPCURL:    getConfigValueWithDefault("grpc_url", getConfigValueWithDefault("base_grpc_url", "grpc.nvcf.nvidia.com:443")),
 		BaseInvokeURL:  getConfigValueWithDefault("invoke_url", getConfigValueWithDefault("base_http_url", "https://api.nvcf.nvidia.com")),
+		BaseNVCTURL:    getConfigValueWithDefault("base_nvct_url", "https://api.nvct.nvidia.com"),
 		ICMSURL:        getConfigValue("icms_url"),
 		DefaultTimeout: 300 * time.Second,
 		Debug:          viper.GetBool("debug"),
@@ -367,6 +382,7 @@ func LoadConfigWithoutAuth() (*Config, error) {
 		APIHost:    getConfigValue("api_host"),
 		InvokeHost: getConfigValue("invoke_host"),
 		ICMSHost:   getConfigValue("icms_host"),
+		NVCTHost:   getConfigValue("nvct_host"),
 
 		// Cluster mode configuration (deprecated, always false)
 		ClusterMode:    false,
@@ -505,11 +521,12 @@ func getNamespaceFromKubeconfig(kubeconfigPath string) string {
 
 // Client is the NVCF API client
 type Client struct {
-	httpClient *http.Client
-	grpcConn   *grpc.ClientConn
-	config     *Config
-	baseURL    string
-	debug      bool
+	httpClient     *http.Client
+	nvctHTTPClient *http.Client // dedicated client for NVCT requests; nil means use httpClient
+	grpcConn       *grpc.ClientConn
+	config         *Config
+	baseURL        string
+	debug          bool
 }
 
 // BearerTokenTransport implements http.RoundTripper for bearer token authentication
@@ -535,13 +552,23 @@ func (t *BearerTokenTransport) base() http.RoundTripper {
 func NewClient(config *Config) (*Client, error) {
 	var httpClient *http.Client
 
+	// baseTransport applies the management-API TLS trust (R-4) when configured,
+	// otherwise the shared default transport. http.DefaultTransport is shared and
+	// must not be mutated, so it is cloned before setting TLSClientConfig.
+	baseTransport := http.RoundTripper(http.DefaultTransport)
+	if config.TLSConfig != nil {
+		cloned := http.DefaultTransport.(*http.Transport).Clone()
+		cloned.TLSClientConfig = config.TLSConfig
+		baseTransport = cloned
+	}
+
 	// Create HTTP client based on authentication type
 	switch config.AuthType {
 	case AuthTypeBearer:
 		// Set up transport chain: Debug -> Auth -> HTTP
 		// This way auth transport adds headers first, then debug transport sees them
 
-		var finalTransport http.RoundTripper = http.DefaultTransport
+		var finalTransport http.RoundTripper = baseTransport
 
 		// Add authentication transport layer (this adds the Authorization header)
 		if config.Token != "" {
@@ -567,11 +594,11 @@ func NewClient(config *Config) (*Client, error) {
 		if config.Debug {
 			// Replace the base transport in the auth layer with debug transport
 			if config.Token != "" {
-				finalTransport = newMultiTokenTransport(config.APIKey, config.Token, newDebugTransport(http.DefaultTransport))
+				finalTransport = newMultiTokenTransport(config.APIKey, config.Token, newDebugTransport(baseTransport))
 			} else {
 				finalTransport = &BearerTokenTransport{
 					Token: config.APIKey,
-					Base:  newDebugTransport(http.DefaultTransport),
+					Base:  newDebugTransport(baseTransport),
 				}
 			}
 		}
@@ -606,8 +633,12 @@ func NewClient(config *Config) (*Client, error) {
 			},
 		}
 
-		// Create HTTP client with OAuth2 transport
-		ctx := context.Background()
+		// Create HTTP client with OAuth2 transport. The context client is used
+		// by oauth2 for both token acquisition and the returned transport base.
+		ctx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{
+			Transport: baseTransport,
+			Timeout:   config.DefaultTimeout,
+		})
 		httpClient = oauth2Config.Client(ctx)
 		httpClient.Timeout = config.DefaultTimeout
 
@@ -635,12 +666,21 @@ func NewClient(config *Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to create gRPC connection: %w", err)
 	}
 
+	var nvctHTTPClient *http.Client
+	if config.NVCTAPIKey != "" {
+		nvctHTTPClient = &http.Client{
+			Transport: &BearerTokenTransport{Token: config.NVCTAPIKey},
+			Timeout:   config.DefaultTimeout,
+		}
+	}
+
 	return &Client{
-		httpClient: httpClient,
-		grpcConn:   grpcConn,
-		config:     config,
-		baseURL:    config.BaseHTTPURL,
-		debug:      config.Debug,
+		httpClient:     httpClient,
+		nvctHTTPClient: nvctHTTPClient,
+		grpcConn:       grpcConn,
+		config:         config,
+		baseURL:        config.BaseHTTPURL,
+		debug:          config.Debug,
 	}, nil
 }
 
@@ -787,6 +827,17 @@ type LLMConfigDto struct {
 	RoutingMethod  *string  `json:"routingMethod,omitempty"`
 }
 
+// LLMInvocationConfigDto represents function-level LLM invocation configuration.
+type LLMInvocationConfigDto struct {
+	Priority *PriorityDto `json:"priority,omitempty"`
+}
+
+// PriorityDto represents the default and per-account request priorities for an LLM function.
+type PriorityDto struct {
+	DefaultPriority    *uint32           `json:"defaultPriority,omitempty"`
+	PerAccountPriority map[string]uint32 `json:"perAccountPriority,omitempty"`
+}
+
 // SecretDto represents a secret configuration
 type SecretDto struct {
 	Name  string      `json:"name"`            // Secret name (required, max 48 chars, pattern: ^[a-z0-9A-Z][a-z0-9A-Z\\_\\.\\-]*$)
@@ -824,6 +875,7 @@ type CreateFunctionRequest struct {
 	APIBodyFormat        string                      `json:"apiBodyFormat,omitempty"`        // Invocation request body format
 	ContainerArgs        string                      `json:"containerArgs,omitempty"`        // Args to be passed when launching container
 	ContainerEnvironment []ContainerEnvironmentEntry `json:"containerEnvironment,omitempty"` // Environment settings for container
+	LLMInvocationConfig  *LLMInvocationConfigDto     `json:"llmInvocationConfig,omitempty"`  // Function-level LLM invocation configuration
 
 	// Helm configuration
 	HelmChart            string `json:"helmChart,omitempty"`            // Optional Helm Chart
@@ -852,14 +904,15 @@ type CreateFunctionResponse struct {
 
 // FunctionData represents function data
 type FunctionData struct {
-	ID             string `json:"id"`
-	VersionID      string `json:"versionId"`
-	Name           string `json:"name"`
-	Status         string `json:"status"`
-	InferenceURL   string `json:"inferenceUrl"`
-	InferencePort  int    `json:"inferencePort"`
-	ContainerImage string `json:"containerImage"`
-	CreationTime   string `json:"creationTime"`
+	ID                  string                  `json:"id"`
+	VersionID           string                  `json:"versionId"`
+	Name                string                  `json:"name"`
+	Status              string                  `json:"status"`
+	InferenceURL        string                  `json:"inferenceUrl"`
+	InferencePort       int                     `json:"inferencePort"`
+	ContainerImage      string                  `json:"containerImage"`
+	CreationTime        string                  `json:"creationTime"`
+	LLMInvocationConfig *LLMInvocationConfigDto `json:"llmInvocationConfig,omitempty"`
 }
 
 // CreateFunction creates a new function
@@ -966,16 +1019,17 @@ type GetFunctionResponse struct {
 
 // FunctionDetails represents detailed function information
 type FunctionDetails struct {
-	ID              string     `json:"id"`
-	VersionID       string     `json:"versionId"`
-	Name            string     `json:"name"`
-	Status          string     `json:"status"`
-	InferenceURL    string     `json:"inferenceUrl"`
-	InferencePort   int        `json:"inferencePort"`
-	ContainerImage  string     `json:"containerImage"`
-	CreationTime    string     `json:"creationTime"`
-	ActiveInstances []Instance `json:"activeInstances"`
-	Health          HealthInfo `json:"health"`
+	ID                  string                  `json:"id"`
+	VersionID           string                  `json:"versionId"`
+	Name                string                  `json:"name"`
+	Status              string                  `json:"status"`
+	InferenceURL        string                  `json:"inferenceUrl"`
+	InferencePort       int                     `json:"inferencePort"`
+	ContainerImage      string                  `json:"containerImage"`
+	CreationTime        string                  `json:"creationTime"`
+	ActiveInstances     []Instance              `json:"activeInstances"`
+	Health              HealthInfo              `json:"health"`
+	LLMInvocationConfig *LLMInvocationConfigDto `json:"llmInvocationConfig,omitempty"`
 }
 
 // Instance represents a function instance
@@ -1152,9 +1206,10 @@ func (c *Client) DeployFunction(ctx context.Context, functionID, versionID strin
 
 // UpdateFunctionMetadataRequest represents a function update request
 type UpdateFunctionMetadataRequest struct {
-	Description  string           `json:"description,omitempty"`  // Function description
-	Tags         []string         `json:"tags,omitempty"`         // Function tags
-	ModelUpdates []ModelUpdateDto `json:"modelUpdates,omitempty"` // Model-specific updates
+	Description         string                  `json:"description,omitempty"`         // Function description
+	Tags                []string                `json:"tags,omitempty"`                // Function tags
+	ModelUpdates        []ModelUpdateDto        `json:"modelUpdates,omitempty"`        // Model-specific updates
+	LLMInvocationConfig *LLMInvocationConfigDto `json:"llmInvocationConfig,omitempty"` // Function-level LLM invocation configuration
 }
 
 // ModelUpdateDto represents updates for one model.
@@ -1710,6 +1765,8 @@ type FunctionDto struct {
 	FunctionType            string                      `json:"functionType"`
 	Secrets                 []string                    `json:"secrets,omitempty"`
 	RateLimit               *RateLimitDto               `json:"rateLimit,omitempty"`
+	Models                  []ArtifactDto               `json:"models,omitempty"`
+	LLMInvocationConfig     *LLMInvocationConfigDto     `json:"llmInvocationConfig,omitempty"`
 }
 
 // ClusterGroupsResponse represents the response from listing cluster groups

@@ -40,11 +40,16 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+
+	nvtracing "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
 )
 
 type RuntimeConfig struct {
 	MetricsPort int
+	// TracingAccessToken authenticates OTLP trace/metric export to the
+	// collector (Lightstep). Empty leaves exporters unauthenticated.
+	TracingAccessToken string
 }
 
 type Runtime struct {
@@ -76,7 +81,7 @@ func Init(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		),
 	)
 
-	if err := runtime.initTracing(ctx); err != nil {
+	if err := runtime.initTracing(ctx, cfg.TracingAccessToken); err != nil {
 		return nil, err
 	}
 	if err := runtime.initMetrics(ctx, cfg); err != nil {
@@ -86,14 +91,14 @@ func Init(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	return runtime, nil
 }
 
-func (r *Runtime) initTracing(ctx context.Context) error {
+func (r *Runtime) initTracing(ctx context.Context, accessToken string) error {
 	if exporter := os.Getenv("OTEL_TRACES_EXPORTER"); exporter != "" && exporter != "none" {
 		resource, err := newResource()
 		if err != nil {
 			return err
 		}
 
-		traceProvider, err := newTracerProvider(ctx, exporter, resource)
+		traceProvider, err := newTracerProvider(ctx, exporter, resource, accessToken)
 		if err != nil {
 			return err
 		}
@@ -115,7 +120,7 @@ func (r *Runtime) initMetrics(ctx context.Context, cfg RuntimeConfig) error {
 		return err
 	}
 
-	meterProvider, gatherer, err := newMeterProvider(ctx, metricsExporter, resource, cfg.MetricsPort > 0)
+	meterProvider, gatherer, err := newMeterProvider(ctx, metricsExporter, resource, cfg.MetricsPort > 0, cfg.TracingAccessToken)
 	if err != nil {
 		return err
 	}
@@ -169,6 +174,7 @@ func newTracerProvider(
 	ctx context.Context,
 	exporter string,
 	resource *resource.Resource,
+	accessToken string,
 ) (*sdktrace.TracerProvider, error) {
 	var (
 		spanExporter sdktrace.SpanExporter
@@ -179,9 +185,17 @@ func newTracerProvider(
 	case "otlp":
 		switch otlpProtocol() {
 		case "", "grpc":
-			spanExporter, err = otlptracegrpc.New(ctx)
+			var opts []otlptracegrpc.Option
+			if accessToken != "" {
+				opts = append(opts, otlptracegrpc.WithHeaders(otlpAuthHeaders(accessToken)))
+			}
+			spanExporter, err = otlptracegrpc.New(ctx, opts...)
 		case "http", "http/protobuf":
-			spanExporter, err = otlptracehttp.New(ctx)
+			var opts []otlptracehttp.Option
+			if accessToken != "" {
+				opts = append(opts, otlptracehttp.WithHeaders(otlpAuthHeaders(accessToken)))
+			}
+			spanExporter, err = otlptracehttp.New(ctx, opts...)
 		default:
 			return nil, errors.New("unsupported OTEL_EXPORTER_OTLP_PROTOCOL: " + otlpProtocol())
 		}
@@ -204,11 +218,18 @@ func otlpProtocol() string {
 	return strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")))
 }
 
+// otlpAuthHeaders returns the headers OTLP exporters must send to authenticate
+// to the collector (Lightstep). Rendered into secrets.json by the vault config.
+func otlpAuthHeaders(accessToken string) map[string]string {
+	return map[string]string{nvtracing.AccessTokenHeaderLightstep: accessToken}
+}
+
 func newMeterProvider(
 	ctx context.Context,
 	exporter string,
 	resource *resource.Resource,
 	includePrometheus bool,
+	accessToken string,
 ) (*sdkmetric.MeterProvider, prometheus.Gatherer, error) {
 	var (
 		readers  []sdkmetric.Reader
@@ -227,13 +248,17 @@ func newMeterProvider(
 			return nil, nil, err
 		}
 		readers = append(readers, prometheusReader)
-		gatherer = registry
+		gatherer = prometheus.Gatherers{registry, prometheus.DefaultGatherer}
 	}
 
 	switch exporter {
 	case "", "none":
 	case "otlp":
-		metricExporter, err := otlpmetricgrpc.New(ctx)
+		var opts []otlpmetricgrpc.Option
+		if accessToken != "" {
+			opts = append(opts, otlpmetricgrpc.WithHeaders(otlpAuthHeaders(accessToken)))
+		}
+		metricExporter, err := otlpmetricgrpc.New(ctx, opts...)
 		if err != nil {
 			return nil, nil, err
 		}

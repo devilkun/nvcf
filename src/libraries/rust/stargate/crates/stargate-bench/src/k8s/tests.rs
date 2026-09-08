@@ -14,13 +14,14 @@
 // limitations under the License.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::images::{ImageRefs, tilt_image_matches};
 use super::kubectl::Kubectl;
 use super::render::{
-    RenderManifestConfig, StargatePod, render_manifest, render_stargate_external_services,
+    RenderManifestConfig, RenderedManifests, StargatePod, render_manifest,
+    render_stargate_external_services,
 };
 use super::run::{BenchmarkK8sRun, prepare_benchmark_k8s_run_with_resolved_dependencies};
 use crate::config::{
@@ -39,7 +40,7 @@ fn config() -> BenchmarkConfig {
         seed: Some(42),
         request_count: 5,
         max_concurrency: 2,
-        tunnel_protocol: stargate_protocol::TunnelTransportProtocol::Custom,
+        tunnel_protocol: stargate_protocol::TunnelTransportProtocol::RawQuic,
         stargates: StargateConfig { count: 1 },
         backends: BackendConfig {
             count: 2,
@@ -72,11 +73,46 @@ fn config() -> BenchmarkConfig {
         }),
         degradation: DegradationConfig::default(),
         algorithms: vec![AlgorithmConfig {
-            name: "power-of-two".to_string(),
-            config: serde_json::json!({"default": "power-of-two"}),
+            name: "power-of-n".to_string(),
+            config: serde_json::json!({"default": "power-of-n"}),
             pylon_queue_admission: None,
         }],
     }
+}
+
+fn render_test_manifest(
+    config: &BenchmarkConfig,
+    algorithm: &AlgorithmConfig,
+    stargate_ns: &str,
+    backends_ns: &str,
+    lb_config_json: &str,
+) -> RenderedManifests {
+    let images = ImageRefs {
+        stargate: "stargate-dev:tilt-test".to_string(),
+        mock_dynamo: "mock-dynamo-dev:tilt-test".to_string(),
+        pylon: "pylon-dev:tilt-test".to_string(),
+    };
+    render_manifest(RenderManifestConfig {
+        config,
+        algorithm,
+        image_refs: &images,
+        stargate_ns,
+        backends_ns,
+        lb_config_json,
+        http_node_port: 30080,
+        metrics_node_port: 31080,
+        collector_metrics_node_port: 32080,
+    })
+}
+
+fn render_default_test_manifest(config: &BenchmarkConfig) -> RenderedManifests {
+    render_test_manifest(
+        config,
+        &config.algorithms[0],
+        "sgbench-sg-power",
+        "sgbench-be-power",
+        r#"{"default":"power-of-n"}"#,
+    )
 }
 
 fn parse_yaml_documents(manifest: &str) -> Vec<Value> {
@@ -131,9 +167,7 @@ struct FakeKubectl {
 impl FakeKubectl {
     fn new() -> Self {
         Self::with_body(
-            r#"ARGS="$*"
-printf '%s\n' "$ARGS" >> "$LOG"
-if [[ "$ARGS" == *"get namespace "* ]]; then
+            r#"if [[ "$ARGS" == *"get namespace "* ]]; then
   exit 1
 elif [[ "$ARGS" == *"get services -l benchmark.stargate/role=pod-metrics"* ]]; then
   printf 'stargate-1-metrics 31082\nstargate-0-metrics 31081\n'
@@ -169,19 +203,23 @@ fi
     fn with_body(body: &str) -> Self {
         let tempdir = tempfile::tempdir().expect("fake kubectl tempdir should create");
         let program = tempdir.path().join("kubectl");
+        let pending_program = tempdir.path().join("kubectl.pending");
         let log_path = tempdir.path().join("kubectl.log");
         let mut script = String::from("#!/usr/bin/env bash\nset -euo pipefail\n");
         script.push_str(&format!(
             "LOG={}\n",
             shell_single_quote(&log_path.display().to_string())
         ));
+        script.push_str("ARGS=\"$*\"\nprintf '%s\\n' \"$ARGS\" >> \"$LOG\"\n");
         script.push_str(body);
-        fs::write(&program, script).expect("fake kubectl script should write");
-        let mut permissions = fs::metadata(&program)
-            .expect("fake kubectl metadata should read")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&program, permissions).expect("fake kubectl should be executable");
+        {
+            let mut file =
+                fs::File::create(&pending_program).expect("fake kubectl script should create");
+            file.write_all(script.as_bytes())
+                .expect("fake kubectl script should write");
+            file.sync_all().expect("fake kubectl script should sync");
+        }
+        fs::rename(&pending_program, &program).expect("fake kubectl script should publish");
         Self {
             _tempdir: tempdir,
             program,
@@ -190,7 +228,7 @@ fi
     }
 
     fn runner(&self) -> Kubectl {
-        Kubectl::new(&self.program)
+        Kubectl::with_args("bash", [self.program.clone()])
     }
 
     fn command_log(&self) -> String {
@@ -203,10 +241,28 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 fn read_utf8(path: &Path, context: &str) -> String {
-    let bytes = fs::read(path).expect(context);
-    std::str::from_utf8(&bytes)
-        .expect("file contents should be UTF-8")
-        .to_owned()
+    fs::read_to_string(path).expect(context)
+}
+
+fn assert_contains_all(haystack: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(haystack.contains(needle), "missing `{needle}`");
+    }
+}
+
+fn assert_error_contains<T, E: std::fmt::Display>(result: Result<T, E>, expected: &str) {
+    let error = result.err().expect("operation should fail");
+    assert!(
+        error.to_string().contains(expected),
+        "unexpected error: {error}"
+    );
+}
+
+fn resolve_nodeport_host(body: &str, override_host: Option<&str>) -> String {
+    FakeKubectl::with_body(body)
+        .runner()
+        .resolve_nodeport_host_with_override(override_host.map(str::to_owned))
+        .expect("nodeport host should resolve")
 }
 
 fn benchmark_run(run_dir: &Path) -> BenchmarkK8sRun {
@@ -219,11 +275,11 @@ fn benchmark_run(run_dir: &Path) -> BenchmarkK8sRun {
         fs::write(run_dir.join(manifest), "kind: List\n").expect("manifest should write");
     }
     BenchmarkK8sRun {
-        algorithm_name: "power-of-two".to_string(),
+        algorithm_name: "power-of-n".to_string(),
         manifest_path: run_dir.join("manifest.json"),
         run_dir: run_dir.to_path_buf(),
-        stargate_ns: "sgbench-sg-power-of-two".to_string(),
-        backends_ns: "sgbench-be-power-of-two".to_string(),
+        stargate_ns: "sgbench-sg-power-of-n".to_string(),
+        backends_ns: "sgbench-be-power-of-n".to_string(),
         stargate_count: 2,
         nodeport_host: "node.test".to_string(),
         stargate_http_endpoint: "http://node.test:30080".to_string(),
@@ -260,8 +316,8 @@ fn prepare_benchmark_k8s_run_writes_split_manifests_and_run_info() {
     )
     .expect("benchmark k8s run should prepare");
 
-    assert_eq!(run.stargate_ns, "sgbench-sg-power-of-two");
-    assert_eq!(run.backends_ns, "sgbench-be-power-of-two");
+    assert_eq!(run.stargate_ns, "sgbench-sg-power-of-n");
+    assert_eq!(run.backends_ns, "sgbench-be-power-of-n");
     assert_eq!(run.stargate_http_endpoint, "http://node.example:30082");
     assert_eq!(
         run.stargate_metrics_endpoint,
@@ -286,9 +342,8 @@ fn prepare_benchmark_k8s_run_writes_split_manifests_and_run_info() {
         &run.run_dir.join("k8s-backends-manifest.yaml"),
         "backend manifest should read",
     );
-    assert!(full_manifest.contains("registry.test/stargate-dev:tilt-test"));
-    assert!(stargate_manifest.contains("nodePort: 30082"));
-    assert!(stargate_manifest.contains("nodePort: 32082"));
+    assert_contains_all(&full_manifest, &["registry.test/stargate-dev:tilt-test"]);
+    assert_contains_all(&stargate_manifest, &["nodePort: 30082", "nodePort: 32082"]);
     assert!(backends_manifest.contains("- --cluster-id=cluster-0"));
     assert!(!backends_manifest.contains("- --cluster-id=cluster-1"));
 
@@ -297,7 +352,7 @@ fn prepare_benchmark_k8s_run_writes_split_manifests_and_run_info() {
         "run info should read",
     ))
     .expect("run info should parse");
-    assert_eq!(run_info["algorithm_name"], "power-of-two");
+    assert_eq!(run_info["algorithm_name"], "power-of-n");
     assert_eq!(run_info["http_node_port"], 30082);
     assert_eq!(
         run_info["stargate_http_endpoint"],
@@ -314,7 +369,7 @@ fn kubectl_runner_executes_readiness_and_maintenance_commands() {
     let fake = FakeKubectl::new();
     let kubectl = fake.runner();
     let tempdir = tempfile::tempdir().expect("tempdir should create");
-    let run = benchmark_run(&tempdir.path().join("run-power-of-two"));
+    let run = benchmark_run(&tempdir.path().join("run-power-of-n"));
 
     kubectl.apply(&run).expect("stargate manifest should apply");
     kubectl
@@ -353,8 +408,13 @@ fn kubectl_runner_executes_readiness_and_maintenance_commands() {
         &run.run_dir.join("logs/stargate.log"),
         "stargate log should read",
     );
-    assert!(stargate_log.contains("status: exit status: 0"));
-    assert!(stargate_log.contains("logs for -n sgbench-sg-power-of-two logs"));
+    assert_contains_all(
+        &stargate_log,
+        &[
+            "status: exit status: 0",
+            "logs for -n sgbench-sg-power-of-n logs",
+        ],
+    );
     let backend_log = read_utf8(
         &run.run_dir.join("logs/backend-0-inference-server.log"),
         "backend log should read",
@@ -362,18 +422,21 @@ fn kubectl_runner_executes_readiness_and_maintenance_commands() {
     assert!(backend_log.contains("app=backend-0-inference-server"));
 
     let command_log = fake.command_log();
-    assert!(command_log.contains("rollout status statefulset/stargate --timeout=180s"));
-    assert!(command_log.contains("delete pod -l app=backend-1-inference-server"));
-    assert!(command_log.contains("scale deployment/backend-0-inference-server --replicas=3"));
-    assert!(command_log.contains("delete -f"));
+    assert_contains_all(
+        &command_log,
+        &[
+            "rollout status statefulset/stargate --timeout=180s",
+            "delete pod -l app=backend-1-inference-server",
+            "scale deployment/backend-0-inference-server --replicas=3",
+            "delete -f",
+        ],
+    );
 }
 
 #[test]
 fn kubectl_runner_reports_failed_operations_and_inconsistent_snapshots() {
     let fake = FakeKubectl::with_body(
-        r#"ARGS="$*"
-printf '%s\n' "$ARGS" >> "$LOG"
-if [[ "$ARGS" == *"get namespace "* ]]; then
+        r#"if [[ "$ARGS" == *"get namespace "* ]]; then
   exit 1
 elif [[ "$ARGS" == "apply -f "* ]]; then
   exit 1
@@ -392,139 +455,74 @@ fi
     );
     let kubectl = fake.runner();
     let tempdir = tempfile::tempdir().expect("tempdir should create");
-    let run = benchmark_run(&tempdir.path().join("run-power-of-two"));
+    let run = benchmark_run(&tempdir.path().join("run-power-of-n"));
 
-    let apply_error = kubectl
-        .apply(&run)
-        .expect_err("failed apply should be reported");
-    assert!(apply_error.to_string().contains("kubectl apply failed"));
-
-    let delete_error = kubectl
-        .delete(&run)
-        .expect_err("failed delete should be reported");
-    assert!(delete_error.to_string().contains("kubectl delete failed"));
-
-    let delete_pod_error = kubectl
-        .delete_backend_pod(&run, 0)
-        .expect_err("failed pod delete should be reported");
-    assert!(
-        delete_pod_error
-            .to_string()
-            .contains("kubectl delete pod failed")
+    assert_error_contains(kubectl.apply(&run), "kubectl apply failed");
+    assert_error_contains(kubectl.delete(&run), "kubectl delete failed");
+    assert_error_contains(
+        kubectl.delete_backend_pod(&run, 0),
+        "kubectl delete pod failed",
     );
-
-    let scale_error = kubectl
-        .scale_backend(&run, 0, 3)
-        .expect_err("failed scale should be reported");
-    assert!(scale_error.to_string().contains("kubectl scale failed"));
-
-    let metrics_error = kubectl
-        .stargate_metrics_endpoints(&run)
-        .expect_err("missing per-pod metric service should be reported");
-    assert!(
-        metrics_error
-            .to_string()
-            .contains("expected 2 per-stargate metrics endpoints but found 1")
+    assert_error_contains(kubectl.scale_backend(&run, 0, 3), "kubectl scale failed");
+    assert_error_contains(
+        kubectl.stargate_metrics_endpoints(&run),
+        "expected 2 per-stargate metrics endpoints but found 1",
     );
-
-    let readiness_error = kubectl
-        .wait_ready(&run, 2)
-        .expect_err("pod-count mismatch should be reported");
-    assert!(
-        readiness_error
-            .to_string()
-            .contains("expected 2 stargate pods but found 1")
+    assert_error_contains(
+        kubectl.wait_ready(&run, 2),
+        "expected 2 stargate pods but found 1",
     );
 }
 
 #[test]
 fn kubectl_resolves_nodeport_host_from_override_context_or_node_addresses() {
-    let override_fake = FakeKubectl::with_body(
-        r#"ARGS="$*"
-printf '%s\n' "$ARGS" >> "$LOG"
-"#,
-    );
-    let override_runner = override_fake.runner();
     assert_eq!(
-        override_runner
-            .resolve_nodeport_host_with_override(Some(" node.override.test ".to_string()))
-            .expect("explicit host should resolve"),
+        resolve_nodeport_host("", Some(" node.override.test ")),
         "node.override.test"
     );
 
-    let docker_fake = FakeKubectl::with_body(
-        r#"ARGS="$*"
-printf '%s\n' "$ARGS" >> "$LOG"
-if [[ "$ARGS" == "config current-context" ]]; then
+    assert_eq!(
+        resolve_nodeport_host(
+            r#"if [[ "$ARGS" == "config current-context" ]]; then
   printf 'docker-desktop\n'
 fi
 "#,
-    );
-    let docker_runner = docker_fake.runner();
-    assert_eq!(
-        docker_runner
-            .resolve_nodeport_host_with_override(None)
-            .expect("docker-desktop should resolve to loopback"),
+            None,
+        ),
         "127.0.0.1"
     );
 
-    let external_fake = FakeKubectl::with_body(
-        r#"ARGS="$*"
-printf '%s\n' "$ARGS" >> "$LOG"
-if [[ "$ARGS" == "config current-context" ]]; then
+    assert_eq!(
+        resolve_nodeport_host(
+            r#"if [[ "$ARGS" == "config current-context" ]]; then
   printf 'kind-kind\n'
 elif [[ "$ARGS" == *"get nodes -o "*"ExternalIP"* ]]; then
   printf '203.0.113.10\n'
 fi
 "#,
-    );
-    let external_runner = external_fake.runner();
-    assert_eq!(
-        external_runner
-            .resolve_nodeport_host_with_override(None)
-            .expect("external node IP should resolve"),
+            None,
+        ),
         "203.0.113.10"
     );
 
-    let internal_fake = FakeKubectl::with_body(
-        r#"ARGS="$*"
-printf '%s\n' "$ARGS" >> "$LOG"
-if [[ "$ARGS" == "config current-context" ]]; then
+    assert_eq!(
+        resolve_nodeport_host(
+            r#"if [[ "$ARGS" == "config current-context" ]]; then
   printf 'kind-kind\n'
 elif [[ "$ARGS" == *"get nodes -o "*"InternalIP"* ]]; then
   printf '10.0.0.8\n'
 fi
 "#,
-    );
-    let internal_runner = internal_fake.runner();
-    assert_eq!(
-        internal_runner
-            .resolve_nodeport_host_with_override(None)
-            .expect("internal node IP should resolve after empty external IP"),
+            None,
+        ),
         "10.0.0.8"
     );
 }
 
 #[test]
 fn rendered_benchmark_manifest_includes_otel_prometheus_scraper() {
-    let images = ImageRefs {
-        stargate: "stargate-dev:tilt-test".to_string(),
-        mock_dynamo: "mock-dynamo-dev:tilt-test".to_string(),
-        pylon: "pylon-dev:tilt-test".to_string(),
-    };
-
     let config = config();
-    let rendered = render_manifest(RenderManifestConfig {
-        config: &config,
-        algorithm: &config.algorithms[0],
-        image_refs: &images,
-        stargate_ns: "sgbench-sg-power",
-        backends_ns: "sgbench-be-power",
-        lb_config_json: r#"{"default":"power-of-two"}"#,
-        http_node_port: 30080,
-        metrics_node_port: 31080,
-        collector_metrics_node_port: 32080,
-    });
+    let rendered = render_default_test_manifest(&config);
 
     let docs = parse_yaml_documents(&rendered.stargate);
     let collector_sa = find_doc_by_kind_and_name(&docs, "ServiceAccount", "otel-collector");
@@ -573,24 +571,8 @@ fn rendered_benchmark_manifest_includes_otel_prometheus_scraper() {
 
 #[test]
 fn rendered_benchmark_manifest_does_not_expose_list_models_via_headless_service() {
-    let images = ImageRefs {
-        stargate: "stargate-dev:tilt-test".to_string(),
-        mock_dynamo: "mock-dynamo-dev:tilt-test".to_string(),
-        pylon: "pylon-dev:tilt-test".to_string(),
-    };
-
     let config = config();
-    let rendered = render_manifest(RenderManifestConfig {
-        config: &config,
-        algorithm: &config.algorithms[0],
-        image_refs: &images,
-        stargate_ns: "sgbench-sg-power",
-        backends_ns: "sgbench-be-power",
-        lb_config_json: r#"{"default":"power-of-two"}"#,
-        http_node_port: 30080,
-        metrics_node_port: 31080,
-        collector_metrics_node_port: 32080,
-    });
+    let rendered = render_default_test_manifest(&config);
 
     let docs = parse_yaml_documents(&rendered.stargate);
     let headless = find_doc_by_kind_and_name(&docs, "Service", "stargate-headless");
@@ -680,92 +662,46 @@ fn external_services_include_per_pod_metrics_nodeport() {
 
 #[test]
 fn rendered_grouped_pylons_share_one_scaled_mock_backend() {
-    let images = ImageRefs {
-        stargate: "stargate-dev:tilt-test".to_string(),
-        mock_dynamo: "mock-dynamo-dev:tilt-test".to_string(),
-        pylon: "pylon-dev:tilt-test".to_string(),
-    };
-
     let mut config = config();
     config.backends.cluster_id_template = Some("cluster-{cluster_index}".to_string());
     config.backends.pylons_per_cluster = 2;
     config.backends.profile.max_concurrent_requests = Some(3);
     config.backends.profile.kv_cache_capacity_tokens = 11;
-    let rendered = render_manifest(RenderManifestConfig {
-        config: &config,
-        algorithm: &config.algorithms[0],
-        image_refs: &images,
-        stargate_ns: "sgbench-sg-power",
-        backends_ns: "sgbench-be-power",
-        lb_config_json: r#"{"default":"power-of-two"}"#,
-        http_node_port: 30080,
-        metrics_node_port: 31080,
-        collector_metrics_node_port: 32080,
-    });
+    let rendered = render_default_test_manifest(&config);
 
-    assert!(rendered.backends.contains("- --cluster-id=cluster-0"));
+    assert_contains_all(
+        &rendered.backends,
+        &[
+            "- --cluster-id=cluster-0",
+            "name: backend-0-http",
+            "- --upstream-http-base-url=http://backend-0-http.sgbench-be-power.svc.cluster.local:8090",
+            "- --max-concurrent-requests=6",
+            "- --kv-cache-capacity-tokens=22",
+        ],
+    );
     assert!(!rendered.backends.contains("- --cluster-id=cluster-1"));
-    assert!(rendered.backends.contains("name: backend-0-http"));
     assert!(!rendered.backends.contains("name: backend-1-http"));
-    assert!(rendered.backends.contains(
-        "- --upstream-http-base-url=http://backend-0-http.sgbench-be-power.svc.cluster.local:8090"
-    ));
     assert!(!rendered.backends.contains(
         "- --upstream-http-base-url=http://backend-1-http.sgbench-be-power.svc.cluster.local:8090"
     ));
-    assert!(rendered.backends.contains("- --max-concurrent-requests=6"));
-    assert!(
-        rendered
-            .backends
-            .contains("- --kv-cache-capacity-tokens=22")
-    );
 }
 
 #[test]
 fn rendered_manifests_include_tunnel_protocol() {
-    let images = ImageRefs {
-        stargate: "stargate-dev:tilt-test".to_string(),
-        mock_dynamo: "mock-dynamo-dev:tilt-test".to_string(),
-        pylon: "pylon-dev:tilt-test".to_string(),
-    };
-
     let mut config = config();
     config.tunnel_protocol = stargate_protocol::TunnelTransportProtocol::WebTransport;
-    let rendered = render_manifest(RenderManifestConfig {
-        config: &config,
-        algorithm: &config.algorithms[0],
-        image_refs: &images,
-        stargate_ns: "sgbench-sg-power",
-        backends_ns: "sgbench-be-power",
-        lb_config_json: r#"{"default":"power-of-two"}"#,
-        http_node_port: 30080,
-        metrics_node_port: 31080,
-        collector_metrics_node_port: 32080,
-    });
+    let rendered = render_default_test_manifest(&config);
 
-    assert!(
-        rendered
-            .stargate
-            .contains("- --tunnel-protocol=webtransport")
-    );
-    assert!(
-        rendered
-            .backends
-            .contains("- --tunnel-protocol=webtransport")
-    );
+    assert_contains_all(&rendered.stargate, &["- --tunnel-protocol=webtransport"]);
+    assert_contains_all(&rendered.backends, &["- --tunnel-protocol=webtransport"]);
 }
 
 #[test]
 fn rendered_pylons_include_per_algorithm_queue_admission_args() {
-    let images = ImageRefs {
-        stargate: "stargate-dev:tilt-test".to_string(),
-        mock_dynamo: "mock-dynamo-dev:tilt-test".to_string(),
-        pylon: "pylon-dev:tilt-test".to_string(),
-    };
     let config = config();
     let algorithm = AlgorithmConfig {
         name: "queue-admission-enabled".to_string(),
-        config: serde_json::json!({"default": "groq-multiregion"}),
+        config: serde_json::json!({"default": "wait-and-widen"}),
         pylon_queue_admission: Some(crate::config::PylonQueueAdmissionConfig {
             enabled: true,
             min_delta_ms: Some(0),
@@ -773,47 +709,25 @@ fn rendered_pylons_include_per_algorithm_queue_admission_args() {
             retry_after_ms: Some(5),
         }),
     };
-    let rendered = render_manifest(RenderManifestConfig {
-        config: &config,
-        algorithm: &algorithm,
-        image_refs: &images,
-        stargate_ns: "sgbench-sg-queue",
-        backends_ns: "sgbench-be-queue",
-        lb_config_json: r#"{"default":"groq-multiregion"}"#,
-        http_node_port: 30080,
-        metrics_node_port: 31080,
-        collector_metrics_node_port: 32080,
-    });
+    let rendered = render_test_manifest(
+        &config,
+        &algorithm,
+        "sgbench-sg-queue",
+        "sgbench-be-queue",
+        r#"{"default":"wait-and-widen"}"#,
+    );
 
-    assert!(
-        rendered
-            .backends
-            .contains("- --pylon-queue-mismatch-retry-enabled=true")
-    );
-    assert!(
-        rendered
-            .backends
-            .contains("- --pylon-queue-mismatch-min-delta-ms=0")
-    );
-    assert!(rendered.backends.contains("- --disable-bringup"));
-    assert!(
-        rendered
-            .backends
-            .contains("- --active-canary-interval-ms=0")
-    );
-    assert!(
-        rendered
-            .backends
-            .contains("- --benchmark-fixed-last-mean-input-tps=100")
-    );
-    assert!(
-        rendered
-            .backends
-            .contains("- --pylon-queue-mismatch-tolerance-factor=1")
-    );
-    assert!(
-        rendered
-            .backends
-            .contains("- --pylon-queue-mismatch-retry-after-ms=5")
+    assert_contains_all(
+        &rendered.backends,
+        &[
+            "- --pylon-queue-mismatch-retry-enabled=true",
+            "- --pylon-queue-mismatch-min-delta-ms=0",
+            "- --disable-bringup",
+            "- --active-canary-interval-ms=0",
+            "- --initial-input-tps=100",
+            "- --benchmark-pin-input-tps",
+            "- --pylon-queue-mismatch-tolerance-factor=1",
+            "- --pylon-queue-mismatch-retry-after-ms=5",
+        ],
     );
 }

@@ -13,7 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Integration tests for backend-facing forwarding across two stargates.
+// Integration tests for the development-only backend-facing peer relay across
+// two stargates.
 // Registration fanout gives each stargate local routing state; HTTP proxy
 // requests themselves remain local and are never forwarded between peers.
 // Matrix: {1,2} backends x {direct-quic, reverse-tunnel} x 2 stargates.
@@ -23,11 +24,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::common::{
-    BackendHandle, MapResolver, assert_model_routing, base_config, bind_ephemeral,
-    bind_ephemeral_udp, init_crypto, start_and_register_backend, wait_for_routing,
+    BackendHandle, MapResolver, assert_model_routing, base_config, init_crypto,
+    localhost_reverse_tunnel_config, start_and_register_backend, wait_for_routing,
     wait_for_unroutable, with_proxy_headers,
 };
-use stargate::runtime::{StargateHandle, StargateRuntime};
+use stargate::runtime::{BoundStargateListeners, StargateHandle, StargateRuntime};
 use stargate_forwarding::ForwardingResolver;
 use stargate_proto::pb::StargateInfo;
 
@@ -69,97 +70,84 @@ impl TwoStargates {
     }
 }
 
-/// Two stargates with backend-facing gRPC forwarding (no reverse tunnel).
+/// Two stargates with development-only backend-facing gRPC relay coverage
+/// (no reverse tunnel).
 async fn two_stargates_direct_quic() -> TwoStargates {
-    let (grpc_a, grpc_listener_a) = bind_ephemeral();
-    let (grpc_b, grpc_listener_b) = bind_ephemeral();
-    let (http_a, http_listener_a) = bind_ephemeral();
-    let (http_b, http_listener_b) = bind_ephemeral();
-
-    let peers = Arc::new(Mutex::new(Vec::<StargateInfo>::new()));
-
-    let mut resolver_a = MapResolver::new("sg-a");
-    resolver_a.insert("sg-b", grpc_b);
-    let resolver_a: Arc<dyn ForwardingResolver> = Arc::new(resolver_a);
-
-    let mut resolver_b = MapResolver::new("sg-b");
-    resolver_b.insert("sg-a", grpc_a);
-    let resolver_b: Arc<dyn ForwardingResolver> = Arc::new(resolver_b);
-
-    let discovery_a = crate::common::SharedDiscovery::new("sg-a", grpc_a, http_a, peers.clone());
-    let mut config_a = base_config("sg-a", grpc_a, http_a);
-    config_a.dns_poll_interval = Duration::from_secs(1);
-    let runtime_a = StargateRuntime::new(config_a, Box::new(discovery_a))
-        .with_forwarding(resolver_a)
-        .with_grpc_listener(grpc_listener_a)
-        .with_http_listener(http_listener_a);
-
-    let discovery_b = crate::common::SharedDiscovery::new("sg-b", grpc_b, http_b, peers.clone());
-    let mut config_b = base_config("sg-b", grpc_b, http_b);
-    config_b.dns_poll_interval = Duration::from_secs(1);
-    let runtime_b = StargateRuntime::new(config_b, Box::new(discovery_b))
-        .with_forwarding(resolver_b)
-        .with_grpc_listener(grpc_listener_b)
-        .with_http_listener(http_listener_b);
-
-    let handle_a = runtime_a.start().await.expect("stargate A failed");
-    let handle_b = runtime_b.start().await.expect("stargate B failed");
-
-    crate::common::wait_for_healthy(http_a, Duration::from_secs(5)).await;
-    crate::common::wait_for_healthy(http_b, Duration::from_secs(5)).await;
-
-    TwoStargates {
-        grpc_a,
-        http_a,
-        grpc_b,
-        http_b,
-        handle_a,
-        handle_b,
-    }
+    two_stargates(false).await
 }
 
-/// Two stargates with backend-facing gRPC and QUIC forwarding (reverse tunnel enabled).
+/// Two stargates with development-only backend-facing gRPC and QUIC relay
+/// coverage (reverse tunnel enabled).
 async fn two_stargates_reverse_tunnel() -> TwoStargates {
-    let (grpc_a, grpc_listener_a) = bind_ephemeral();
-    let (grpc_b, grpc_listener_b) = bind_ephemeral();
-    let (http_a, http_listener_a) = bind_ephemeral();
-    let (http_b, http_listener_b) = bind_ephemeral();
-    let (reverse_a, reverse_socket_a) = bind_ephemeral_udp();
-    let (reverse_b, reverse_socket_b) = bind_ephemeral_udp();
+    two_stargates(true).await
+}
+
+async fn two_stargates(reverse_tunnel: bool) -> TwoStargates {
+    let mut config_a = base_config(
+        "sg-a",
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config_a.dns_poll_interval = Duration::from_secs(1);
+    let reverse_tunnel_a =
+        reverse_tunnel.then(|| localhost_reverse_tunnel_config("127.0.0.1:0".parse().unwrap()));
+    let listeners_a = BoundStargateListeners::bind(&mut config_a).unwrap();
+    let grpc_a = config_a.grpc_listen_addr;
+    let http_a = config_a.http_listen_addr;
+
+    let mut config_b = base_config(
+        "sg-b",
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config_b.dns_poll_interval = Duration::from_secs(1);
+    let reverse_tunnel_b =
+        reverse_tunnel.then(|| localhost_reverse_tunnel_config("127.0.0.1:0".parse().unwrap()));
+    let listeners_b = BoundStargateListeners::bind(&mut config_b).unwrap();
+    let grpc_b = config_b.grpc_listen_addr;
+    let http_b = config_b.http_listen_addr;
 
     let peers = Arc::new(Mutex::new(Vec::<StargateInfo>::new()));
 
-    let mut resolver_a = MapResolver::new("sg-a.stargate.external");
+    let mut resolver_a = MapResolver::new(if reverse_tunnel {
+        "sg-a.stargate.external"
+    } else {
+        "sg-a"
+    });
     resolver_a.insert("sg-b", grpc_b);
-    resolver_a.insert("sg-b.stargate.external", reverse_b);
+    if let Some(reverse_b) = &reverse_tunnel_b {
+        resolver_a.insert("sg-b.stargate.external", reverse_b.listen_addr());
+    }
     let resolver_a: Arc<dyn ForwardingResolver> = Arc::new(resolver_a);
 
-    let mut resolver_b = MapResolver::new("sg-b.stargate.external");
+    let mut resolver_b = MapResolver::new(if reverse_tunnel {
+        "sg-b.stargate.external"
+    } else {
+        "sg-b"
+    });
     resolver_b.insert("sg-a", grpc_a);
-    resolver_b.insert("sg-a.stargate.external", reverse_a);
+    if let Some(reverse_a) = &reverse_tunnel_a {
+        resolver_b.insert("sg-a.stargate.external", reverse_a.listen_addr());
+    }
     let resolver_b: Arc<dyn ForwardingResolver> = Arc::new(resolver_b);
 
+    config_a.forwarding = Some(resolver_a);
     let discovery_a = crate::common::SharedDiscovery::new("sg-a", grpc_a, http_a, peers.clone());
-    let mut config_a = base_config("sg-a", grpc_a, http_a);
-    config_a.dns_poll_interval = Duration::from_secs(1);
-    config_a.advertised_hostname_template = Some("localhost".to_string());
-    config_a.reverse_tunnel_listen_addr = Some(reverse_a);
-    let runtime_a = StargateRuntime::new(config_a, Box::new(discovery_a))
-        .with_forwarding(resolver_a)
-        .with_grpc_listener(grpc_listener_a)
-        .with_http_listener(http_listener_a)
-        .with_reverse_tunnel_socket(reverse_socket_a);
+    let runtime_a = StargateRuntime::new(
+        config_a,
+        Box::new(discovery_a),
+        listeners_a,
+        reverse_tunnel_a,
+    );
 
+    config_b.forwarding = Some(resolver_b);
     let discovery_b = crate::common::SharedDiscovery::new("sg-b", grpc_b, http_b, peers.clone());
-    let mut config_b = base_config("sg-b", grpc_b, http_b);
-    config_b.dns_poll_interval = Duration::from_secs(1);
-    config_b.advertised_hostname_template = Some("localhost".to_string());
-    config_b.reverse_tunnel_listen_addr = Some(reverse_b);
-    let runtime_b = StargateRuntime::new(config_b, Box::new(discovery_b))
-        .with_forwarding(resolver_b)
-        .with_grpc_listener(grpc_listener_b)
-        .with_http_listener(http_listener_b)
-        .with_reverse_tunnel_socket(reverse_socket_b);
+    let runtime_b = StargateRuntime::new(
+        config_b,
+        Box::new(discovery_b),
+        listeners_b,
+        reverse_tunnel_b,
+    );
 
     let handle_a = runtime_a.start().await.expect("stargate A failed");
     let handle_b = runtime_b.start().await.expect("stargate B failed");

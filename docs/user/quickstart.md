@@ -14,6 +14,13 @@ Run the commands from the NVCF repository root unless a step says otherwise.
 The `nvcf-cli self-hosted up` command runs on your workstation. It does not run
 inside Kubernetes.
 
+Clone the public repository before you start:
+
+```bash
+git clone https://github.com/nvidia/nvcf.git
+cd nvcf
+```
+
 ## Prerequisites
 
 Before you start, install and prepare:
@@ -161,7 +168,7 @@ instead of the hosted NVCF endpoints.
 
 ## Step 3: Create the local stack secrets file
 
-Create the local secrets file used by the self-managed stack:
+Create the local secrets files used by the control-plane and compute-plane stacks:
 
 ```bash
 cp deploy/stacks/self-managed/secrets/secrets.yaml.template \
@@ -189,12 +196,13 @@ Run the local install:
 
 ```bash
 nvcf-cli --config "${NVCF_CLI_CONFIG}" self-hosted up \
+  --control-plane-stack=deploy/stacks/self-managed \
+  --compute-plane-stack=deploy/stacks/nvcf-compute-plane \
   --env=local \
   --cluster-name=ncp-local \
   --nca-id=nvcf-default \
   --region=us-west-1 \
   --icms-url=http://sis.localhost:8080 \
-  --stack=deploy/stacks/self-managed \
   --refresh-token
 ```
 
@@ -292,13 +300,16 @@ Remove the compute-plane components:
 ```bash
 nvcf-cli --config "${NVCF_CLI_CONFIG}" self-hosted uninstall \
   --compute-plane \
-  --cluster-name ncp-local
+  --cluster-name ncp-local \
+  --compute-plane-stack=deploy/stacks/nvcf-compute-plane
 ```
 
 Remove the control plane:
 
 ```bash
-nvcf-cli --config "${NVCF_CLI_CONFIG}" self-hosted uninstall --control-plane
+nvcf-cli --config "${NVCF_CLI_CONFIG}" self-hosted uninstall \
+  --control-plane \
+  --control-plane-stack=deploy/stacks/self-managed
 ```
 
 Destroy the local k3d cluster:
@@ -335,7 +346,7 @@ Common local k3d issues:
 
 ## See Also
 
-- [Local Development](./local-development.md) for local k3d variants and cleanup commands.
+- [Local Development](../local-development) for local k3d variants and cleanup commands.
 - [Helmfile Installation](./helmfile-installation.md) for remote or manual control-plane installs.
 - [Self-Managed Clusters](./cluster-management/self-managed.md) for registering GPU clusters outside the local quickstart.
 - `src/clis/nvcf-cli/examples/` in this repository for sample CLI input files.

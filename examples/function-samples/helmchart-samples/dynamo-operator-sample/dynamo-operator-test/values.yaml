@@ -14,22 +14,36 @@
 # limitations under the License.
 
 frontend:
+  image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+  nodeCount: 1
   replicas: 1
 
 vllmDecodeWorker:
+  image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
   replicas: 1
+  nodeCount: 1
   resources:
     limits:
       # Must be "gpu" not "nvidia.com/gpu"
       gpu: "1"
+    requests:
+      custom:
+        # Increase this value for larger models
+        ephemeral-storage: "2Gi"
 
 vllmPrefillWorker:
+  image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
   replicas: 1
+  nodeCount: 1
   resources:
     limits:
       # Must be "gpu" not "nvidia.com/gpu"
       gpu: "1"
+    requests:
+      custom:
+        # Increase this value for larger models
+        ephemeral-storage: "2Gi"
 
 annotations: {}
 labels: {}
-env: {}
+hfToken: ""

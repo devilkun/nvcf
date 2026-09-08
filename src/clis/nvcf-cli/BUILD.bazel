@@ -36,6 +36,8 @@ go_library(
         "main.BuildDate": "{BUILD_DATE}",
         "main.BuildUser": "{STABLE_BUILD_USER}",
         "main.GoVersion": "{STABLE_GO_VERSION}",
+        "nvcf-cli/cmd.defaultControlPlaneStackOCI": "{CONTROL_PLANE_STACK_OCI}",
+        "nvcf-cli/cmd.defaultComputePlaneStackOCI": "{COMPUTE_PLANE_STACK_OCI}",
     },
     deps = ["//src/clis/nvcf-cli/cmd"],
 )

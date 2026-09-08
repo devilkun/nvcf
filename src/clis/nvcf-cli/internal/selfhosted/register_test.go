@@ -120,16 +120,16 @@ func TestRegisterCluster_PropagatesError(t *testing.T) {
 // fakeLister is a test double for the clusterLister interface used by
 // resolveExistingCluster.
 type fakeLister struct {
-	clusters []client.SISCluster
+	clusters []client.ICMSCluster
 	err      error
 }
 
-func (f *fakeLister) ListClusters(_ context.Context, _, _ string) ([]client.SISCluster, error) {
+func (f *fakeLister) ListClusters(_ context.Context, _, _ string) ([]client.ICMSCluster, error) {
 	return f.clusters, f.err
 }
 
 func TestResolveExistingCluster_FoundByName(t *testing.T) {
-	l := &fakeLister{clusters: []client.SISCluster{
+	l := &fakeLister{clusters: []client.ICMSCluster{
 		{ClusterName: "other", ClusterID: "id-other"},
 		{ClusterName: "wanted", ClusterID: "id-wanted", ClusterGroupID: "grp-wanted"},
 	}}
@@ -140,7 +140,7 @@ func TestResolveExistingCluster_FoundByName(t *testing.T) {
 }
 
 func TestResolveExistingCluster_NotFound(t *testing.T) {
-	l := &fakeLister{clusters: []client.SISCluster{{ClusterName: "other"}}}
+	l := &fakeLister{clusters: []client.ICMSCluster{{ClusterName: "other"}}}
 	_, err := resolveExistingCluster(context.Background(), l, "url", "nca", "missing")
 	assert.ErrorContains(t, err, "missing")
 }
@@ -269,6 +269,50 @@ func TestLoadKubeConfigFn_EmptyKctxIsPassedThrough(t *testing.T) {
 	assert.Equal(t, "", capturedKctx,
 		"empty kctx should be passed through unchanged")
 	assert.Equal(t, "https://default:6443", cfg.Host)
+}
+
+// TestClusterClientAdapter_TokenEmitsBearerOnRegister verifies the wiring that
+// the --token flag (selfHostedToken in cmd/) propagates through to the SIS
+// register call as an Authorization: Bearer header. Regression for the bug
+// where --token=$JWT skipped nvcf-cli init but the resulting register POST
+// still went out unauthenticated, returning 401.
+func TestClusterClientAdapter_TokenEmitsBearerOnRegister(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/accounts/nca/clusters" {
+			gotAuth = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"clusterId":"cl-1","clusterGroupId":"cg-1"}`))
+			return
+		}
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+
+	cfg := &client.Config{
+		AuthType:       client.AuthTypeBearer,
+		Token:          "test-jwt",
+		ClientID:       "nca",
+		BaseHTTPURL:    server.URL,
+		BaseGRPCURL:    "localhost:1",
+		DefaultTimeout: time.Second,
+	}
+	inner, err := client.NewClient(cfg)
+	require.NoError(t, err)
+	defer inner.Close()
+
+	adapter := &clusterClientAdapter{inner: inner, sisURL: server.URL, cfg: cfg}
+	_, err = adapter.RegisterCluster(context.Background(), RegisterRequest{
+		ClusterName: "wanted",
+		NCAID:       "nca",
+		Region:      "us-west-1",
+		JWKS:        `{"keys":[]}`,
+		OIDCIssuer:  "https://issuer.example.com",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer test-jwt", gotAuth,
+		"register POST must carry the admin JWT as Bearer when Config.Token is set")
 }
 
 func TestNewClusterClient_HitsRealSIS(t *testing.T) {

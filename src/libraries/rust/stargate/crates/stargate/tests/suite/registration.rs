@@ -15,13 +15,12 @@
 
 use std::time::Duration;
 
+use crate::common::sse::{assert_sse_done, parse_sse_events};
 use crate::common::{
-    init_crypto, make_stargate_runtime, start_dummy_inst, wait_for_routing, with_proxy_headers,
+    direct_registration_config, init_crypto, make_stargate_runtime, start_dummy_inst,
+    wait_for_routing, with_proxy_headers,
 };
-use pylon_lib::{
-    BringupConfig, InferenceServerRegistrationClient, InferenceServerRegistrationConfig,
-    OutputTokenParserFactory,
-};
+use pylon_lib::{InferenceServerRegistrationClient, PylonRuntimeState};
 use stargate_proto::pb::InferenceServerStatus;
 use stargate_proto::pb::stargate_control_plane_client::StargateControlPlaneClient;
 use stargate_proto::pb::{InferenceServerAck, InferenceServerRegistration};
@@ -38,31 +37,14 @@ async fn duplicate_inference_server_id_rejected() {
     let (inst_addr, quic_url, _tunnel) = start_dummy_inst("dup-model").await;
 
     let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "dup-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url.clone(),
-                upstream_http_base_url: Some(format!("http://{inst_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["dup-model".to_string()],
-        )
+    reg_client
+        .start(direct_registration_config(
+            vec![grpc_addr.to_string()],
+            "dup-inst",
+            quic_url.clone(),
+            format!("http://{inst_addr}"),
+            PylonRuntimeState::new(InferenceServerStatus::Active, &["dup-model".to_string()]),
+        ))
         .expect("registration failed");
 
     wait_for_routing(http_addr, "dup-model", Duration::from_secs(5)).await;
@@ -83,7 +65,6 @@ async fn duplicate_inference_server_id_rejected() {
         inference_server_url: quic_url,
         models: Default::default(),
         reverse_tunnel: false,
-        coordinated_calibration: false,
     })
     .await
     .expect("send failed");
@@ -132,31 +113,14 @@ async fn concurrent_proxy_requests_all_succeed() {
     let (inst_addr, quic_url, _tunnel) = start_dummy_inst("conc-model").await;
 
     let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "conc-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url,
-                upstream_http_base_url: Some(format!("http://{inst_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["conc-model".to_string()],
-        )
+    reg_client
+        .start(direct_registration_config(
+            vec![grpc_addr.to_string()],
+            "conc-inst",
+            quic_url,
+            format!("http://{inst_addr}"),
+            PylonRuntimeState::new(InferenceServerStatus::Active, &["conc-model".to_string()]),
+        ))
         .expect("registration failed");
 
     wait_for_routing(http_addr, "conc-model", Duration::from_secs(5)).await;
@@ -190,7 +154,7 @@ async fn concurrent_proxy_requests_all_succeed() {
     for handle in handles {
         let (status, text) = handle.await.expect("task panicked");
         assert_eq!(status, 200, "concurrent request should succeed");
-        assert!(text.contains("[DONE]"), "SSE should end with [DONE]");
+        assert_sse_done(&parse_sse_events(&text).expect("concurrent stream should be valid SSE"));
     }
 
     reg_client.stop();

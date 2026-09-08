@@ -21,12 +21,46 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	rc "ai-api-gateway-service/internal/reloadableconfig"
 )
 
 type SessionTimeoutSeconds int
+
+type ShadowSamplingMethod string
+
+const (
+	ShadowSamplingMethodRandom       ShadowSamplingMethod = "random"
+	ShadowSamplingMethodPerBearerKey ShadowSamplingMethod = "perBearerKey"
+)
+
+type CustomHeaders map[string]string
+
+func (h *CustomHeaders) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*h = nil
+		return nil
+	}
+
+	rawHeaders := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &rawHeaders); err != nil {
+		return err
+	}
+
+	headers := make(CustomHeaders, len(rawHeaders))
+	for name, rawValue := range rawHeaders {
+		var value string
+		if err := json.Unmarshal(rawValue, &value); err != nil {
+			return fmt.Errorf("customHeaders.%s must be a string", name)
+		}
+		headers[name] = value
+	}
+	*h = headers
+	return nil
+}
 
 type ModelFunctionDetails struct {
 	ModelName                      string                `json:"modelName"`
@@ -35,13 +69,32 @@ type ModelFunctionDetails struct {
 	OutgoingPathOverride           string                `json:"outgoingPathOverride"`
 	UsePexec                       bool                  `json:"usePexec"`
 	SessionTimeout                 SessionTimeoutSeconds `json:"sessionTimeout,omitempty"`
+	CustomHeaders                  CustomHeaders         `json:"customHeaders,omitempty"`
 	EOL                            time.Time             `json:"eol,omitempty"`            // RFC3339 timestamp (full ISO 8601)
 	OfflineMessage                 string                `json:"offlineMessage,omitempty"` // non-empty = endpoint is offline
 	TooManyRequestsMessage         string                `json:"tooManyRequestsMessage"`
 	ShadowModelName                string                `json:"shadowModelName,omitempty"`
 	ShadowModelNames               []string              `json:"shadowModelNames,omitempty"`
-	ShadowPercentage               *int                  `json:"shadowPercentage,omitempty"`               // 1-100 when set; omitted defaults to 100
+	ShadowPercentage               *int                  `json:"shadowPercentage,omitempty"` // 1-100 when set; omitted defaults to 100
+	ShadowSamplingMethod           ShadowSamplingMethod  `json:"shadowSamplingMethod,omitempty"`
 	ShadowCancelOnClientDisconnect bool                  `json:"shadowCancelOnClientDisconnect,omitempty"` // cancel shadow when primary completes; default false
+	FunctionType                   FunctionType          `json:"functionType,omitempty"`
+}
+
+func (m ModelFunctionDetails) TargetsLLMGateway() bool {
+	return m.FunctionType == FunctionTypeLLM
+}
+
+func (m *ModelFunctionDetails) UnmarshalJSON(data []byte) error {
+	type modelFunctionDetailsAlias ModelFunctionDetails
+
+	var alias modelFunctionDetailsAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+
+	*m = ModelFunctionDetails(alias)
+	return nil
 }
 
 type PathFunctionDetails struct {
@@ -51,11 +104,13 @@ type PathFunctionDetails struct {
 	FunctionVersionID       string                 `json:"functionVersionID"`
 	UsePexec                bool                   `json:"usePexec"`
 	SessionTimeout          *SessionTimeoutSeconds `json:"sessionTimeout,omitempty"`
+	CustomHeaders           CustomHeaders          `json:"customHeaders,omitempty"`
 	EOL                     time.Time              `json:"eol,omitempty"`            // RFC3339 timestamp (full ISO 8601)
 	OfflineMessage          string                 `json:"offlineMessage,omitempty"` // non-empty = endpoint is offline
 	ShadowFunctionID        string                 `json:"shadowFunctionID,omitempty"`
 	ShadowFunctionVersionID string                 `json:"shadowFunctionVersionID,omitempty"`
 	ShadowPercentage        *int                   `json:"shadowPercentage,omitempty"` // unsupported on vanity routes; rejected during validation
+	ShadowSamplingMethod    ShadowSamplingMethod   `json:"shadowSamplingMethod,omitempty"`
 	sessionTimeoutPresent   bool
 }
 
@@ -81,6 +136,18 @@ type VanityEntry struct {
 	Host  string                         `json:"host"`
 	Paths map[string]PathFunctionDetails `json:"paths"`
 }
+
+// FunctionType selects which upstream serves a model. The empty value keeps the
+// historical behavior of invoking the function through the NVCF invocation API.
+type FunctionType string
+
+const (
+	FunctionTypeDefault FunctionType = ""
+	FunctionTypeLLM     FunctionType = "LLM"
+)
+
+// llmGatewaySections are the OpenAI-compatible sections the LLM Gateway serves.
+var llmGatewaySections = []string{"chatCompletions", "responses", "embeddings"}
 
 type V2Config struct {
 	OpenAI struct {
@@ -111,6 +178,18 @@ type GatewayConfig struct {
 	V2Config `json:"v2config"`
 }
 
+func (c *GatewayConfig) UnmarshalJSON(data []byte) error {
+	type gatewayConfigAlias GatewayConfig
+
+	var alias gatewayConfigAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+
+	*c = GatewayConfig(alias)
+	return nil
+}
+
 func uniqueShadowModelNames(legacyModelName string, modelNames []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(modelNames)+1)
 	result := make([]string, 0, len(modelNames)+1)
@@ -137,6 +216,10 @@ func validateOpenAIShadowConfig(location string, entry ModelFunctionDetails) ([]
 		return nil, fmt.Errorf("%s: %w", location, err)
 	}
 
+	if err := validateShadowSamplingMethod(location, entry.ShadowSamplingMethod); err != nil {
+		return nil, err
+	}
+
 	if entry.ShadowPercentage != nil {
 		pct := *entry.ShadowPercentage
 		if pct < 1 || pct > 100 {
@@ -148,12 +231,24 @@ func validateOpenAIShadowConfig(location string, entry ModelFunctionDetails) ([]
 		if entry.ShadowPercentage != nil {
 			return nil, fmt.Errorf("%s: shadowPercentage requires at least one shadow target", location)
 		}
+		if entry.ShadowSamplingMethod != "" {
+			return nil, fmt.Errorf("%s: shadowSamplingMethod requires at least one shadow target", location)
+		}
 		if entry.ShadowCancelOnClientDisconnect {
 			return nil, fmt.Errorf("%s: shadowCancelOnClientDisconnect requires at least one shadow target", location)
 		}
 	}
 
 	return shadowTargets, nil
+}
+
+func validateShadowSamplingMethod(location string, method ShadowSamplingMethod) error {
+	switch method {
+	case "", ShadowSamplingMethodRandom, ShadowSamplingMethodPerBearerKey:
+		return nil
+	default:
+		return fmt.Errorf("%s: shadowSamplingMethod must be %q or %q", location, ShadowSamplingMethodRandom, ShadowSamplingMethodPerBearerKey)
+	}
 }
 
 func (c *GatewayConfig) Validate() error {
@@ -185,8 +280,15 @@ func validateOpenAISection(sectionName string, entries map[string]ModelFunctionD
 	}
 
 	for modelKey, entry := range entries {
+		location := "openai." + sectionName + "." + modelKey
 		if entry.SessionTimeout < 0 {
-			return fmt.Errorf("openai.%s.%s: sessionTimeout must be greater than or equal to 0", sectionName, modelKey)
+			return fmt.Errorf("%s: sessionTimeout must be greater than or equal to 0", location)
+		}
+		if err := validateCustomHeaders(location, entry.CustomHeaders); err != nil {
+			return err
+		}
+		if err := validateFunctionType(location, sectionName, entry); err != nil {
+			return err
 		}
 	}
 
@@ -214,7 +316,7 @@ func isMultipartOpenAISection(sectionName string) bool {
 
 func validateMultipartOpenAISection(sectionName string, entries map[string]ModelFunctionDetails) error {
 	for modelKey, entry := range entries {
-		if entry.ShadowModelName != "" || len(entry.ShadowModelNames) > 0 || entry.ShadowPercentage != nil || entry.ShadowCancelOnClientDisconnect {
+		if entry.ShadowModelName != "" || len(entry.ShadowModelNames) > 0 || entry.ShadowPercentage != nil || entry.ShadowSamplingMethod != "" || entry.ShadowCancelOnClientDisconnect {
 			return fmt.Errorf("openai.%s.%s: shadow config is unsupported for multipart image endpoints", sectionName, modelKey)
 		}
 	}
@@ -247,14 +349,105 @@ func validateShadowTargetNames(location string, sectionName string, modelName st
 	return nil
 }
 
+var reservedCustomHeaderNames = map[string]struct{}{
+	"authorization":       {},
+	"connection":          {},
+	"content-length":      {},
+	"function-id":         {},
+	"function-version-id": {},
+	"host":                {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+	"via":                 {},
+	"x-forwarded-for":     {},
+	"x-forwarded-host":    {},
+	"x-forwarded-proto":   {},
+}
+
+// The LLM Gateway rejects any request carrying X-Priority, on header presence
+// rather than value, so a configured value would fail every request.
+var llmGatewayReservedCustomHeaderNames = map[string]struct{}{
+	"x-priority": {},
+}
+
+func validateCustomHeaders(location string, headers CustomHeaders) error {
+	seenNames := make(map[string]string, len(headers))
+	for name := range headers {
+		if err := validateCustomHeaderName(location, name); err != nil {
+			return err
+		}
+		lowerName := strings.ToLower(name)
+		if existingName, ok := seenNames[lowerName]; ok {
+			return fmt.Errorf("%s: customHeaders cannot contain duplicate header names %q and %q", location, existingName, name)
+		}
+		seenNames[lowerName] = name
+	}
+	return nil
+}
+
+func validateCustomHeaderName(location string, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s: customHeaders cannot contain empty header names", location)
+	}
+	if !isHTTPFieldName(name) {
+		return fmt.Errorf("%s: customHeaders header %q has invalid HTTP field name", location, name)
+	}
+	lowerName := strings.ToLower(name)
+	if _, ok := reservedCustomHeaderNames[lowerName]; ok {
+		return fmt.Errorf("%s: customHeaders cannot set reserved header %q", location, name)
+	}
+	if strings.HasPrefix(lowerName, "nvcf-") {
+		return fmt.Errorf("%s: customHeaders cannot set NVCF-managed header %q", location, name)
+	}
+	return nil
+}
+
+func isHTTPFieldName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		if !isHTTPFieldNameChar(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHTTPFieldNameChar(ch byte) bool {
+	switch {
+	case ch >= 'a' && ch <= 'z':
+		return true
+	case ch >= 'A' && ch <= 'Z':
+		return true
+	case ch >= '0' && ch <= '9':
+		return true
+	}
+	switch ch {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *GatewayConfig) validateVanityConfig() error {
 	for vanityName, vanity := range c.Vanity {
+		if vanity.Host != "" && vanity.Host == c.OpenAI.Host {
+			return fmt.Errorf("vanity.%s.host %q conflicts with openai.host", vanityName, vanity.Host)
+		}
 		for pathKey, path := range vanity.Paths {
+			location := "vanity." + vanityName + ".paths." + pathKey
 			if path.sessionTimeoutPresent || path.SessionTimeout != nil {
-				return fmt.Errorf("vanity.%s.paths.%s: sessionTimeout is unsupported for vanity routes", vanityName, pathKey)
+				return fmt.Errorf("%s: sessionTimeout is unsupported for vanity routes", location)
 			}
-			if path.ShadowFunctionID != "" || path.ShadowFunctionVersionID != "" || path.ShadowPercentage != nil {
-				return fmt.Errorf("vanity.%s.paths.%s: shadow config is unsupported for vanity routes", vanityName, pathKey)
+			if path.ShadowFunctionID != "" || path.ShadowFunctionVersionID != "" || path.ShadowPercentage != nil || path.ShadowSamplingMethod != "" {
+				return fmt.Errorf("%s: shadow config is unsupported for vanity routes", location)
+			}
+			if err := validateCustomHeaders(location, path.CustomHeaders); err != nil {
+				return err
 			}
 		}
 	}
@@ -262,15 +455,76 @@ func (c *GatewayConfig) validateVanityConfig() error {
 	return nil
 }
 
+// validateLLMGatewayModel checks a model routed to the LLM Gateway. The gateway
+// rewrites the request model to functionID/modelName and forwards it, so the
+// invocation-only fields are meaningless here.
+func validateLLMGatewayModel(location string, sectionName string, entry ModelFunctionDetails) error {
+	if !slices.Contains(llmGatewaySections, sectionName) {
+		return fmt.Errorf("%s: functionType %q is only supported in %s", location, FunctionTypeLLM, strings.Join(llmGatewaySections, ", "))
+	}
+	if entry.FunctionID == "" {
+		return fmt.Errorf("%s: functionID is required for functionType %q", location, FunctionTypeLLM)
+	}
+	if entry.UsePexec {
+		return fmt.Errorf("%s: usePexec is unsupported for functionType %q", location, FunctionTypeLLM)
+	}
+	if entry.OutgoingPathOverride != "" {
+		return fmt.Errorf("%s: outgoingPathOverride is unsupported for functionType %q", location, FunctionTypeLLM)
+	}
+	if entry.SessionTimeout != 0 {
+		return fmt.Errorf("%s: sessionTimeout is unsupported for functionType %q", location, FunctionTypeLLM)
+	}
+	for name := range entry.CustomHeaders {
+		if _, ok := llmGatewayReservedCustomHeaderNames[strings.ToLower(name)]; ok {
+			return fmt.Errorf("%s: customHeaders cannot set %q for functionType %q; the LLM Gateway rejects requests carrying it", location, name, FunctionTypeLLM)
+		}
+	}
+	return nil
+}
+
+func validateFunctionType(location string, sectionName string, entry ModelFunctionDetails) error {
+	switch entry.FunctionType {
+	case FunctionTypeDefault:
+		return nil
+	case FunctionTypeLLM:
+		return validateLLMGatewayModel(location, sectionName, entry)
+	default:
+		return fmt.Errorf("%s: functionType must be %q when set", location, FunctionTypeLLM)
+	}
+}
+
+// HasLLMGatewayRoute reports whether any model is routed to the LLM Gateway.
+func (c *GatewayConfig) HasLLMGatewayRoute() bool {
+	for _, entries := range c.openAISections() {
+		for _, entry := range entries {
+			if entry.TargetsLLMGateway() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func SetupConfigWithConfigPath(path string) (rc.ReloadableConfig[GatewayConfig], error) {
-	config, err := rc.SetupConfig[GatewayConfig](path,
+	return SetupConfigWithConfigPathAndTimeout(path, 0)
+}
+
+func SetupConfigWithConfigPathAndTimeout(path string, loadTimeout time.Duration) (rc.ReloadableConfig[GatewayConfig], error) {
+	opts := []rc.ConfigOption[GatewayConfig]{
 		rc.WithValidateFunc(func(c *GatewayConfig) error {
 			return c.Validate()
 		}),
 		rc.WithPostLoadFunc(func(c *GatewayConfig) error {
 			notifySharedReload()
 			return nil
-		}))
+		}),
+	}
+	if loadTimeout > 0 {
+		opts = append(opts, rc.WithInitialLoadTimeout[GatewayConfig](loadTimeout))
+	}
+
+	config, err := rc.SetupConfig[GatewayConfig](path,
+		opts...)
 	return config, err
 }
 

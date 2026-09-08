@@ -18,14 +18,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::{
-    TokenMapAuthenticator, bind_ephemeral_udp, init_crypto, make_stargate_runtime,
-    make_stargate_runtime_with_auth, make_stargate_runtime_with_reverse_and_auth,
-    start_dummy_backend, start_dummy_inst, wait_for_routing, wait_for_routing_with_rk,
-    with_proxy_headers, with_proxy_headers_rk,
+    TokenMapAuthenticator, bind_ephemeral_udp,
+    direct_registration_config as base_direct_registration_config, init_crypto,
+    make_stargate_runtime, make_stargate_runtime_with_auth,
+    make_stargate_runtime_with_reverse_and_auth,
+    reverse_registration_config as base_reverse_registration_config, start_dummy_backend,
+    start_dummy_inst, wait_for_routing, wait_for_routing_with_rk, with_proxy_headers,
+    with_proxy_headers_rk,
 };
 use pylon_lib::{
-    AuthTokenProvider, BringupConfig, InferenceServerRegistrationClient,
-    InferenceServerRegistrationConfig, OutputTokenParserFactory,
+    AuthTokenProvider, InferenceServerRegistrationClient, InferenceServerRegistrationConfig,
 };
 use stargate_proto::pb::InferenceServerStatus;
 
@@ -34,30 +36,43 @@ fn reverse_registration_config(
     inference_server_id: &str,
     backend_addr: SocketAddr,
     auth_token: &str,
+    model_id: &str,
 ) -> InferenceServerRegistrationConfig {
     InferenceServerRegistrationConfig {
-        seeds: vec![grpc_addr.to_string()],
-        inference_server_id: inference_server_id.to_string(),
-        cluster_id: String::new(),
-        inference_server_url: format!("http://{backend_addr}"),
-        upstream_http_base_url: Some(format!("http://{backend_addr}")),
-        min_update_interval: Duration::from_millis(100),
-        status: InferenceServerStatus::Active,
-        reverse_tunnel: true,
-        bringup: BringupConfig {
-            enabled: false,
-            ..BringupConfig::default()
-        },
-        output_token_parser_factory: OutputTokenParserFactory::vllm(),
-        request_observation_tx: None,
-        request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-        metrics: None,
-        retry: pylon_lib::PylonRetryConfig::default(),
-        queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-        queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
         auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(auth_token.to_string()))),
-        quic_insecure: true,
-        tunnel_protocol: Default::default(),
+        ..base_reverse_registration_config(
+            vec![grpc_addr.to_string()],
+            inference_server_id,
+            format!("http://{backend_addr}"),
+            pylon_lib::PylonRuntimeState::new(
+                InferenceServerStatus::Active,
+                &[model_id.to_string()],
+            ),
+        )
+    }
+}
+
+fn direct_registration_config(
+    grpc_addr: SocketAddr,
+    inference_server_id: &str,
+    inference_server_url: String,
+    upstream_addr: SocketAddr,
+    model_id: &str,
+    auth_token: Option<&str>,
+) -> InferenceServerRegistrationConfig {
+    InferenceServerRegistrationConfig {
+        auth_token_provider: auth_token
+            .map(|token| Arc::new(AuthTokenProvider::Static(token.to_string()))),
+        ..base_direct_registration_config(
+            vec![grpc_addr.to_string()],
+            inference_server_id,
+            inference_server_url,
+            format!("http://{upstream_addr}"),
+            pylon_lib::PylonRuntimeState::new(
+                InferenceServerStatus::Active,
+                &[model_id.to_string()],
+            ),
+        )
     }
 }
 
@@ -77,6 +92,54 @@ async fn assert_no_eligible_candidates(resp: reqwest::Response, context: &str) {
     let _ = resp.bytes().await;
 }
 
+struct RoutingClient {
+    client: reqwest::Client,
+    url: String,
+    model: &'static str,
+}
+
+impl RoutingClient {
+    fn new(http_addr: SocketAddr, model: &'static str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            url: format!("http://{http_addr}/v1/chat/completions"),
+            model,
+        }
+    }
+
+    async fn send(&self, routing_key: Option<&str>, request_id: &str) -> reqwest::Response {
+        let request = self.client.post(&self.url);
+        let request = match routing_key {
+            Some(routing_key) => {
+                with_proxy_headers_rk(request, routing_key, self.model, request_id)
+            }
+            None => with_proxy_headers(request, self.model, request_id),
+        };
+        request
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": self.model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .send()
+            .await
+            .expect("request failed")
+    }
+}
+
+async fn assert_routes_to(resp: reqwest::Response, expected_backend: &str, context: &str) {
+    assert_eq!(resp.status(), 200, "{context}");
+    assert_eq!(
+        resp.headers()
+            .get("x-inference-server-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_backend),
+        "{context}"
+    );
+    let _ = resp.bytes().await;
+}
+
 /// With OpenAuthenticator (default), requests without `x-routing-key` route
 /// successfully through the None routing key path.
 #[tokio::test]
@@ -89,61 +152,26 @@ async fn no_routing_key_header_routes_via_open_authenticator() {
     let (inst_addr, quic_url, _tunnel) = start_dummy_inst("no-rk-model").await;
 
     let mut reg = InferenceServerRegistrationClient::default();
-    let _channels = reg
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "no-rk-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url,
-                upstream_http_base_url: Some(format!("http://{inst_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["no-rk-model".to_string()],
-        )
-        .expect("registration failed");
+    reg.start(direct_registration_config(
+        grpc_addr,
+        "no-rk-inst",
+        quic_url,
+        inst_addr,
+        "no-rk-model",
+        None,
+    ))
+    .expect("registration failed");
 
     wait_for_routing(http_addr, "no-rk-model", Duration::from_secs(5)).await;
 
-    let http_client = reqwest::Client::new();
-    let url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "no-rk-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-
-    let resp = with_proxy_headers(http_client.post(&url), "no-rk-model", "req-no-rk")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .expect("request failed");
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("x-inference-server-id")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "no-rk-inst"
-    );
+    assert_routes_to(
+        RoutingClient::new(http_addr, "no-rk-model")
+            .send(None, "req-no-rk")
+            .await,
+        "no-rk-inst",
+        "request without a routing key should use the open-authenticator backend",
+    )
+    .await;
 
     reg.stop();
     handle.begin_shutdown();
@@ -173,19 +201,25 @@ async fn reverse_tunnel_routing_keys_isolate_same_model_backends() {
     let backend_addr_b = start_dummy_backend("rt-rk-iso-model").await;
 
     let mut reg_a = InferenceServerRegistrationClient::default();
-    let _channels_a = reg_a
-        .start(
-            reverse_registration_config(grpc_addr, "rt-rk-iso-a", backend_addr_a, "token-rt-a"),
-            vec!["rt-rk-iso-model".to_string()],
-        )
+    reg_a
+        .start(reverse_registration_config(
+            grpc_addr,
+            "rt-rk-iso-a",
+            backend_addr_a,
+            "token-rt-a",
+            "rt-rk-iso-model",
+        ))
         .expect("registration a failed");
 
     let mut reg_b = InferenceServerRegistrationClient::default();
-    let _channels_b = reg_b
-        .start(
-            reverse_registration_config(grpc_addr, "rt-rk-iso-b", backend_addr_b, "token-rt-b"),
-            vec!["rt-rk-iso-model".to_string()],
-        )
+    reg_b
+        .start(reverse_registration_config(
+            grpc_addr,
+            "rt-rk-iso-b",
+            backend_addr_b,
+            "token-rt-b",
+            "rt-rk-iso-model",
+        ))
         .expect("registration b failed");
 
     wait_for_routing_with_rk(
@@ -203,41 +237,23 @@ async fn reverse_tunnel_routing_keys_isolate_same_model_backends() {
     )
     .await;
 
-    let http_client = reqwest::Client::new();
-    let url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rt-rk-iso-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
+    let client = RoutingClient::new(http_addr, "rt-rk-iso-model");
 
     for (routing_key, expected_inst, request_prefix) in [
         ("rk-rt-a", "rt-rk-iso-a", "req-rt-rk-a"),
         ("rk-rt-b", "rt-rk-iso-b", "req-rt-rk-b"),
     ] {
         for i in 0..4 {
-            let resp = with_proxy_headers_rk(
-                http_client.post(&url),
-                routing_key,
-                "rt-rk-iso-model",
-                &format!("{request_prefix}-{i}"),
-            )
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .expect("request failed");
-            assert_eq!(resp.status(), 200);
-            assert_eq!(
-                resp.headers()
-                    .get("x-inference-server-id")
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
+            assert_routes_to(
+                client
+                    .send(Some(routing_key), &format!("{request_prefix}-{i}"))
+                    .await,
                 expected_inst,
-                "{routing_key} should only route to its authenticated reverse-tunnel backend"
-            );
-            let _ = resp.bytes().await;
+                &format!(
+                    "{routing_key} should only route to its authenticated reverse-tunnel backend"
+                ),
+            )
+            .await;
         }
     }
 
@@ -266,12 +282,14 @@ async fn reverse_tunnel_wrong_or_omitted_routing_key_returns_404_no_eligible_can
     let backend_addr = start_dummy_backend("rt-rk-miss-model").await;
 
     let mut reg = InferenceServerRegistrationClient::default();
-    let _channels = reg
-        .start(
-            reverse_registration_config(grpc_addr, "rt-rk-miss-inst", backend_addr, "token-rt-x"),
-            vec!["rt-rk-miss-model".to_string()],
-        )
-        .expect("registration failed");
+    reg.start(reverse_registration_config(
+        grpc_addr,
+        "rt-rk-miss-inst",
+        backend_addr,
+        "token-rt-x",
+        "rt-rk-miss-model",
+    ))
+    .expect("registration failed");
 
     wait_for_routing_with_rk(
         http_addr,
@@ -281,38 +299,17 @@ async fn reverse_tunnel_wrong_or_omitted_routing_key_returns_404_no_eligible_can
     )
     .await;
 
-    let http_client = reqwest::Client::new();
-    let url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rt-rk-miss-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-
-    let wrong_key_resp = with_proxy_headers_rk(
-        http_client.post(&url),
-        "rk-rt-wrong",
-        "rt-rk-miss-model",
-        "req-rt-rk-wrong",
+    let client = RoutingClient::new(http_addr, "rt-rk-miss-model");
+    assert_no_eligible_candidates(
+        client.send(Some("rk-rt-wrong"), "req-rt-rk-wrong").await,
+        "wrong routing key",
     )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("wrong routing-key request failed");
-    assert_no_eligible_candidates(wrong_key_resp, "wrong routing key").await;
-
-    let omitted_key_resp = with_proxy_headers(
-        http_client.post(&url),
-        "rt-rk-miss-model",
-        "req-rt-rk-omitted",
+    .await;
+    assert_no_eligible_candidates(
+        client.send(None, "req-rt-rk-omitted").await,
+        "omitted routing key",
     )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("omitted routing-key request failed");
-    assert_no_eligible_candidates(omitted_key_resp, "omitted routing key").await;
+    .await;
 
     reg.stop();
     handle.begin_shutdown();
@@ -332,37 +329,15 @@ async fn routing_key_header_routes_to_correct_backend() {
     let (inst_addr, quic_url, _tunnel) = start_dummy_inst("rk-model").await;
 
     let mut reg = InferenceServerRegistrationClient::default();
-    let _channels = reg
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rk-match-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url,
-                upstream_http_base_url: Some(format!("http://{inst_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(
-                    "token-alpha".to_string(),
-                ))),
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rk-model".to_string()],
-        )
-        .expect("registration failed");
+    reg.start(direct_registration_config(
+        grpc_addr,
+        "rk-match-inst",
+        quic_url,
+        inst_addr,
+        "rk-model",
+        Some("token-alpha"),
+    ))
+    .expect("registration failed");
 
     wait_for_routing_with_rk(
         http_addr,
@@ -372,34 +347,14 @@ async fn routing_key_header_routes_to_correct_backend() {
     )
     .await;
 
-    let http_client = reqwest::Client::new();
-    let url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rk-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-
-    let resp = with_proxy_headers_rk(
-        http_client.post(&url),
-        "rk-alpha",
-        "rk-model",
-        "req-rk-match",
+    assert_routes_to(
+        RoutingClient::new(http_addr, "rk-model")
+            .send(Some("rk-alpha"), "req-rk-match")
+            .await,
+        "rk-match-inst",
+        "matching routing key should reach its backend",
     )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("request failed");
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("x-inference-server-id")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "rk-match-inst"
-    );
+    .await;
 
     reg.stop();
     handle.begin_shutdown();
@@ -418,37 +373,15 @@ async fn wrong_routing_key_returns_404_no_eligible_candidates() {
     let (inst_addr, quic_url, _tunnel) = start_dummy_inst("rk404-model").await;
 
     let mut reg = InferenceServerRegistrationClient::default();
-    let _channels = reg
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rk404-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url,
-                upstream_http_base_url: Some(format!("http://{inst_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(
-                    "token-a".to_string(),
-                ))),
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rk404-model".to_string()],
-        )
-        .expect("registration failed");
+    reg.start(direct_registration_config(
+        grpc_addr,
+        "rk404-inst",
+        quic_url,
+        inst_addr,
+        "rk404-model",
+        Some("token-a"),
+    ))
+    .expect("registration failed");
 
     wait_for_routing_with_rk(
         http_addr,
@@ -458,37 +391,13 @@ async fn wrong_routing_key_returns_404_no_eligible_candidates() {
     )
     .await;
 
-    let http_client = reqwest::Client::new();
-    let url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rk404-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-
-    let resp = with_proxy_headers_rk(
-        http_client.post(&url),
-        "rk-wrong",
-        "rk404-model",
-        "req-wrong-rk",
+    assert_no_eligible_candidates(
+        RoutingClient::new(http_addr, "rk404-model")
+            .send(Some("rk-wrong"), "req-wrong-rk")
+            .await,
+        "wrong routing key",
     )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("request failed");
-    assert_eq!(
-        resp.status(),
-        404,
-        "request with wrong routing key should get 404 (no matching candidates)"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("x-stargate-error-code")
-            .and_then(|value| value.to_str().ok()),
-        Some("no_eligible_candidates"),
-        "no-candidates proxy errors should be distinguishable from upstream errors"
-    );
+    .await;
 
     reg.stop();
     handle.begin_shutdown();
@@ -512,130 +421,47 @@ async fn different_routing_keys_isolate_backends() {
     let (inst_addr_b, quic_url_b, _tunnel_b) = start_dummy_inst("iso-model").await;
 
     let mut reg_a = InferenceServerRegistrationClient::default();
-    let _ch_a = reg_a
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "iso-inst-a".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url_a,
-                upstream_http_base_url: Some(format!("http://{inst_addr_a}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(
-                    "token-a".to_string(),
-                ))),
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["iso-model".to_string()],
-        )
+    reg_a
+        .start(direct_registration_config(
+            grpc_addr,
+            "iso-inst-a",
+            quic_url_a,
+            inst_addr_a,
+            "iso-model",
+            Some("token-a"),
+        ))
         .expect("registration failed");
 
     let mut reg_b = InferenceServerRegistrationClient::default();
-    let _ch_b = reg_b
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "iso-inst-b".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url_b,
-                upstream_http_base_url: Some(format!("http://{inst_addr_b}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(
-                    "token-b".to_string(),
-                ))),
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["iso-model".to_string()],
-        )
+    reg_b
+        .start(direct_registration_config(
+            grpc_addr,
+            "iso-inst-b",
+            quic_url_b,
+            inst_addr_b,
+            "iso-model",
+            Some("token-b"),
+        ))
         .expect("registration failed");
 
     wait_for_routing_with_rk(http_addr, Some("rk-a"), "iso-model", Duration::from_secs(5)).await;
     wait_for_routing_with_rk(http_addr, Some("rk-b"), "iso-model", Duration::from_secs(5)).await;
 
-    let http_client = reqwest::Client::new();
-    let url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "iso-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-
-    for i in 0..5 {
-        let resp = with_proxy_headers_rk(
-            http_client.post(&url),
-            "rk-a",
-            "iso-model",
-            &format!("req-iso-a-{i}"),
-        )
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .expect("request failed");
-        assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.headers()
-                .get("x-inference-server-id")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "iso-inst-a",
-            "rk-a should always route to iso-inst-a"
-        );
-        let _ = resp.bytes().await;
-    }
-
-    for i in 0..5 {
-        let resp = with_proxy_headers_rk(
-            http_client.post(&url),
-            "rk-b",
-            "iso-model",
-            &format!("req-iso-b-{i}"),
-        )
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .expect("request failed");
-        assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.headers()
-                .get("x-inference-server-id")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "iso-inst-b",
-            "rk-b should always route to iso-inst-b"
-        );
-        let _ = resp.bytes().await;
+    let client = RoutingClient::new(http_addr, "iso-model");
+    for (routing_key, expected_backend, request_prefix) in [
+        ("rk-a", "iso-inst-a", "req-iso-a"),
+        ("rk-b", "iso-inst-b", "req-iso-b"),
+    ] {
+        for i in 0..5 {
+            assert_routes_to(
+                client
+                    .send(Some(routing_key), &format!("{request_prefix}-{i}"))
+                    .await,
+                expected_backend,
+                &format!("{routing_key} should always route to {expected_backend}"),
+            )
+            .await;
+        }
     }
 
     reg_a.stop();
@@ -657,37 +483,15 @@ async fn omitted_routing_key_does_not_match_keyed_backend() {
     let (inst_addr, quic_url, _tunnel) = start_dummy_inst("omit-model").await;
 
     let mut reg = InferenceServerRegistrationClient::default();
-    let _channels = reg
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "omit-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url,
-                upstream_http_base_url: Some(format!("http://{inst_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(
-                    "token-x".to_string(),
-                ))),
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["omit-model".to_string()],
-        )
-        .expect("registration failed");
+    reg.start(direct_registration_config(
+        grpc_addr,
+        "omit-inst",
+        quic_url,
+        inst_addr,
+        "omit-model",
+        Some("token-x"),
+    ))
+    .expect("registration failed");
 
     wait_for_routing_with_rk(
         http_addr,
@@ -697,32 +501,13 @@ async fn omitted_routing_key_does_not_match_keyed_backend() {
     )
     .await;
 
-    let http_client = reqwest::Client::new();
-    let url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "omit-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-
-    let resp = with_proxy_headers(http_client.post(&url), "omit-model", "req-omit-rk")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .expect("request failed");
-    assert_eq!(
-        resp.status(),
-        404,
-        "request without x-routing-key should not match backend registered with rk-x"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("x-stargate-error-code")
-            .and_then(|value| value.to_str().ok()),
-        Some("no_eligible_candidates"),
-        "no-candidates proxy errors should be distinguishable from upstream errors"
-    );
+    assert_no_eligible_candidates(
+        RoutingClient::new(http_addr, "omit-model")
+            .send(None, "req-omit-rk")
+            .await,
+        "request without a routing key",
+    )
+    .await;
 
     reg.stop();
     handle.begin_shutdown();

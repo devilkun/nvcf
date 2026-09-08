@@ -28,6 +28,7 @@ type (
 
 // NetTCP returns the IPv4 kernel/networking statistics for TCP datagrams
 // read from /proc/net/tcp.
+//
 // Deprecated: Use github.com/mdlayher/netlink#Conn (with syscall.AF_INET) instead.
 func (fs FS) NetTCP() (NetTCP, error) {
 	return newNetTCP(fs.proc.Path("net/tcp"))
@@ -35,6 +36,7 @@ func (fs FS) NetTCP() (NetTCP, error) {
 
 // NetTCP6 returns the IPv6 kernel/networking statistics for TCP datagrams
 // read from /proc/net/tcp6.
+//
 // Deprecated: Use github.com/mdlayher/netlink#Conn (with syscall.AF_INET6) instead.
 func (fs FS) NetTCP6() (NetTCP, error) {
 	return newNetTCP(fs.proc.Path("net/tcp6"))
@@ -42,6 +44,7 @@ func (fs FS) NetTCP6() (NetTCP, error) {
 
 // NetTCPSummary returns already computed statistics like the total queue lengths
 // for TCP datagrams read from /proc/net/tcp.
+//
 // Deprecated: Use github.com/mdlayher/netlink#Conn (with syscall.AF_INET) instead.
 func (fs FS) NetTCPSummary() (*NetTCPSummary, error) {
 	return newNetTCPSummary(fs.proc.Path("net/tcp"))
@@ -49,6 +52,7 @@ func (fs FS) NetTCPSummary() (*NetTCPSummary, error) {
 
 // NetTCP6Summary returns already computed statistics like the total queue lengths
 // for TCP datagrams read from /proc/net/tcp6.
+//
 // Deprecated: Use github.com/mdlayher/netlink#Conn (with syscall.AF_INET6) instead.
 func (fs FS) NetTCP6Summary() (*NetTCPSummary, error) {
 	return newNetTCPSummary(fs.proc.Path("net/tcp6"))

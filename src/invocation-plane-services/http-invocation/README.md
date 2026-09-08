@@ -46,8 +46,7 @@ for a public base such as `gcr.io/distroless/cc-debian12` (then
 `bazel mod tidy` to refresh the lockfile). `bazel build //...` and
 `bazel test //...` work without modification.
 
-Local Bazel cache setup is documented in the umbrella's
-`nvidia-internal/bazel-cheatsheet.md`.
+Local Bazel cache setup is documented in the `nvcf/nvcf-internal` docs.
 
 ## Cargo development (still supported)
 
@@ -267,7 +266,7 @@ Install the Coverage Gutters extension.  From Vscode:
 1. Ctl-Shift-p
 1. Type then select, `Coverage gutters: watch`
 
-From the code editor, see that coveraged lines have green sidebars, otherwise red.
+From the code editor, see that covered lines have green sidebars, otherwise red.
 To see entire lines highlighted in green and red:
 1. Right click the extension and select settings
 1. In the settings pane, select `Show line coverage`

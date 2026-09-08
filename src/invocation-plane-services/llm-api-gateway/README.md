@@ -52,6 +52,9 @@ Each request is normalized into a function-scoped request context.
   and is forwarded to NVCF gRPC auth when that adapter is configured.
 - `X-Request-ID` is accepted if present, otherwise the gateway generates one.
 - `X-NVCF-Target-Region` is forwarded into the request context.
+- `X-Priority` is reserved for the gateway and derived from the caller's
+  resolved priority; a client-supplied `X-Priority` on the LLM endpoints is
+  rejected with 400.
 
 Configured functions control the downstream `model`, service tier, routing
 method, and per-function rate limits. Prompt rendering and exact prompt
@@ -62,9 +65,12 @@ the selected function/model and estimated prompt size, including
 `x-routing-key`, `x-model`, `x-input-tokens`, and `x-token-estimate`.
 
 For OpenAI-compatible multi-turn stickiness, chat completions and responses
-return `x-multi-turn-session-id`. Clients should persist that value and send it
-on later requests for the same conversation. The gateway forwards only a hashed
-internal `x-cache-affinity-key` to Stargate.
+accept `prompt_cache_key` and return the selected session value in
+`x-multi-turn-session-id`. Clients can send the same `prompt_cache_key` or
+persist the response header and send it on later requests for the same
+conversation. The gateway preserves the raw body field for the model backend.
+It forwards only a SHA-256-derived value in the internal
+`x-cache-affinity-key` header to Stargate.
 
 When `NVCF_GRPC_ADDR` is configured, the gateway authenticates each request
 through the NVCF LLM gRPC auth service, derives the per-caller rate-limit key
@@ -155,6 +161,36 @@ Useful overrides:
 - `OTEL_TRACES_EXPORTER=otlp|stdout|none` to enable trace export
 - `OTEL_METRICS_EXPORTER=otlp|none` to enable metric export
 
+## Metrics
+
+Request-facing metrics include a `function_id` label. The value comes from the
+request routing key. Requests without a function, such as health checks, use
+`function_id="none"`.
+
+The label is present on HTTP request, upstream request, token usage, provider
+time, first-token time, and stream duration metrics. Infrastructure metrics for
+authentication, pub/sub, rate-limit synchronization, and Olric remain
+function-independent.
+
+Example request-rate query:
+
+```promql
+sum by (function_id) (
+  rate(llm_api_gateway_http_requests_total[5m])
+)
+```
+
+Example p95 request-latency query:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, function_id) (
+    rate(llm_api_gateway_http_request_duration_seconds_bucket[5m])
+  )
+)
+```
+
 ## Tooling and Tasks
 
 Common tasks:
@@ -185,7 +221,7 @@ docker run --rm -p 8080:8080 \
   llm-api-gateway:dev
 ```
 
-The same image also contains `./llm-api-gateway-rate-limit-sync-worker`.
+The same image also contains `/usr/bin/llm-api-gateway-rate-limit-sync-worker`.
 
 ## Kubernetes
 

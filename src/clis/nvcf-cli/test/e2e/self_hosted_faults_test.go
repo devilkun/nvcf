@@ -103,7 +103,8 @@ func TestT14_OCICacheCorruption(t *testing.T) {
 	t.Skip("T14: full run requires a prior successful up + populated OCI cache (M+8.K close-out)")
 	// TODO(M+8.K close-out): run on mcamp-dev-vm:
 	//   1. Run `up` once to populate the OCI cache.
-	//   2. Determine the digest from STACK_PATH (oci:// ref or local bundle).
+	//   2. Determine the digest from CONTROL_PLANE_STACK_PATH /
+	//      COMPUTE_PLANE_STACK_PATH (oci:// refs or local bundles).
 	//   3. homeDir, _ := os.UserHomeDir()
 	//      faults.TruncateOCICache(homeDir, digest)
 	//   4. Run `up` again; assert phase_failed{errCategory:"cache_corruption", retryClass:"immediate"}.

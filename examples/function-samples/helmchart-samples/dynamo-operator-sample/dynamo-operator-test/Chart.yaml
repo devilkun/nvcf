@@ -14,8 +14,8 @@
 # limitations under the License.
 
 apiVersion: v2
-name: dynamo-operator-test
+appVersion: 0.1.0
 description: A Helm chart for Kubernetes
+name: nvcf-dynamo-test
 type: application
 version: 0.1.0
-appVersion: "0.1.0"

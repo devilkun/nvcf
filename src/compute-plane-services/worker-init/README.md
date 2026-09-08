@@ -1,8 +1,28 @@
-# init
+# worker-init
 
-```shell
-docker buildx build --platform "linux/amd64,linux/arm64" --push \
-  -t stg.nvcr.io/nv-cf/nvcf-core/nvcf_worker_init:2.2.2 \
-  -t nvcr.io/qtfpt1h0bieu/nvcf-core/nvcf_worker_init:2.2.2 \
-  -f Dockerfile.nvcf-worker-init .
+Init component that prepares the NVCF worker environment before the task
+container starts. It downloads the model and resource artifacts from NGC,
+bootstraps the ESS (secret) agent configuration, and emits initialization
+metrics.
+
+## Build
+
+The binary and container image are built with Bazel:
+
+```bash
+# Build the worker-init binary
+bazel build //src/compute-plane-services/worker-init/cmd:worker-init
+
+# Build the container image
+bazel build //src/compute-plane-services/worker-init/cmd:image
+```
+
+## Test
+
+```bash
+# Run unit tests via Bazel
+bazel test //src/compute-plane-services/worker-init/...
+
+# Or with the Go toolchain, from this directory
+go test ./...
 ```

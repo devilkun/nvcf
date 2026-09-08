@@ -13,10 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+
 use crate::config::{BenchmarkConfig, PylonQueueAdmissionConfig, ScenarioMetadata};
 use crate::manifest::Manifest;
-use crate::score::{BackendSummary, QueueAdmissionSummary, RunSummary};
-use std::collections::BTreeSet;
+use crate::score::{QueueAdmissionSummary, RunSummary};
 
 #[derive(Debug, Clone)]
 pub struct ReportContext {
@@ -55,17 +60,12 @@ impl ReportContext {
             max_concurrency: manifest.max_concurrency,
             stargate_count: manifest.stargate_count,
             backend_count: manifest.backend_count,
-            cluster_count: manifest_cluster_count(manifest),
+            cluster_count: match manifest.cluster_count {
+                0 => manifest.backend_count,
+                count => count,
+            },
             pylons_per_cluster: manifest.pylons_per_cluster,
         }
-    }
-}
-
-fn manifest_cluster_count(manifest: &Manifest) -> usize {
-    if manifest.cluster_count == 0 {
-        manifest.backend_count
-    } else {
-        manifest.cluster_count
     }
 }
 
@@ -76,10 +76,77 @@ pub struct ReportEntry {
     pub summary: RunSummary,
 }
 
+#[derive(Debug, Clone)]
+pub struct BenchmarkReportArtifacts {
+    pub comparison_path: PathBuf,
+    pub report_path: PathBuf,
+}
+
+pub fn write_benchmark_report_artifacts(
+    output_dir: &Path,
+    context: &ReportContext,
+    entries: &[ReportEntry],
+) -> anyhow::Result<BenchmarkReportArtifacts> {
+    let artifacts = BenchmarkReportArtifacts {
+        comparison_path: output_dir.join("comparison.json"),
+        report_path: output_dir.join("report.md"),
+    };
+    let comparison = entries.iter().map(comparison_entry).collect::<Vec<_>>();
+    let comparison_bytes = serde_json::to_vec_pretty(&comparison)
+        .context("failed to serialize benchmark comparison")?;
+    std::fs::write(&artifacts.comparison_path, comparison_bytes)
+        .with_context(|| format!("failed to write {}", artifacts.comparison_path.display()))?;
+    write_markdown_report_artifact(&artifacts.report_path, context, entries)?;
+    Ok(artifacts)
+}
+
+pub fn write_markdown_report_artifact(
+    report_path: &Path,
+    context: &ReportContext,
+    entries: &[ReportEntry],
+) -> anyhow::Result<()> {
+    std::fs::write(report_path, render_markdown_report(context, entries))
+        .with_context(|| format!("failed to write {}", report_path.display()))
+}
+
+pub(crate) fn comparison_entry(entry: &ReportEntry) -> serde_json::Value {
+    let summary = &entry.summary;
+    serde_json::json!({
+        "algorithm_name": entry.algorithm_name,
+        "pylon_queue_admission": entry.pylon_queue_admission,
+        "success_rate": summary.success_rate,
+        "avg_ttft_ms": summary.avg_ttft_ms,
+        "p95_ttft_ms": summary.p95_ttft_ms,
+        "avg_ttlt_ms": summary.avg_ttlt_ms,
+        "max_ttlt_ms": summary.max_ttlt_ms,
+        "total_length_ms": summary.total_length_ms,
+        "successful_requests_per_second": summary.successful_requests_per_second,
+        "successful_output_tokens_per_second": summary.successful_output_tokens_per_second,
+        "balance_score": summary.balance_score,
+        "capacity_balance_score": summary.capacity_balance_score,
+        "cluster_balance_score": summary.cluster_balance_score,
+        "cluster_capacity_balance_score": summary.cluster_capacity_balance_score,
+        "cache_observed_request_count": summary.cache_summary.observed_request_count,
+        "cache_hit_count": summary.cache_summary.hit_count,
+        "cache_miss_count": summary.cache_summary.miss_count,
+        "cache_hit_rate": summary.cache_summary.hit_rate,
+        "cache_eviction_count": summary.cache_summary.eviction_count,
+        "cache_evicted_tokens": summary.cache_summary.evicted_tokens,
+        "cache_reused_input_tokens": summary.cache_summary.reused_input_tokens,
+        "cache_uncached_input_tokens": summary.cache_summary.uncached_input_tokens,
+        "cache_input_reuse_rate": summary.cache_summary.input_reuse_rate,
+        "cache_key_movement_rate": summary.stickiness_summary.movement_rate,
+        "moved_cache_key_count": summary.stickiness_summary.moved_cache_key_count,
+        "failure_group_count": summary.failure_summary.len(),
+        "queue_admission": summary.queue_admission_summary,
+        "routing_selection": summary.routing_selection_summary,
+    })
+}
+
 pub fn render_markdown_report(context: &ReportContext, entries: &[ReportEntry]) -> String {
     let mut out = String::new();
     render_report_header(&mut out, context);
-    render_warning_section(&mut out, &report_warnings(context, entries));
+    render_warnings(&mut out, context, entries);
     render_overview_table(&mut out, entries);
     render_share_table(&mut out, ShareGroupKind::Cluster, entries);
     render_share_table(&mut out, ShareGroupKind::Backend, entries);
@@ -88,53 +155,33 @@ pub fn render_markdown_report(context: &ReportContext, entries: &[ReportEntry]) 
 }
 
 fn render_report_header(out: &mut String, context: &ReportContext) {
-    out.push_str(&format!("# Benchmark Report: {}\n\n", context.name));
+    write!(out, "# Benchmark Report: {}\n\n", context.name).unwrap();
     if let Some(description) = &context.metadata.description {
-        out.push_str(description);
-        out.push_str("\n\n");
+        write!(out, "{description}\n\n").unwrap();
     }
-    out.push_str(&format!("- Model: `{}`\n", context.model));
-    out.push_str(&format!("- Requests: `{}`\n", context.request_count));
-    out.push_str(&format!(
-        "- Max concurrency: `{}`\n",
-        context.max_concurrency
-    ));
-    out.push_str(&format!("- Stargates: `{}`\n", context.stargate_count));
-    out.push_str(&format!("- Pylons/backends: `{}`\n", context.backend_count));
-    out.push_str(&format!(
-        "- Routing clusters: `{}`\n",
-        context.cluster_count
-    ));
-    out.push_str(&format!(
-        "- Pylons per generated cluster: `{}`\n\n",
+    write!(
+        out,
+        "- Model: `{}`\n- Requests: `{}`\n- Max concurrency: `{}`\n- Stargates: `{}`\n- Pylons/backends: `{}`\n- Routing clusters: `{}`\n- Pylons per generated cluster: `{}`\n\n",
+        context.model,
+        context.request_count,
+        context.max_concurrency,
+        context.stargate_count,
+        context.backend_count,
+        context.cluster_count,
         context.pylons_per_cluster
-    ));
+    )
+    .unwrap();
+    let metadata_start = out.len();
     if !context.metadata.tags.is_empty() {
-        out.push_str(&format!(
-            "- Tags: `{}`\n",
-            context.metadata.tags.join("`, `")
-        ));
+        writeln!(out, "- Tags: `{}`", context.metadata.tags.join("`, `")).unwrap();
     }
     if let Some(expected_runtime) = &context.metadata.expected_runtime {
-        out.push_str(&format!("- Expected runtime: `{expected_runtime}`\n"));
+        writeln!(out, "- Expected runtime: `{expected_runtime}`").unwrap();
     }
     if let Some(expected_signal) = &context.metadata.expected_signal {
-        out.push_str(&format!("- Expected signal: {expected_signal}\n"));
+        writeln!(out, "- Expected signal: {expected_signal}").unwrap();
     }
-    if !context.metadata.tags.is_empty()
-        || context.metadata.expected_runtime.is_some()
-        || context.metadata.expected_signal.is_some()
-    {
-        out.push('\n');
-    }
-}
-
-fn render_warning_section(out: &mut String, warnings: &[String]) {
-    if !warnings.is_empty() {
-        out.push_str("## Warnings\n\n");
-        for warning in warnings {
-            out.push_str(&format!("- {warning}\n"));
-        }
+    if out.len() != metadata_start {
         out.push('\n');
     }
 }
@@ -144,6 +191,10 @@ fn render_overview_table(out: &mut String, entries: &[ReportEntry]) {
     out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for entry in entries {
         let summary = &entry.summary;
+        let cache = &summary.cache_summary;
+        let queue = &summary.queue_admission_summary;
+        let routing = &summary.routing_selection_summary;
+        let stickiness = &summary.stickiness_summary;
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             entry.algorithm_name,
@@ -161,146 +212,81 @@ fn render_overview_table(out: &mut String, entries: &[ReportEntry]) {
             optional_score(summary.cluster_capacity_balance_score),
             optional_score(summary.balance_score),
             optional_score(summary.capacity_balance_score),
-            cache_hits(
-                summary.cache_summary.hit_count,
-                summary.cache_summary.miss_count
-            ),
-            optional_percent(summary.cache_summary.hit_rate),
-            optional_percent(summary.cache_summary.input_reuse_rate),
-            summary.cache_summary.reused_input_tokens,
-            summary.cache_summary.uncached_input_tokens,
-            optional_percent(summary.stickiness_summary.movement_rate),
-            summary.cache_summary.eviction_count,
-            summary.cache_summary.evicted_tokens,
+            cache_hits(cache.hit_count, cache.miss_count),
+            optional_percent(cache.hit_rate),
+            optional_percent(cache.input_reuse_rate),
+            cache.reused_input_tokens,
+            cache.uncached_input_tokens,
+            optional_percent(stickiness.movement_rate),
+            cache.eviction_count,
+            cache.evicted_tokens,
             summary.failure_summary.len(),
-            counter(summary.routing_selection_summary.fallback_count),
-            counter(
-                summary
-                    .routing_selection_summary
-                    .kv_free_token_fallback_count
-            ),
-            counter(summary.queue_admission_summary.pylon_rejected_count),
-            counter(summary.queue_admission_summary.pylon_disabled_count),
-            counter(
-                summary
-                    .queue_admission_summary
-                    .stargate_queue_mismatch_retry_count
-            ),
-            retry_exhaustion(&summary.queue_admission_summary),
+            counter(routing.fallback_count),
+            counter(routing.kv_free_token_fallback_count),
+            counter(queue.pylon_rejected_count),
+            counter(queue.pylon_disabled_count),
+            counter(queue.stargate_queue_mismatch_retry_count),
+            retry_exhaustion(queue),
         ));
     }
 }
 
 #[derive(Clone, Copy)]
 enum ShareGroupKind {
-    Cluster,
-    Backend,
-}
-
-impl ShareGroupKind {
-    fn section_title(self) -> &'static str {
-        match self {
-            Self::Cluster => "Cluster Shares",
-            Self::Backend => "Backend Shares",
-        }
-    }
-
-    fn id_header(self) -> &'static str {
-        match self {
-            Self::Cluster => "Cluster",
-            Self::Backend => "Backend",
-        }
-    }
-
-    fn ids(self, summary: &RunSummary) -> BTreeSet<&str> {
-        let mut ids = BTreeSet::new();
-        match self {
-            Self::Cluster => {
-                ids.extend(summary.cluster_request_shares.keys().map(String::as_str));
-                ids.extend(summary.cluster_capacity_shares.keys().map(String::as_str));
-                ids.extend(summary.cluster_summaries.keys().map(String::as_str));
-            }
-            Self::Backend => {
-                ids.extend(summary.backend_request_shares.keys().map(String::as_str));
-                ids.extend(summary.backend_capacity_shares.keys().map(String::as_str));
-                ids.extend(summary.backend_summaries.keys().map(String::as_str));
-            }
-        }
-        ids
-    }
-
-    fn member_summary<'a>(self, summary: &'a RunSummary, id: &str) -> Option<&'a BackendSummary> {
-        match self {
-            Self::Cluster => summary.cluster_summaries.get(id),
-            Self::Backend => summary.backend_summaries.get(id),
-        }
-    }
-
-    fn request_share(self, summary: &RunSummary, id: &str) -> Option<f64> {
-        match self {
-            Self::Cluster => summary.cluster_request_shares.get(id).copied(),
-            Self::Backend => summary.backend_request_shares.get(id).copied(),
-        }
-    }
-
-    fn input_share(self, summary: &RunSummary, id: &str) -> Option<f64> {
-        match self {
-            Self::Cluster => summary.cluster_input_token_shares.get(id).copied(),
-            Self::Backend => summary.backend_input_token_shares.get(id).copied(),
-        }
-    }
-
-    fn output_share(self, summary: &RunSummary, id: &str) -> Option<f64> {
-        match self {
-            Self::Cluster => summary.cluster_output_token_shares.get(id).copied(),
-            Self::Backend => summary.backend_output_token_shares.get(id).copied(),
-        }
-    }
-
-    fn capacity_share(self, summary: &RunSummary, id: &str) -> Option<f64> {
-        match self {
-            Self::Cluster => summary.cluster_capacity_shares.get(id).copied(),
-            Self::Backend => summary.backend_capacity_shares.get(id).copied(),
-        }
-    }
+    Cluster = 0,
+    Backend = 1,
 }
 
 fn render_share_table(out: &mut String, group_kind: ShareGroupKind, entries: &[ReportEntry]) {
-    out.push_str(&format!("\n## {}\n\n", group_kind.section_title()));
+    let (section_title, id_header) =
+        [("Cluster Shares", "Cluster"), ("Backend Shares", "Backend")][group_kind as usize];
+    out.push_str(&format!("\n## {section_title}\n\n"));
     for entry in entries {
+        let summary = &entry.summary;
+        let (request_shares, input_shares, output_shares, capacity_shares, summaries) =
+            match group_kind {
+                ShareGroupKind::Cluster => (
+                    &summary.cluster_request_shares,
+                    &summary.cluster_input_token_shares,
+                    &summary.cluster_output_token_shares,
+                    &summary.cluster_capacity_shares,
+                    &summary.cluster_summaries,
+                ),
+                ShareGroupKind::Backend => (
+                    &summary.backend_request_shares,
+                    &summary.backend_input_token_shares,
+                    &summary.backend_output_token_shares,
+                    &summary.backend_capacity_shares,
+                    &summary.backend_summaries,
+                ),
+            };
         out.push_str(&format!("### {}\n\n", entry.algorithm_name));
         out.push_str(&format!(
             "| {} | Requests | Success | Request Share | Input Share | Output Share | Capacity Share | Avg TTLT | P95 TTLT | Cache Hit Rate | Evictions |\n",
-            group_kind.id_header()
+            id_header
         ));
         out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
-        for member_id in group_kind.ids(&entry.summary) {
-            let member_summary = group_kind.member_summary(&entry.summary, member_id);
+        let member_ids = request_shares
+            .keys()
+            .chain(capacity_shares.keys())
+            .chain(summaries.keys())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        for member_id in member_ids {
+            let member_summary = summaries.get(member_id);
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 member_id,
-                member_summary
-                    .map(|summary| summary.request_count.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                member_summary
-                    .map(|summary| summary.success_count.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                optional_percent(group_kind.request_share(&entry.summary, member_id)),
-                optional_percent(group_kind.input_share(&entry.summary, member_id)),
-                optional_percent(group_kind.output_share(&entry.summary, member_id)),
-                optional_percent(group_kind.capacity_share(&entry.summary, member_id)),
-                member_summary
-                    .and_then(|summary| summary.avg_ttlt_ms)
-                    .map(ms_float)
-                    .unwrap_or_else(|| "-".to_string()),
-                member_summary
-                    .and_then(|summary| summary.p95_ttlt_ms)
-                    .map(ms)
-                    .unwrap_or_else(|| "-".to_string()),
+                optional_display(member_summary.map(|summary| summary.request_count)),
+                optional_display(member_summary.map(|summary| summary.success_count)),
+                optional_percent(request_shares.get(member_id).copied()),
+                optional_percent(input_shares.get(member_id).copied()),
+                optional_percent(output_shares.get(member_id).copied()),
+                optional_percent(capacity_shares.get(member_id).copied()),
+                optional_ms(member_summary.and_then(|summary| summary.avg_ttlt_ms)),
+                optional_integer_ms(member_summary.and_then(|summary| summary.p95_ttlt_ms)),
                 optional_percent(member_summary.and_then(|summary| summary.cache_hit_rate)),
-                member_summary
-                    .map(|summary| summary.cache_eviction_count.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
+                optional_display(member_summary.map(|summary| summary.cache_eviction_count)),
             ));
         }
         out.push('\n');
@@ -308,27 +294,30 @@ fn render_share_table(out: &mut String, group_kind: ShareGroupKind, entries: &[R
 }
 
 fn render_failure_table(out: &mut String, entries: &[ReportEntry]) {
-    let has_failures = entries
+    if entries
         .iter()
-        .any(|entry| !entry.summary.failure_summary.is_empty());
-    if has_failures {
-        out.push_str("## Failures\n\n");
-        out.push_str("| Algorithm | Status | Backend | Count | Error |\n");
-        out.push_str("|---|---:|---|---:|---|\n");
-        for entry in entries {
-            for failure in &entry.summary.failure_summary {
-                out.push_str(&format!(
-                    "| {} | {} | {} | {} | {} |\n",
-                    entry.algorithm_name,
-                    failure.status_code,
-                    failure.selected_backend_id.as_deref().unwrap_or("-"),
-                    failure.count,
-                    failure.error.as_deref().unwrap_or("-"),
-                ));
-            }
-        }
-        out.push('\n');
+        .all(|entry| entry.summary.failure_summary.is_empty())
+    {
+        return;
     }
+    out.push_str("## Failures\n\n");
+    out.push_str("| Algorithm | Status | Backend | Count | Error |\n");
+    out.push_str("|---|---:|---|---:|---|\n");
+    for entry in entries {
+        for failure in &entry.summary.failure_summary {
+            writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                entry.algorithm_name,
+                failure.status_code,
+                failure.selected_backend_id.as_deref().unwrap_or("-"),
+                failure.count,
+                failure.error.as_deref().unwrap_or("-"),
+            )
+            .unwrap();
+        }
+    }
+    out.push('\n');
 }
 
 fn ms(value: u64) -> String {
@@ -340,11 +329,11 @@ fn ms_float(value: f64) -> String {
 }
 
 fn optional_ms(value: Option<f64>) -> String {
-    value.map(ms_float).unwrap_or_else(|| "-".to_string())
+    optional(value, ms_float)
 }
 
 fn optional_integer_ms(value: Option<u64>) -> String {
-    value.map(ms).unwrap_or_else(|| "-".to_string())
+    optional(value, ms)
 }
 
 fn percent(value: f64) -> String {
@@ -352,19 +341,23 @@ fn percent(value: f64) -> String {
 }
 
 fn optional_percent(value: Option<f64>) -> String {
-    value.map(percent).unwrap_or_else(|| "-".to_string())
+    optional(value, percent)
 }
 
 fn optional_score(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.3}"))
-        .unwrap_or_else(|| "-".to_string())
+    optional(value, |value| format!("{value:.3}"))
 }
 
 fn optional_rate(value: Option<f64>, unit: &str) -> String {
-    value
-        .map(|value| format!("{value:.1} {unit}"))
-        .unwrap_or_else(|| "-".to_string())
+    optional(value, |value| format!("{value:.1} {unit}"))
+}
+
+fn optional<T>(value: Option<T>, render: impl FnOnce(T) -> String) -> String {
+    value.map(render).unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_display(value: Option<impl std::fmt::Display>) -> String {
+    optional(value, |value| value.to_string())
 }
 
 fn cache_hits(hit_count: usize, miss_count: usize) -> String {
@@ -423,84 +416,81 @@ fn retry_exhaustion(summary: &QueueAdmissionSummary) -> String {
     format!("{total} ({reasons})")
 }
 
-fn report_warnings(context: &ReportContext, entries: &[ReportEntry]) -> Vec<String> {
-    let mut warnings = Vec::new();
+fn render_warnings(out: &mut String, context: &ReportContext, entries: &[ReportEntry]) {
+    let start = out.len();
+    out.push_str("## Warnings\n\n");
     if entries.is_empty() {
-        warnings.push("No algorithm summaries were found.".to_string());
-        return warnings;
+        out.push_str("- No algorithm summaries were found.\n\n");
+        return;
     }
-    let cache_focused = context
-        .metadata
-        .tags
-        .iter()
-        .any(|tag| matches!(tag.as_str(), "cache" | "pulsar" | "kv-cache"));
-    let queue_admission_focused = context
-        .metadata
-        .tags
-        .iter()
-        .any(|tag| matches!(tag.as_str(), "queue-admission" | "queue-mismatch"));
-    let pmr_fallback_focused = context
-        .metadata
-        .tags
-        .iter()
-        .any(|tag| tag == "pmr-fallback");
+    let has_tag = |targets: &[&str]| {
+        context
+            .metadata
+            .tags
+            .iter()
+            .any(|tag| targets.contains(&tag.as_str()))
+    };
+    let cache_focused = has_tag(&["cache", "pulsar", "kv-cache"]);
+    let queue_admission_focused = has_tag(&["queue-admission", "queue-mismatch"]);
+    let pulsar_wait_and_widen_fallback_focused = has_tag(&["pulsar-wait-and-widen-fallback"]);
     for entry in entries {
-        if entry.summary.success_rate < 1.0 {
-            warnings.push(format!(
-                "{} success rate was {:.1}%.",
+        let summary = &entry.summary;
+        if summary.success_rate < 1.0 {
+            writeln!(
+                out,
+                "- {} success rate was {:.1}%.",
                 entry.algorithm_name,
-                entry.summary.success_rate * 100.0
-            ));
+                summary.success_rate * 100.0
+            )
+            .unwrap();
         }
-        if let Some(score) = entry.summary.capacity_balance_score
+        if let Some(score) = summary.capacity_balance_score
             && score < 0.5
         {
-            warnings.push(format!(
-                "{} capacity balance score was low ({score:.3}).",
+            writeln!(
+                out,
+                "- {} capacity balance score was low ({score:.3}).",
                 entry.algorithm_name
-            ));
+            )
+            .unwrap();
         }
-        if cache_focused && entry.summary.cache_summary.observed_request_count == 0 {
-            warnings.push(format!(
-                "{} did not report per-request KV-cache headers.",
-                entry.algorithm_name
-            ));
+        if cache_focused {
+            if summary.cache_summary.observed_request_count == 0 {
+                writeln!(
+                    out,
+                    "- {} did not report per-request KV-cache headers.",
+                    entry.algorithm_name
+                )
+                .unwrap();
+            } else if summary.cache_summary.hit_count == 0 {
+                writeln!(
+                    out,
+                    "- {} reported KV-cache headers but no cache hits.",
+                    entry.algorithm_name
+                )
+                .unwrap();
+            }
         }
-        if cache_focused
-            && entry.summary.cache_summary.observed_request_count > 0
-            && entry.summary.cache_summary.hit_count == 0
+        if pulsar_wait_and_widen_fallback_focused
+            && entry.algorithm_name == "pulsar-wait-and-widen"
+            && summary.routing_selection_summary.fallback_count == 0.0
         {
-            warnings.push(format!(
-                "{} reported KV-cache headers but no cache hits.",
-                entry.algorithm_name
-            ));
-        }
-        if pmr_fallback_focused
-            && entry.algorithm_name == "pulsar-multiregion"
-            && entry.summary.routing_selection_summary.fallback_count == 0.0
-        {
-            warnings.push(
-                "pulsar-multiregion did not observe a ranked fallback route choice in the PMR fallback scenario."
-                    .to_string(),
-            );
+            out.push_str("- pulsar-wait-and-widen did not observe a ranked fallback route choice in the PulsarWaitAndWiden fallback scenario.\n");
         }
     }
     if queue_admission_focused
         && entries.iter().all(|entry| {
-            entry.summary.queue_admission_summary.pylon_rejected_count == 0.0
-                && entry
-                    .summary
-                    .queue_admission_summary
-                    .stargate_queue_mismatch_retry_count
-                    == 0.0
+            let queue = &entry.summary.queue_admission_summary;
+            queue.pylon_rejected_count == 0.0 && queue.stargate_queue_mismatch_retry_count == 0.0
         })
     {
-        warnings.push(
-            "No pylon queue-mismatch rejections or Stargate queue-mismatch retries were observed."
-                .to_string(),
-        );
+        out.push_str("- No pylon queue-mismatch rejections or Stargate queue-mismatch retries were observed.\n");
     }
-    warnings
+    if out.len() == start + "## Warnings\n\n".len() {
+        out.truncate(start);
+    } else {
+        out.push('\n');
+    }
 }
 
 #[cfg(test)]
@@ -511,8 +501,8 @@ mod tests {
         StargateConfig, TokenDistributionConfig, TrafficPatternConfig, UniformTrafficConfig,
     };
     use crate::score::{
-        CacheSummary, FailureSummary, QueueAdmissionSummary, RoutingSelectionSummary,
-        summarize_with_capacity,
+        BackendSummary, CacheSummary, FailureSummary, QueueAdmissionSummary,
+        RoutingSelectionSummary, summarize_with_capacity,
     };
     use std::collections::BTreeMap;
 
@@ -524,7 +514,7 @@ mod tests {
             seed: Some(1),
             request_count: 1,
             max_concurrency: 1,
-            tunnel_protocol: stargate_protocol::TunnelTransportProtocol::Custom,
+            tunnel_protocol: stargate_protocol::TunnelTransportProtocol::RawQuic,
             stargates: StargateConfig { count: 1 },
             backends: BackendConfig {
                 count: 1,
@@ -560,77 +550,135 @@ mod tests {
         }
     }
 
-    #[test]
-    fn markdown_report_includes_key_columns() {
-        let mut request_shares = BTreeMap::new();
-        request_shares.insert("backend-0".to_string(), 1.0);
-        let summary = RunSummary {
-            request_count: 1,
-            success_rate: 1.0,
-            successful_requests_per_second: Some(40.0),
-            successful_output_tokens_per_second: Some(400.0),
-            avg_ttft_ms: Some(10.0),
-            p50_ttft_ms: Some(10),
-            p95_ttft_ms: Some(10),
-            p99_ttft_ms: Some(10),
-            avg_ttlt_ms: 20.0,
-            p50_ttlt_ms: 20,
-            p95_ttlt_ms: 20,
-            p99_ttlt_ms: 20,
-            max_ttlt_ms: 20,
-            total_length_ms: 25,
-            balance_score: Some(1.0),
-            capacity_balance_score: Some(1.0),
-            cluster_balance_score: Some(1.0),
-            cluster_capacity_balance_score: Some(1.0),
-            backend_request_shares: request_shares.clone(),
-            backend_capacity_shares: request_shares,
-            backend_input_token_shares: BTreeMap::new(),
-            backend_output_token_shares: BTreeMap::new(),
-            backend_summaries: BTreeMap::new(),
-            cluster_request_shares: BTreeMap::from([("cluster-a".to_string(), 1.0)]),
-            cluster_capacity_shares: BTreeMap::from([("cluster-a".to_string(), 1.0)]),
-            cluster_input_token_shares: BTreeMap::new(),
-            cluster_output_token_shares: BTreeMap::new(),
-            cluster_summaries: BTreeMap::from([(
-                "cluster-a".to_string(),
-                crate::score::BackendSummary {
-                    request_count: 1,
-                    success_count: 1,
-                    input_tokens: 1,
-                    output_tokens: 10,
-                    avg_ttlt_ms: Some(20.0),
-                    p95_ttlt_ms: Some(20),
-                    cache_hit_rate: Some(1.0),
-                    cache_eviction_count: 0,
-                    cache_evicted_tokens: 0,
-                },
-            )]),
-            cache_summary: CacheSummary {
-                observed_request_count: 1,
-                hit_count: 1,
-                miss_count: 0,
-                hit_rate: Some(1.0),
-                eviction_count: 0,
-                evicted_tokens: 0,
-                reused_input_tokens: 10,
-                uncached_input_tokens: 1,
-                input_reuse_rate: Some(10.0 / 11.0),
-            },
-            stickiness_summary: Default::default(),
-            failure_summary: Vec::new(),
-            queue_admission_summary: Default::default(),
-            routing_selection_summary: Default::default(),
-        };
-
-        let report = render_markdown_report(
-            &ReportContext::from_config(&config()),
+    fn render(
+        config: &BenchmarkConfig,
+        algorithm_name: &str,
+        pylon_queue_admission: Option<PylonQueueAdmissionConfig>,
+        summary: RunSummary,
+    ) -> String {
+        render_markdown_report(
+            &ReportContext::from_config(config),
             &[ReportEntry {
-                algorithm_name: "power-of-two".to_string(),
-                pylon_queue_admission: None,
+                algorithm_name: algorithm_name.to_string(),
+                pylon_queue_admission,
                 summary,
             }],
+        )
+    }
+
+    fn queue_admission() -> PylonQueueAdmissionConfig {
+        PylonQueueAdmissionConfig {
+            enabled: true,
+            min_delta_ms: Some(0),
+            tolerance_factor: Some(1.0),
+            retry_after_ms: Some(5),
+        }
+    }
+
+    #[test]
+    fn report_artifacts_write_comparison_and_markdown_from_same_entries() {
+        let tempdir = tempfile::tempdir().expect("tempdir should create");
+        let mut summary = summarize_with_capacity(&[], BTreeMap::new());
+        summary.p95_ttft_ms = Some(17);
+        summary.queue_admission_summary = QueueAdmissionSummary {
+            pylon_rejected_count: 4.0,
+            stargate_queue_mismatch_retry_count: 3.0,
+            ..QueueAdmissionSummary::default()
+        };
+        summary.routing_selection_summary = RoutingSelectionSummary {
+            primary_count: 5.0,
+            fallback_count: 2.0,
+            kv_free_token_fallback_count: 1.0,
+        };
+        let entry = ReportEntry {
+            algorithm_name: "wait-and-widen-admission-enabled".to_string(),
+            pylon_queue_admission: Some(queue_admission()),
+            summary,
+        };
+
+        let artifacts = write_benchmark_report_artifacts(
+            tempdir.path(),
+            &ReportContext::from_config(&config()),
+            &[entry],
+        )
+        .expect("report artifacts should write");
+
+        let comparison: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&artifacts.comparison_path).expect("comparison should read"),
+        )
+        .expect("comparison should parse");
+        assert_eq!(
+            comparison[0]["algorithm_name"],
+            "wait-and-widen-admission-enabled"
         );
+        assert_eq!(comparison[0]["pylon_queue_admission"]["enabled"], true);
+        assert_eq!(comparison[0]["p95_ttft_ms"], 17);
+        assert_eq!(
+            comparison[0]["queue_admission"]["pylon_rejected_count"],
+            4.0
+        );
+        assert_eq!(
+            comparison[0]["queue_admission"]["stargate_queue_mismatch_retry_count"],
+            3.0
+        );
+        assert_eq!(comparison[0]["routing_selection"]["fallback_count"], 2.0);
+        assert_eq!(
+            comparison[0]["routing_selection"]["kv_free_token_fallback_count"],
+            1.0
+        );
+
+        let report = std::fs::read_to_string(&artifacts.report_path).expect("report should read");
+        assert!(report.contains("| wait-and-widen-admission-enabled | enabled"));
+        assert!(report.contains("Pylon Rejected"));
+        assert!(report.contains("Fallback Route Choices"));
+    }
+
+    #[test]
+    fn markdown_report_includes_key_columns() {
+        let mut summary = summarize_with_capacity(&[], BTreeMap::new());
+        summary.request_count = 1;
+        summary.success_rate = 1.0;
+        summary.successful_requests_per_second = Some(40.0);
+        summary.successful_output_tokens_per_second = Some(400.0);
+        summary.avg_ttft_ms = Some(10.0);
+        summary.p95_ttft_ms = Some(10);
+        summary.avg_ttlt_ms = 20.0;
+        summary.p95_ttlt_ms = 20;
+        summary.max_ttlt_ms = 20;
+        summary.total_length_ms = 25;
+        summary.balance_score = Some(1.0);
+        summary.capacity_balance_score = Some(1.0);
+        summary.cluster_balance_score = Some(1.0);
+        summary.cluster_capacity_balance_score = Some(1.0);
+        summary.backend_request_shares = BTreeMap::from([("backend-0".to_string(), 1.0)]);
+        summary.backend_capacity_shares = summary.backend_request_shares.clone();
+        summary.cluster_request_shares = BTreeMap::from([("cluster-a".to_string(), 1.0)]);
+        summary.cluster_capacity_shares = summary.cluster_request_shares.clone();
+        summary.cluster_summaries = BTreeMap::from([(
+            "cluster-a".to_string(),
+            BackendSummary {
+                request_count: 1,
+                success_count: 1,
+                input_tokens: 1,
+                output_tokens: 10,
+                avg_ttlt_ms: Some(20.0),
+                p95_ttlt_ms: Some(20),
+                cache_hit_rate: Some(1.0),
+                cache_eviction_count: 0,
+                cache_evicted_tokens: 0,
+            },
+        )]);
+        summary.cache_summary = CacheSummary {
+            observed_request_count: 1,
+            hit_count: 1,
+            hit_rate: Some(1.0),
+            reused_input_tokens: 10,
+            uncached_input_tokens: 1,
+            input_reuse_rate: Some(10.0 / 11.0),
+            ..CacheSummary::default()
+        };
+
+        let report = render(&config(), "power-of-n", None, summary);
 
         assert!(report.contains("| Algorithm | Admission Mode | Success |"));
         assert!(report.contains("Successful RPS"));
@@ -649,50 +697,10 @@ mod tests {
     fn markdown_report_warns_for_cache_scenarios_without_cache_headers() {
         let mut config = config();
         config.metadata.tags = vec!["cache".to_string()];
-        let summary = RunSummary {
-            request_count: 1,
-            success_rate: 1.0,
-            successful_requests_per_second: None,
-            successful_output_tokens_per_second: None,
-            avg_ttft_ms: Some(10.0),
-            p50_ttft_ms: Some(10),
-            p95_ttft_ms: Some(10),
-            p99_ttft_ms: Some(10),
-            avg_ttlt_ms: 20.0,
-            p50_ttlt_ms: 20,
-            p95_ttlt_ms: 20,
-            p99_ttlt_ms: 20,
-            max_ttlt_ms: 20,
-            total_length_ms: 25,
-            balance_score: Some(1.0),
-            capacity_balance_score: Some(1.0),
-            cluster_balance_score: None,
-            cluster_capacity_balance_score: None,
-            backend_request_shares: BTreeMap::new(),
-            backend_capacity_shares: BTreeMap::new(),
-            backend_input_token_shares: BTreeMap::new(),
-            backend_output_token_shares: BTreeMap::new(),
-            backend_summaries: BTreeMap::new(),
-            cluster_request_shares: BTreeMap::new(),
-            cluster_capacity_shares: BTreeMap::new(),
-            cluster_input_token_shares: BTreeMap::new(),
-            cluster_output_token_shares: BTreeMap::new(),
-            cluster_summaries: BTreeMap::new(),
-            cache_summary: CacheSummary::default(),
-            stickiness_summary: Default::default(),
-            failure_summary: Vec::new(),
-            queue_admission_summary: Default::default(),
-            routing_selection_summary: Default::default(),
-        };
+        let mut summary = summarize_with_capacity(&[], BTreeMap::new());
+        summary.success_rate = 1.0;
 
-        let report = render_markdown_report(
-            &ReportContext::from_config(&config),
-            &[ReportEntry {
-                algorithm_name: "pulsar".to_string(),
-                pylon_queue_admission: None,
-                summary,
-            }],
-        );
+        let report = render(&config, "pulsar", None, summary);
 
         assert!(report.contains("## Warnings"));
         assert!(report.contains("did not report per-request KV-cache headers"));
@@ -718,32 +726,24 @@ mod tests {
             kv_free_token_fallback_count: 1.0,
         };
 
-        let report = render_markdown_report(
-            &ReportContext::from_config(&config()),
-            &[ReportEntry {
-                algorithm_name: "groq-admission-enabled".to_string(),
-                pylon_queue_admission: Some(crate::config::PylonQueueAdmissionConfig {
-                    enabled: true,
-                    min_delta_ms: Some(0),
-                    tolerance_factor: Some(1.0),
-                    retry_after_ms: Some(5),
-                }),
-                summary,
-            }],
+        let report = render(
+            &config(),
+            "wait-and-widen-admission-enabled",
+            Some(queue_admission()),
+            summary,
         );
 
         assert!(report.contains("Admission Mode"));
         assert!(report.contains("enabled (min=0ms, factor=1, retry-after=5ms)"));
         assert!(report.contains("Pylon Rejected"));
         assert!(report.contains("Fallback Route Choices"));
-        assert!(report.contains("| groq-admission-enabled | enabled"));
+        assert!(report.contains("| wait-and-widen-admission-enabled | enabled"));
         assert!(report.contains("| 2 | 1 | 3 | 0 | 2 | 1 (retry_budget_exhausted=1) |"));
     }
 
     #[test]
     fn markdown_report_renders_failure_rows_only_when_failures_exist() {
-        let mut successful_summary = summarize_with_capacity(&[], BTreeMap::new());
-        successful_summary.failure_summary = Vec::new();
+        let successful_summary = summarize_with_capacity(&[], BTreeMap::new());
         let mut failed_summary = summarize_with_capacity(&[], BTreeMap::new());
         failed_summary.failure_summary = vec![FailureSummary {
             status_code: 503,
@@ -752,47 +752,31 @@ mod tests {
             count: 2,
         }];
 
-        let successful_report = render_markdown_report(
-            &ReportContext::from_config(&config()),
-            &[ReportEntry {
-                algorithm_name: "round-robin".to_string(),
-                pylon_queue_admission: None,
-                summary: successful_summary,
-            }],
-        );
-        let failed_report = render_markdown_report(
-            &ReportContext::from_config(&config()),
-            &[ReportEntry {
-                algorithm_name: "power-of-two".to_string(),
-                pylon_queue_admission: None,
-                summary: failed_summary,
-            }],
-        );
+        let successful_report = render(&config(), "round-robin", None, successful_summary);
+        let failed_report = render(&config(), "power-of-n", None, failed_summary);
 
         assert!(!successful_report.contains("## Failures"));
         assert!(failed_report.contains("## Failures"));
         assert!(failed_report.contains("| Algorithm | Status | Backend | Count | Error |"));
         assert!(
-            failed_report.contains("| power-of-two | 503 | backend-a | 2 | upstream unavailable |")
+            failed_report.contains("| power-of-n | 503 | backend-a | 2 | upstream unavailable |")
         );
     }
 
     #[test]
-    fn markdown_report_warns_when_a_pmr_fallback_scenario_never_uses_fallback() {
+    fn markdown_report_warns_when_a_pulsar_wait_and_widen_fallback_scenario_never_uses_fallback() {
         let mut config = config();
-        config.metadata.tags = vec!["pmr-fallback".to_string()];
+        config.metadata.tags = vec!["pulsar-wait-and-widen-fallback".to_string()];
 
-        let report = render_markdown_report(
-            &ReportContext::from_config(&config),
-            &[ReportEntry {
-                algorithm_name: "pulsar-multiregion".to_string(),
-                pylon_queue_admission: None,
-                summary: summarize_with_capacity(&[], BTreeMap::new()),
-            }],
+        let report = render(
+            &config,
+            "pulsar-wait-and-widen",
+            None,
+            summarize_with_capacity(&[], BTreeMap::new()),
         );
 
         assert!(
-            report.contains("pulsar-multiregion did not observe a ranked fallback route choice")
+            report.contains("pulsar-wait-and-widen did not observe a ranked fallback route choice")
         );
     }
 }

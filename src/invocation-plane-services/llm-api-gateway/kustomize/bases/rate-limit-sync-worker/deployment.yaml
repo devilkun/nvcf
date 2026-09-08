@@ -37,7 +37,7 @@ spec:
           image: llm-api-gateway:dev
           imagePullPolicy: IfNotPresent
           command:
-            - ./llm-api-gateway-rate-limit-sync-worker
+            - /usr/bin/llm-api-gateway-rate-limit-sync-worker
           envFrom:
             - configMapRef:
                 name: llm-api-gateway-config

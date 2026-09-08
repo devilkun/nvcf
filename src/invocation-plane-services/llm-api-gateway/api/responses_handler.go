@@ -20,7 +20,6 @@ package api
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +43,6 @@ import (
 )
 
 const (
-	responsesEndpointPath       = "/v1/responses"
 	headerResponsesInput        = "X-Input-Tokens"
 	headerResponsesEstimate     = "X-Token-Estimate"
 	headerResponsesRequest      = "X-Request-Id"
@@ -54,6 +52,7 @@ const (
 	headerResponsesMethod       = "X-Routing-Method"
 	headerResponsesModel        = "X-Model"
 	headerResponsesAffinity     = "X-Cache-Affinity-Key"
+	headerResponsesPriority     = "X-Priority"
 )
 
 func (h *ResponsesHandlers) RegisterRoutes(group *echo.Group) {
@@ -125,7 +124,7 @@ func (h *ResponsesHandlers) prepareNativeResponsesRequest(
 	reqCtx.Model = routedModel
 	setRoutingMethodForModel(reqCtx, routedModel)
 
-	if err := requireResponsesURI(reqCtx, routedModel); err != nil {
+	if err := h.handlers.requireModelURIAllowlist(c, routedModel, responsesEndpointPath, true); err != nil {
 		return nil, nil, err
 	}
 
@@ -179,36 +178,6 @@ func (h *ResponsesHandlers) prepareNativeResponsesRequest(
 		MaxOutputTokens: maxOutputTokens,
 		AdmissionPlan:   admissionPlan,
 	}, outboundBody, nil
-}
-
-func requireResponsesURI(reqCtx *requestctx.RequestContext, model string) error {
-	if reqCtx == nil || reqCtx.ModelSpecs == nil {
-		return nil
-	}
-
-	spec, ok := reqCtx.ModelSpecs[model]
-	if !ok || len(spec.URIs) == 0 {
-		return nil
-	}
-
-	for _, uri := range spec.URIs {
-		if normalizeModelURI(uri) == responsesEndpointPath {
-			return nil
-		}
-	}
-
-	return echo.NewHTTPError(
-		http.StatusBadRequest,
-		fmt.Sprintf("model %q does not support %s", model, responsesEndpointPath),
-	)
-}
-
-func normalizeModelURI(uri string) string {
-	uri = strings.TrimSpace(uri)
-	if uri == "" {
-		return ""
-	}
-	return "/" + strings.TrimPrefix(uri, "/")
 }
 
 func rewriteResponsesProxyBody(body []byte, model string, stream bool) ([]byte, error) {
@@ -294,6 +263,12 @@ func setResponsesProxyContextHeaders(headers http.Header, reqCtx *requestctx.Req
 	if reqCtx.CacheAffinityKey != "" {
 		headers.Set(headerResponsesAffinity, reqCtx.CacheAffinityKey)
 	}
+	// X-Priority is gateway-owned: strip any client-supplied value from the
+	// cloned inbound headers, then set it only when a priority resolved.
+	headers.Del(headerResponsesPriority)
+	if reqCtx.Priority != nil {
+		headers.Set(headerResponsesPriority, strconv.FormatUint(uint64(*reqCtx.Priority), 10))
+	}
 }
 
 func (h *ResponsesHandlers) relayNativeResponsesStream(
@@ -305,7 +280,7 @@ func (h *ResponsesHandlers) relayNativeResponsesStream(
 	setMultiTurnSessionResponseHeader(c)
 	c.Response().WriteHeader(resp.StatusCode)
 	if resp.Body == nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, true)
+		h.finalizeNativeResponsesUsage(c, request, nil, true)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -316,9 +291,9 @@ func (h *ResponsesHandlers) relayNativeResponsesStream(
 		c.Response().Writer,
 	)
 	if terminalResponse != nil {
-		h.recordNativeResponsesProviderTime(c.UserContext(), start, true)
+		h.recordNativeResponsesProviderTime(c, start, true)
 	}
-	h.finalizeNativeResponsesUsage(c.UserContext(), request, terminalResponse, true)
+	h.finalizeNativeResponsesUsage(c, request, terminalResponse, true)
 	return err
 }
 
@@ -328,7 +303,7 @@ func (h *ResponsesHandlers) aggregateNativeResponsesStream(
 	resp *provider.ProxyResponse,
 ) error {
 	if resp.Body == nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
+		h.finalizeNativeResponsesUsage(c, request, nil, false)
 		return echo.NewHTTPError(http.StatusBadGateway, "responses proxy returned no body")
 	}
 	defer resp.Body.Close()
@@ -338,26 +313,26 @@ func (h *ResponsesHandlers) aggregateNativeResponsesStream(
 		setMultiTurnSessionResponseHeader(c)
 		c.Response().WriteHeader(resp.StatusCode)
 		_, err := io.Copy(c.Response().Writer, resp.Body)
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
+		h.finalizeNativeResponsesUsage(c, request, nil, false)
 		return err
 	}
 
 	start := time.Now()
 	terminalResponse, err := consumeNativeResponsesSSE(resp.Body, nil)
 	if err != nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
+		h.finalizeNativeResponsesUsage(c, request, nil, false)
 		return err
 	}
 	if terminalResponse == nil {
-		h.finalizeNativeResponsesUsage(c.UserContext(), request, nil, false)
+		h.finalizeNativeResponsesUsage(c, request, nil, false)
 		return echo.NewHTTPError(
 			http.StatusBadGateway,
 			"responses proxy stream ended without a terminal response event",
 		)
 	}
 
-	h.recordNativeResponsesProviderTime(c.UserContext(), start, false)
-	h.finalizeNativeResponsesUsage(c.UserContext(), request, terminalResponse, false)
+	h.recordNativeResponsesProviderTime(c, start, false)
+	h.finalizeNativeResponsesUsage(c, request, terminalResponse, false)
 	setMultiTurnSessionResponseHeader(c)
 	return c.JSON(http.StatusOK, terminalResponse)
 }
@@ -464,23 +439,31 @@ func parseNativeResponsesSSEBlock(block []byte) *openairesponses.Response {
 }
 
 func (h *ResponsesHandlers) finalizeNativeResponsesUsage(
-	ctx context.Context,
+	c *GatewayContext,
 	request *provider.NormalizedRequest,
 	response *openairesponses.Response,
 	stream bool,
 ) {
+	ctx := c.UserContext()
 	usage := chatUsageFromResponses(response)
 	if usageHasTokenCounts(usage) {
-		h.handlers.observability.recordLLMUsage(ctx, responsesEndpointPath, usage, stream)
+		h.handlers.observability.recordLLMUsage(
+			ctx,
+			responsesEndpointPath,
+			requestFunctionID(c),
+			usage,
+			stream,
+		)
 	}
 	h.handlers.finalizeTokenConsumption(ctx, request, usage)
 }
 
 func (h *ResponsesHandlers) recordNativeResponsesProviderTime(
-	ctx context.Context,
+	c *GatewayContext,
 	start time.Time,
 	stream bool,
 ) {
+	ctx := c.UserContext()
 	telemetry.RecordWithContext(
 		ctx,
 		h.handlers.observability.providerTime,
@@ -488,6 +471,7 @@ func (h *ResponsesHandlers) recordNativeResponsesProviderTime(
 		attribute.String("endpoint", responsesEndpointPath),
 		attribute.String("phase", "total"),
 		attribute.String("stream", boolLabel(stream)),
+		telemetry.FunctionIDAttribute(requestFunctionID(c)),
 	)
 }
 

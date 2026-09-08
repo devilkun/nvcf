@@ -15,29 +15,38 @@
 
 use super::*;
 use stargate_protocol::common::queue_time_delta_ms;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct PendingClusterReservation {
     pub(super) inference_server_id: String,
     pub(super) input_tokens: u64,
     pub(super) priority: u32,
+    active: AtomicBool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RoutingReservation {
-    pub(super) id: u64,
+impl PendingClusterReservation {
+    pub(super) fn new(inference_server_id: String, input_tokens: u64, priority: u32) -> Arc<Self> {
+        Arc::new(Self {
+            inference_server_id,
+            input_tokens,
+            priority,
+            active: AtomicBool::new(true),
+        })
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
-#[derive(Debug, Default)]
-pub(super) struct RoutingReservationState {
-    next_id: AtomicU64,
-}
+// Cancellation is explicit because a successful attempt remains pending until its heartbeat.
+#[derive(Debug)]
+pub(crate) struct RoutingReservation(pub(super) Arc<PendingClusterReservation>);
 
-impl RoutingReservationState {
-    pub(super) fn next(&self) -> RoutingReservation {
-        RoutingReservation {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed),
-        }
+impl RoutingReservation {
+    pub(crate) fn release(self) {
+        self.0.active.store(false, Ordering::Release);
     }
 }
 
@@ -64,19 +73,21 @@ pub(super) fn update_reserved_priority_queue_time(
         .or_insert(pre_reservation_estimate_ms);
     *estimate = estimate.saturating_add(delta_ms);
     for (candidate_priority, estimate_ms) in &mut stats.queue_time_estimate_ms_by_priority {
-        if *candidate_priority <= priority {
-            continue;
+        if *candidate_priority > priority {
+            // Queue-time estimates are advisory routing stats; saturate rather than wrap.
+            *estimate_ms = estimate_ms.saturating_add(delta_ms);
         }
-        // Queue-time estimates are advisory routing stats; saturate rather than wrap on extreme input.
-        *estimate_ms = estimate_ms.saturating_add(delta_ms);
     }
 }
 
 pub(super) fn apply_pending_cluster_reservations(
     stats: &mut ModelStats,
-    pending_cluster_reservations: &BTreeMap<u64, PendingClusterReservation>,
+    pending_cluster_reservations: &[Arc<PendingClusterReservation>],
 ) {
-    for pending in pending_cluster_reservations.values() {
+    for pending in pending_cluster_reservations
+        .iter()
+        .filter(|pending| pending.is_active())
+    {
         // Pending reservations are advisory routing stats; saturate rather than wrap.
         stats.queue_size = stats.queue_size.saturating_add(1);
         stats.queued_input_size = stats.queued_input_size.saturating_add(pending.input_tokens);

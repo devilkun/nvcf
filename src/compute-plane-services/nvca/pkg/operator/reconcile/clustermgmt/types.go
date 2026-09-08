@@ -125,9 +125,10 @@ func (m CaseInsensitiveClusterConfigMap) MarshalJSON() ([]byte, error) {
 }
 
 type agentDTO struct {
-	Tolerations      []corev1.Toleration `json:"tolerations,omitempty"`
-	NATSURL          string              `json:"natsURL,omitempty"`
-	NATSHostOverride string              `json:"natsHostOverride,omitempty"`
+	Tolerations             []corev1.Toleration `json:"tolerations,omitempty"`
+	NATSURL                 string              `json:"natsURL,omitempty"`
+	NATSHostOverride        string              `json:"natsHostOverride,omitempty"`
+	LLMRequestRouterAddress string              `json:"llmRequestRouterAddress,omitempty"`
 
 	HelmReValStageOAuthTokenURL             string `json:"helmReValStageOAuthTokenURL,omitempty"`
 	HelmReValStageOAuthPublicKeysetEndpoint string `json:"helmReValStageOAuthPublicKeysetEndpoint,omitempty"`

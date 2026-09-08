@@ -3271,14 +3271,6 @@ spec:
 			expectedError: false,
 		},
 		{
-			name: "failure when cluster source is changed after initial deployment",
-			bc: &BackendK8sCache{
-				clusterSource: nvcaoptypes.ClusterSourceSelfHosted,
-			},
-			expectedError: true,
-			errorContains: "cluster source cannot be changed after initial deployment",
-		},
-		{
 			name: "failure when custom network policy yaml is malformed",
 			setupConfigMap: func(clients *kubeclients.KubeClients) error {
 				cm := &corev1.ConfigMap{

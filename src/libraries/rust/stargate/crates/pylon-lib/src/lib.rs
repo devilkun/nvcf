@@ -18,36 +18,52 @@ pub use stargate_protocol::TunnelTransportProtocol;
 pub use stargate_tls::ServerTlsIdentity;
 
 mod bringup;
+mod generated_request_id;
+mod model_discovery;
+mod model_lifecycle;
 mod output_token_parser;
 mod queue_admission;
 mod quic_http_tunnel;
 mod registration;
 mod request_observer;
 mod request_quality_monitor;
+mod runtime_state;
 mod sse_message_stream;
 mod stats;
+#[cfg(test)]
+mod test_support;
+mod upstream_health;
+mod upstream_url;
 
-pub use bringup::BringupConfig;
-pub use output_token_parser::OutputTokenParserFactory;
-pub use queue_admission::{PylonQueueMismatchRetryConfig, QueueAdmissionTracker};
+pub use bringup::{BringupConfig, BringupError, CalibrationConfig};
+pub use model_discovery::{
+    ModelDiscoveryConfig, ModelDiscoveryError, ModelDiscoveryProvider,
+    ParseModelDiscoveryProviderError,
+};
+pub use model_lifecycle::{
+    ModelInitialization, ModelLifecycleConfig, ModelLifecycleError, ModelLifecycleHandle,
+    ModelSource, start_model_lifecycle,
+};
+pub use queue_admission::PylonQueueMismatchRetryConfig;
 pub use quic_http_tunnel::{
-    PylonRetryConfig, QuicHttpTunnelConfig, QuicHttpTunnelHandle, ReverseQuicTunnelConfig,
-    ReverseQuicTunnelHandle, TunnelError, TunnelForwardingConfig, start_quic_http_tunnel,
-    start_reverse_quic_tunnel,
+    DEFAULT_MAX_SSE_BUFFER_BYTES, DEFAULT_PRIORITY_CEILING, PylonRetryConfig, QuicHttpTunnelConfig,
+    QuicHttpTunnelHandle, ReverseQuicTunnelConfig, ReverseQuicTunnelHandle, TunnelError,
+    TunnelForwardingConfig, UpstreamBackend, start_quic_http_tunnel, start_reverse_quic_tunnel,
 };
 pub use registration::{
-    ClientError, CurrentModelStats, InferenceServerRegistrationClient,
-    InferenceServerRegistrationConfig, InferenceServerUpdateChannels,
+    ClientError, InferenceServerRegistrationClient, InferenceServerRegistrationConfig,
 };
 pub use request_observer::{
     RequestObservation, RequestObservationEndpoint, RequestObservationState,
 };
 pub use request_quality_monitor::RequestQualityMonitorConfig;
+pub use runtime_state::{CurrentModelStats, PylonRuntimeState, RequestObservationEvent};
 pub use stats::{
-    EngineStatsStreamConfig, EngineStatsStreamHandle, EngineStatsStreamMode, PylonMetrics,
-    RequestCounterUpdate, RequestCounterUpdateInput, StatsAggregatorUpdate, StatsCollectorConfig,
-    StatsCollectorHandle, StatsUpdateSource, parse_engine_stats_line_for_benchmark,
-    request_observation_channel, start_engine_stats_stream, start_metrics_server,
+    EngineStatsStreamConfig, EngineStatsStreamHandle, EngineStatsStreamMode, MetricsServerHandle,
+    PylonMetrics, RequestCounterUpdate, RequestCounterUpdateInput, StatsAggregatorUpdate,
+    StatsCollectorConfig, StatsCollectorHandle, StatsUpdateSource,
+    parse_engine_stats_line_for_benchmark, start_engine_stats_stream, start_metrics_server,
     start_stats_collector, start_stats_collector_with_engine_stats,
     stats_aggregator_update_channel,
 };
+pub use upstream_health::{DEFAULT_UPSTREAM_HEALTH_PATHS, UpstreamHealthPaths};

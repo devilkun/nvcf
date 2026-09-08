@@ -21,6 +21,12 @@ const MAX_QUIC_VARINT_ENCODED_LEN: usize = 8;
 const MAX_WEBTRANSPORT_BIDI_HEADER_LEN: usize = MAX_QUIC_VARINT_ENCODED_LEN * 2;
 const COMMON_WEBTRANSPORT_BIDI_HEADER: [u8; 3] = [0x40, 0x41, 0x00];
 
+#[derive(Debug, PartialEq, Eq)]
+enum BidiHeaderDecode {
+    Complete(u64, usize),
+    Incomplete(usize),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebTransportBidiHeader {
     bytes: [u8; MAX_WEBTRANSPORT_BIDI_HEADER_LEN],
@@ -56,8 +62,7 @@ pub async fn write_precomputed_webtransport_bidi_header(
 ) -> Result<(), ProtocolError> {
     tx.write_all(header.as_slice())
         .await
-        .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))?;
-    Ok(())
+        .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
 }
 
 pub async fn read_webtransport_bidi_header(
@@ -73,23 +78,15 @@ pub async fn read_webtransport_bidi_header(
     }
 
     loop {
-        if let Some((session_id, _consumed)) =
-            decode_webtransport_bidi_header_bytes(&header[..read_len])?
-        {
-            return Ok(session_id);
+        match parse_webtransport_bidi_header(&header[..read_len])? {
+            BidiHeaderDecode::Complete(session_id, _) => return Ok(session_id),
+            BidiHeaderDecode::Incomplete(required_len) => {
+                rx.read_exact(&mut header[read_len..required_len])
+                    .await
+                    .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))?;
+                read_len = required_len;
+            }
         }
-
-        let next_read_len = next_webtransport_bidi_header_read_len(&header[..read_len])?;
-        if next_read_len <= read_len || next_read_len > header.len() {
-            return Err(ProtocolError::ProtocolViolation(
-                "incomplete WebTransport bidi stream header after reading required varints"
-                    .to_string(),
-            ));
-        }
-        rx.read_exact(&mut header[read_len..next_read_len])
-            .await
-            .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))?;
-        read_len = next_read_len;
     }
 }
 
@@ -106,26 +103,20 @@ fn encode_webtransport_bidi_header(
 }
 
 fn validate_quic_varint(value: u64) -> Result<(), ProtocolError> {
-    if value > MAX_QUIC_VARINT {
-        return Err(ProtocolError::ProtocolViolation(format!(
-            "QUIC varint value out of range: {value}"
-        )));
-    }
-    Ok(())
+    (value <= MAX_QUIC_VARINT).then_some(()).ok_or_else(|| {
+        ProtocolError::ProtocolViolation(format!("QUIC varint value out of range: {value}"))
+    })
 }
 
 fn encode_quic_varint(value: u64, out: &mut [u8]) -> Result<usize, ProtocolError> {
     validate_quic_varint(value)?;
 
     let len = quic_varint_len_for_value(value);
-    let tag = if len == 1 {
-        0b00_u8
-    } else if len == 2 {
-        0b01_u8
-    } else if len == 4 {
-        0b10_u8
-    } else {
-        0b11_u8
+    let tag = match len {
+        1 => 0b00_u8,
+        2 => 0b01_u8,
+        4 => 0b10_u8,
+        _ => 0b11_u8,
     };
 
     if out.len() < len {
@@ -145,15 +136,13 @@ fn encode_quic_varint(value: u64, out: &mut [u8]) -> Result<usize, ProtocolError
     Ok(len)
 }
 
-fn decode_webtransport_bidi_header_bytes(
-    bytes: &[u8],
-) -> Result<Option<(u64, usize)>, ProtocolError> {
+fn parse_webtransport_bidi_header(bytes: &[u8]) -> Result<BidiHeaderDecode, ProtocolError> {
     let Some(first) = bytes.first().copied() else {
-        return Ok(None);
+        return Ok(BidiHeaderDecode::Incomplete(1));
     };
     let stream_type_len = quic_varint_len_from_first(first);
     if bytes.len() < stream_type_len {
-        return Ok(None);
+        return Ok(BidiHeaderDecode::Incomplete(stream_type_len));
     }
     let stream_type = decode_quic_varint_bytes(&bytes[..stream_type_len])?;
     if stream_type != crate::WEBTRANSPORT_BIDI_STREAM_TYPE {
@@ -164,46 +153,22 @@ fn decode_webtransport_bidi_header_bytes(
     }
 
     let Some(session_first) = bytes.get(stream_type_len).copied() else {
-        return Ok(None);
+        return Ok(BidiHeaderDecode::Incomplete(stream_type_len + 1));
     };
     let session_varint_len = quic_varint_len_from_first(session_first);
     let consumed = stream_type_len + session_varint_len;
     if bytes.len() < consumed {
-        return Ok(None);
+        return Ok(BidiHeaderDecode::Incomplete(consumed));
     }
     let session_id = decode_quic_varint_bytes(&bytes[stream_type_len..consumed])?;
-    Ok(Some((session_id, consumed)))
-}
-
-fn next_webtransport_bidi_header_read_len(bytes: &[u8]) -> Result<usize, ProtocolError> {
-    let Some(first) = bytes.first().copied() else {
-        return Ok(1);
-    };
-    let stream_type_len = quic_varint_len_from_first(first);
-    if bytes.len() < stream_type_len {
-        return Ok(stream_type_len);
-    }
-
-    let stream_type = decode_quic_varint_bytes(&bytes[..stream_type_len])?;
-    if stream_type != crate::WEBTRANSPORT_BIDI_STREAM_TYPE {
-        return Err(ProtocolError::ProtocolViolation(format!(
-            "expected WebTransport bidi stream type {:#x}, got {stream_type:#x}",
-            crate::WEBTRANSPORT_BIDI_STREAM_TYPE
-        )));
-    }
-
-    let Some(session_first) = bytes.get(stream_type_len).copied() else {
-        return Ok(stream_type_len + 1);
-    };
-    Ok(stream_type_len + quic_varint_len_from_first(session_first))
+    Ok(BidiHeaderDecode::Complete(session_id, consumed))
 }
 
 fn decode_quic_varint_bytes(bytes: &[u8]) -> Result<u64, ProtocolError> {
-    let Some(first) = bytes.first().copied() else {
-        return Err(ProtocolError::ProtocolViolation(
-            "empty QUIC varint".to_string(),
-        ));
-    };
+    let first = bytes
+        .first()
+        .copied()
+        .ok_or_else(|| ProtocolError::ProtocolViolation("empty QUIC varint".to_string()))?;
     let len = quic_varint_len_from_first(first);
     if bytes.len() < len {
         return Err(ProtocolError::ProtocolViolation(format!(
@@ -219,14 +184,11 @@ fn decode_quic_varint_bytes(bytes: &[u8]) -> Result<u64, ProtocolError> {
 }
 
 fn quic_varint_len_for_value(value: u64) -> usize {
-    if value < (1 << 6) {
-        1
-    } else if value < (1 << 14) {
-        2
-    } else if value < (1 << 30) {
-        4
-    } else {
-        8
+    match value {
+        0..=0x3f => 1,
+        0x40..=0x3fff => 2,
+        0x4000..=0x3fff_ffff => 4,
+        _ => 8,
     }
 }
 
@@ -244,13 +206,24 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn decode(bytes: &[u8]) -> Option<(u64, usize)> {
+        match parse_webtransport_bidi_header(bytes).unwrap() {
+            BidiHeaderDecode::Complete(session_id, consumed) => Some((session_id, consumed)),
+            BidiHeaderDecode::Incomplete(_) => None,
+        }
+    }
+
+    fn assert_decodes(bytes: &[u8], expected: Option<(u64, usize)>) {
+        assert_eq!(decode(bytes), expected);
+    }
+
     proptest! {
         #[test]
         fn webtransport_bidi_header_roundtrips_any_valid_session_id(
             session_id in 0..=MAX_QUIC_VARINT,
         ) {
             let header = WebTransportBidiHeader::new(session_id).unwrap();
-            let decoded = decode_webtransport_bidi_header_bytes(header.as_slice()).unwrap();
+            let decoded = decode(header.as_slice());
             prop_assert_eq!(decoded, Some((session_id, header.as_slice().len())));
         }
     }
@@ -296,54 +269,33 @@ mod tests {
 
     #[test]
     fn webtransport_bidi_header_decodes_common_prefix_without_extra_bytes() {
-        assert_eq!(
-            decode_webtransport_bidi_header_bytes(&[0x40, 0x41, 0x00]).unwrap(),
-            Some((0, 3))
-        );
+        assert_decodes(&[0x40, 0x41, 0x00], Some((0, 3)));
     }
 
     #[test]
     fn webtransport_bidi_header_decodes_non_minimal_stream_type_varints() {
-        assert_eq!(
-            decode_webtransport_bidi_header_bytes(&[0x80, 0x00, 0x00, 0x41, 0x00]).unwrap(),
-            Some((0, 5))
-        );
-        assert_eq!(
-            decode_webtransport_bidi_header_bytes(&[
-                0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00,
-            ])
-            .unwrap(),
-            Some((0, 9))
+        assert_decodes(&[0x80, 0x00, 0x00, 0x41, 0x00], Some((0, 5)));
+        assert_decodes(
+            &[0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00],
+            Some((0, 9)),
         );
     }
 
     #[test]
     fn webtransport_bidi_header_waits_for_non_minimal_stream_type_bytes() {
-        assert_eq!(
-            decode_webtransport_bidi_header_bytes(&[0x80, 0x00, 0x00]).unwrap(),
-            None
-        );
-        assert_eq!(
-            decode_webtransport_bidi_header_bytes(&[0x80, 0x00, 0x00, 0x41]).unwrap(),
-            None
-        );
+        assert_decodes(&[0x80, 0x00, 0x00], None);
+        assert_decodes(&[0x80, 0x00, 0x00, 0x41], None);
     }
 
     #[test]
     fn webtransport_bidi_header_waits_for_wide_session_id_bytes() {
-        assert_eq!(
-            decode_webtransport_bidi_header_bytes(&[0x40, 0x41, 0x7f]).unwrap(),
-            None
-        );
-        assert_eq!(
-            decode_webtransport_bidi_header_bytes(&[0x40, 0x41, 0x7f, 0xff]).unwrap(),
-            Some((0x3fff, 4))
-        );
+        assert_decodes(&[0x40, 0x41, 0x7f], None);
+        assert_decodes(&[0x40, 0x41, 0x7f, 0xff], Some((0x3fff, 4)));
     }
 
     #[test]
     fn webtransport_bidi_header_rejects_wrong_stream_type_prefix() {
-        let error = decode_webtransport_bidi_header_bytes(&[0x00, 0x41, 0x00]).unwrap_err();
+        let error = parse_webtransport_bidi_header(&[0x00, 0x41, 0x00]).unwrap_err();
 
         assert!(matches!(error, ProtocolError::ProtocolViolation(_)));
     }

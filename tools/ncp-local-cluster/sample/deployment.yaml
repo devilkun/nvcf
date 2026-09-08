@@ -21,8 +21,29 @@ spec:
         usage: workload
       containers:
       - name: sample
-        image: sample # This will be transformed by Kustomize
-        command: ["sh", "-c"]
-        args: ["while true; do echo \"Still healthy at $(date)\"; sleep 10; done"]
+        image: sample # Transformed by render-sample.sh
+        args:
+          - netexec
+          - --http-port=8080
         ports:
-        - containerPort: 80 
+        - name: http
+          containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 2
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi

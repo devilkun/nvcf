@@ -4,6 +4,10 @@ NVCF supports several optional components that can enhance your deployment's
 performance, routing, and GPU cluster capabilities. Each component has its own
 installation and configuration guide.
 
+## Pod Disruption Budgets
+
+- [Pod Disruption Budgets](pod-disruption-budgets.md) - Protect stateful infrastructure and control-plane services from simultaneous voluntary evictions during node drains and cluster upgrades
+
 ## Low-Latency Streaming
 
 - [LLS Installation](lls-installation.md) - Required for streaming Cloud Functions using WebRTC
@@ -30,6 +34,19 @@ service and exposed through the Gateway API route `vanity.<domain>` by default.
 Enable it only when you need a vanity routing layer. Standard API, API Keys,
 invocation, LLM invocation, and gRPC routes do not require it. See
 [Gateway Routing](./gateway-routing.md#vanity-gateway-optional) for routing and
+verification details.
+
+## NVCF UI
+
+NVCF UI is an optional addon that deploys a customer-facing NVCF admin-panel UI. 
+It is available only in stack packages that include the
+NVCF UI addon. Older packages do not contain the `nvcf-ui` release
+or route values.
+
+When the addon is present and enabled, it is deployed as the `nvcf-ui`
+service and exposed through the Gateway API route `nvcf-ui.<domain>` by default.
+See [Enabling NVCF UI](./nvcf-ui.md) for the enablement steps and
+[Gateway Routing](./gateway-routing.md#nvcf-ui-optional) for routing and
 verification details.
 
 ## Physical Simulation Caches

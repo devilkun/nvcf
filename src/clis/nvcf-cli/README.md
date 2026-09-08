@@ -27,6 +27,8 @@ limitations under the License.
 - **Advanced gRPC Support**: Native gRPC invocation with `--grpc` flag
 - **Comprehensive Authentication**: Multi-token support with automatic scope management
 - **Simple Architecture**: Everything works via direct HTTPS - no cluster access required
+- **NVCT Task Support**: First-class commands for NVIDIA Cloud Tasks (`nvcf-cli task ...`)
+- **Cluster Diagnostics**: One-command health report and support bundle for self-managed deployments (`nvcf-cli cluster-dump`)
 
 **[Jump to Token Generation Guide](#automatic-token-generation-)**
 
@@ -617,6 +619,17 @@ export NVCF_TOKEN="nvapi-your-function-creation-token"
   --inference-port 8000 \
   --function-type "LLM" \
   --llm-model "name=dummy-model,uris=/v1/chat/completions|/v1/responses|/v1/embeddings,routingMethod=round_robin,tokenRateLimit=1000-S"
+
+# Create an LLM function with request priority
+./nvcf-cli function create \
+  --name "my-priority-llm-function" \
+  --image "nvcr.io/example/openai-compatible:latest" \
+  --inference-url "/" \
+  --inference-port 8000 \
+  --function-type "LLM" \
+  --llm-model "name=dummy-model,uris=/v1/chat/completions" \
+  --llm-default-priority 7 \
+  --llm-per-account-priority "nca-id:3"
 ```
 
 **Required flags:**
@@ -743,6 +756,13 @@ export NVCF_API_KEY="nvapi-your-general-operations-token"  # optional fallback
   --function-id "func-12345678-1234-1234-1234-123456789abc" \
   --version-id "ver-12345678-1234-1234-1234-123456789abc" \
   --llm-model-update "name=dummy-model,routingMethod=round_robin,tokenRateLimit=1000-S"
+
+# Replace the function-level request priority configuration
+./nvcf-cli function update \
+  --function-id "func-12345678-1234-1234-1234-123456789abc" \
+  --version-id "ver-12345678-1234-1234-1234-123456789abc" \
+  --llm-default-priority 7 \
+  --llm-per-account-priority "nca-id:3"
 
 # Update function deployment specifications
 ./nvcf-cli function deploy update \
@@ -1472,6 +1492,99 @@ export NVCF_TOKEN="your-existing-token"
 
 ---
 
+## **Cloud Tasks (NVCT)**
+
+The CLI also speaks to the NVIDIA Cloud Tasks (NVCT) service for managing
+GPU-backed batch jobs. NVCT commands live under `nvcf-cli task` and reuse the
+same authentication, state, and config conventions as the function commands.
+
+### **Configuration**
+
+NVCT requests are sent to a dedicated base URL, configurable via:
+
+| Source | Key |
+| --- | --- |
+| Environment variable | `NVCF_BASE_NVCT_URL` |
+| Config file (`~/.nvcf-cli.yaml`) | `base_nvct_url` |
+| Default | `https://api.nvct.nvidia.com` |
+
+Task commands authenticate with an NVCT-scoped API key, separate from the
+function key. `nvcf-cli api-key generate` mints both keys by default:
+
+```bash
+nvcf-cli api-key generate
+```
+
+The task key is saved as `NVCF_NVCT_API_KEY` and used automatically for all
+`nvcf-cli task` subcommands. Use `--for task` if you only want the task key.
+
+### **Command Surface**
+
+| Command | Endpoint | Notes |
+| --- | --- | --- |
+| `task create` | `POST /v1/nvct/tasks` | Launches a task. Saves Task ID to state. |
+| `task list` | `GET /v1/nvct/tasks` | Optional `--status`, `--limit`, `--cursor`. |
+| `task bulk` | `POST /v1/nvct/tasks/bulk` | Basic details for an explicit ID set. |
+| `task get [id]` | `GET /v1/nvct/tasks/{id}` | Falls back to saved task. `--include-secrets`. |
+| `task delete [id]` | `DELETE /v1/nvct/tasks/{id}` | Falls back to saved task. |
+| `task cancel [id]` | `POST /v1/nvct/tasks/{id}/cancel` | Falls back to saved task. |
+| `task events [id]` | `GET /v1/nvct/tasks/{id}/events` | Paginated. |
+| `task results [id]` | `GET /v1/nvct/tasks/{id}/results` | Paginated. |
+| `task update-secrets [id]` | `PUT /v1/nvct/secrets/tasks/{id}` | Replace user secrets. |
+
+### **Quickstart**
+
+```bash
+# Launch a task from a JSON spec (saves taskId to state)
+nvcf-cli task create --input-file examples/create-task.json
+
+# Inline alternative
+nvcf-cli task create \
+  --name my-job \
+  --gpu H100 --instance-type GPU.H100_1x --backend GFN \
+  --image nvcr.io/.../my-image:latest \
+  --container-args "--epochs 10" \
+  --container-env LOG_LEVEL=INFO \
+  --max-runtime PT4H
+
+# List, watch, and inspect using saved task context
+nvcf-cli task list --status RUNNING
+nvcf-cli task get
+nvcf-cli task events
+nvcf-cli task results
+
+# Rotate task secrets
+nvcf-cli task update-secrets --secrets NGC_API_KEY=nvapi-... HF_TOKEN=hf_...
+
+# Cancel and delete
+nvcf-cli task cancel
+nvcf-cli task delete
+
+# JSON automation output
+nvcf-cli --json task list --status RUNNING
+```
+
+### **JSON Input Files**
+
+Sample configs live under [`examples/`](./examples):
+
+- [`examples/create-task.json`](./examples/create-task.json) — minimal create
+- [`examples/create-task-with-results.json`](./examples/create-task-with-results.json) — UPLOAD strategy with NGC secret
+- [`examples/create-task-helm.json`](./examples/create-task-helm.json) — Helm chart based task
+- [`examples/update-task-secrets.json`](./examples/update-task-secrets.json) — secret rotation payload
+- [`examples/bulk-tasks.json`](./examples/bulk-tasks.json) — bulk task ID lookup payload
+
+### **Required vs Optional Fields**
+
+`task create` requires `name`, `gpuSpecification.gpu`, and
+`gpuSpecification.instanceType`. When `resultHandlingStrategy=UPLOAD`,
+`resultsLocation` becomes required and the user must supply an `NGC_API_KEY`
+secret with write privileges to that location. See the
+[OpenAPI specification](../../../docs/user/api.md#openapi-specification) for
+the full field reference.
+
+---
+
 ## Admin Commands
 
 The CLI ships with a set of super-admin commands for operators of the
@@ -1547,6 +1660,259 @@ export NVCF_TOKEN=fake-admin-jwt
 export NVCF_CLI_ENABLE_ADMIN=1
 nvcf-cli admin accounts list --json
 ```
+
+---
+
+## Cluster Agent Inspection
+
+The `cluster agent` commands let operators inspect the NVCF cluster agent (NVCA)
+running on a compute-plane cluster. They are read-only and read the
+`NVCFBackend` and `ICMSRequest` custom resources directly from the target
+cluster, so they work like `kubectl`: select the cluster with a kube context.
+
+### Selecting the cluster
+
+Use `--compute-plane-context` to choose the kube context for the target cluster.
+Standard kubeconfig resolution applies: `--kubeconfig`, then `KUBECONFIG`, then
+`~/.kube/config`.
+
+```bash
+nvcf-cli cluster agent status --compute-plane-context edge-cluster-1
+```
+
+### Commands
+
+| Command | What it does |
+| :---- | :---- |
+| `cluster agent status` | NVCA version, agent health, and GPU usage for the cluster, with optional control-plane (SIS) enrichment. |
+| `cluster agent list-functions` | Function versions scheduled on the cluster, with instance counts and a phase. |
+| `cluster agent get-function <function-id> [version-id]` | Detailed state for one scheduled function version, including its instances. |
+
+All commands support `--json` for automation.
+
+### Function phases
+
+The NVCA tracks eight granular request statuses. `list-functions` collapses them
+into three user-facing phases:
+
+| Phase | Meaning |
+| :---- | :---- |
+| `DEPLOYING` | Request pending or in progress (caching, instance creation). |
+| `ACTIVE` | Request completed and acknowledged. |
+| `DRAINING` | Cluster draining, a termination request, or instances winding down. |
+| `FAILED` | Request failed or failure acknowledged. |
+
+Use `--phase` to filter to one of `ACTIVE`, `DEPLOYING`, `DRAINING`, or `FAILED`.
+
+A termination request never carries its own function ID or version ID; NVCA
+relays it verbatim from the upstream message. `list-functions` and
+`get-function` recover it by correlating the termination request's instance
+IDs against every other same-namespace `ICMSRequest`'s instances. `list-functions`
+omits a `DRAINING` record when identity cannot be recovered this way, rather
+than showing one with empty IDs.
+
+### Authentication
+
+`status`, `list-functions`, and `get-function` read from the cluster's
+Kubernetes API and rely on the kube context's RBAC; no NVCF token is required.
+
+`status` can additionally enrich its output with the control-plane (SIS) view of
+the cluster. That enrichment requires `--nca-id` and `NVCF_TOKEN` with the
+`cluster-management` scope. It is strictly additive: when the token or `--nca-id`
+is missing, or SIS has no data, `status` prints the cluster-derived fields and
+notes that the control-plane view was skipped, rather than failing.
+
+### Examples
+
+```bash
+# NVCA status as a table
+nvcf-cli cluster agent status --compute-plane-context edge-1
+
+# Status with control-plane enrichment
+export NVCF_TOKEN=${YOUR_ADMIN_JWT}
+nvcf-cli cluster agent status --compute-plane-context edge-1 --nca-id nca-123
+
+# Show only functions still draining during maintenance
+nvcf-cli cluster agent list-functions --compute-plane-context edge-1 --phase DRAINING
+
+# Detailed state for one function version, as JSON
+nvcf-cli cluster agent get-function func-abc ver-def --compute-plane-context edge-1 --json
+```
+
+## Cluster Agent Maintenance
+
+The maintenance commands mutate the cluster. They select the cluster the same way
+as the inspection commands (`--compute-plane-context`, then `--kubeconfig` /
+`KUBECONFIG` / `~/.kube/config`) and read the `NVCFBackend` CR to discover the
+cluster identity and the system and requests namespaces.
+
+| Command | What it does |
+| :---- | :---- |
+| `cluster agent cordon-and-drain` (alias `drain`) | Put the cluster into CordonAndDrain maintenance: stop new deployments, let in-flight requests finish, and drain instances to zero. |
+| `cluster agent uncordon` (alias `undrain`) | Reverse a drain and re-enable the cluster. |
+| `cluster agent kill-function <function-id> [version-id]` | Force-terminate one function version (all versions when version-id is omitted). |
+| `cluster agent kill-all` | Force-terminate every function on the cluster. |
+
+### How drain works
+
+`cordon-and-drain` adds the `CordonAndDrainMaintenance` feature flag to the
+`NVCFBackend` CR's `spec.overrides.featureGate.values`. `uncordon` removes it.
+The CLI never edits the NVCA `agent-config` ConfigMap or restarts the NVCA
+deployment directly: the NVCA operator treats `agent-config` as fully
+generated from the CR and reverts any direct edit on its next reconcile, so
+the CLI's job is only to submit the desired state and let the operator's own
+reconcile regenerate `agent-config` and roll NVCA out. The command returns
+once the CR update is accepted and (unless `--force` or `--timeout 0`) the
+operator's rollout has completed; it does not wait for every instance to
+reach zero. Watch progress with `cluster agent list-functions --phase
+DRAINING`. `--timeout` bounds the wait for the operator's rollout (default
+5m); `--force` or `--timeout 0` skip the wait entirely and return right after
+the CR update, leaving the operator's reconciliation to finish
+asynchronously. A timeout is reported as a warning because the CR change is
+already persisted and re-running is a no-op.
+
+`--force` only affects a run that changes the NVCFBackend CR; it has no
+effect when the CR is already in the requested state. In an earlier version
+of this command, `--force` also retriggered the NVCA restart directly, so it
+could be used to kick a stuck rollout even without a state change. The CLI no
+longer performs that restart; the NVCA operator's own reconcile owns it, so
+there is nothing left for `--force` to retrigger once the CR already matches
+the desired state.
+
+### How kill works
+
+`kill-function` and `kill-all` terminate the matching `ICMSRequest`'s
+instances directly (deleting the Pod for a container function, or the
+`MiniService` object for a Helm function), mark them terminated on the CR,
+then delete the CR. Deleting the CR alone never evicts the workload: NVCA's
+reconciler only clears the CR's finalizer once its own `status.instances`
+shows every instance gone and reported terminated, and nothing else in NVCA
+ever produces that for a CLI-initiated kill. Performing the eviction and
+status update directly satisfies that precondition, so NVCA's own reconcile
+clears the finalizer on its next pass. The command polls for the CR to
+actually disappear before reporting success: a request removed within
+`--timeout` (default 60s) is reported `deleted`, and one still present when
+the timeout elapses is reported `terminating` instead, with a non-zero exit
+code. `--force` additionally strips finalizers so a request stuck
+`Terminating` is removed even when NVCA is not running to process its
+finalizer.
+
+### Confirmation and safety
+
+`cordon-and-drain`, `uncordon`, and `kill-function` prompt for a `y/N`
+confirmation; pass `--yes` to skip it in automation.
+
+`kill-all` is higher impact. It prints the affected function ids first and then
+requires you to type the cluster name to confirm; there is no plain `--yes` bypass.
+For automation, pass both `--yes` and `--confirm <cluster-name>` matching the
+connected cluster. When the cluster has no name, it falls back to the cluster id.
+
+All maintenance commands accept `--dry-run` to preview without mutating, and
+`--expect-cluster-id <id>` to refuse to act unless the connected cluster's id or
+name matches (guards against a wrong `--compute-plane-context`). `kill-function`
+and `kill-all` accept `--reason` for an audit note, `--timeout` to bound how
+long to wait for NVCA to finish evicting a terminated request (default 60s),
+and `--json` for automation.
+
+These commands need write access to the target cluster: list/update on the
+`NVCFBackend` CR for drain (plus read access to the `agent-config` ConfigMap
+and the `nvca` Deployment, to wait for the NVCA operator's rollout), and for
+kill, list/delete (and update, with `--force`) on `ICMSRequest` CRs, update on
+the `ICMSRequest` status subresource, delete on Pods in the requests
+namespace, and delete on `MiniService` CRs (cluster-scoped).
+
+### Examples
+
+```bash
+# Preview a drain, then drain for real
+nvcf-cli cluster agent cordon-and-drain --compute-plane-context edge-1 --dry-run
+nvcf-cli cluster agent cordon-and-drain --compute-plane-context edge-1
+
+# Re-enable the cluster
+nvcf-cli cluster agent uncordon --compute-plane-context edge-1
+
+# Force-terminate one function version
+nvcf-cli cluster agent kill-function func-abc ver-def --compute-plane-context edge-1 --yes
+
+# Wipe every function on the cluster (CI/automation form)
+nvcf-cli cluster agent kill-all --compute-plane-context edge-1 --yes --confirm <cluster-name>
+```
+
+---
+
+## Cluster Diagnostics (`cluster-dump`)
+
+`nvcf-cli cluster-dump` collects a diagnostic snapshot of a self-managed NVCF
+deployment across the control-plane and compute-plane clusters in one command.
+It is the operator equivalent of a must-gather: run it to triage an issue, or to
+produce a support bundle to share with NVIDIA.
+
+The default report prints to stdout and covers, per plane:
+
+- Kubernetes version and a per-node table (ready, cordoned, Memory/Disk/PID
+  pressure, roles, GPU count, version, age)
+- Helm releases, flagging any not in the `deployed` state
+- Every pod with its ready state, status, restart count, and age
+- Recent warning events
+- Compute plane only: the NVCFBackend custom resource, GPU reconciliation
+  (NVCFBackend reported capacity/allocated vs node capacity and MiniService
+  reservations), ICMSRequest triage (with failed requests flagged), and any
+  namespaces stuck Terminating (read-only finalizer diagnosis)
+
+Every probe degrades to a per-plane warning rather than aborting, so a partially
+broken cluster still produces a useful report.
+
+### Selecting clusters
+
+```bash
+# Both planes
+nvcf-cli cluster-dump --control-plane-context k3d-ncp-local-cp \
+  --compute-plane-context k3d-ncp-local-compute-1
+
+# Control plane only (single-cluster); defaults to the current kube context
+nvcf-cli cluster-dump --control-plane-context k3d-ncp-local-cp
+
+# Compute plane only
+nvcf-cli cluster-dump --compute-only --compute-plane-context k3d-ncp-local-compute-1
+```
+
+### Support bundle
+
+Add `--bundle <path>` to also write a full bundle. A path ending in `.tar.gz` or
+`.tgz` writes a single archive; any other path writes a directory tree. On top of
+the report, the bundle adds raw artifacts: per-namespace resource manifests,
+bounded pod logs (current and previous), and helm manifest/values. It also
+writes `dump.json`, a `summary.txt`, and a collated `upload.txt` you can attach
+to a support ticket.
+
+```bash
+# Archive (best for sharing)
+nvcf-cli cluster-dump --control-plane-context cp --compute-plane-context co \
+  --bundle ./nvcf-support.tar.gz
+
+# Directory tree
+nvcf-cli cluster-dump --control-plane-context cp --compute-plane-context co \
+  --bundle ./nvcf-dump
+```
+
+### Redaction and tuning
+
+Secret values are masked by default. Captured Secret data, Secret documents in
+rendered helm manifests, and helm values under sensitive keys are masked before
+anything is written to disk.
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--bundle <path>` | (off) | Write a support bundle (`.tar.gz`/`.tgz` archive, else a directory) |
+| `--compute-only` | `false` | Collect only the compute plane |
+| `--redact` | `secrets` | Redaction level: `secrets`, `none`, or `all` |
+| `--include` | all | Limit heavy bundle artifacts (advanced): `resources,logs,helm` |
+| `--log-tail` | `2000` | Max log lines per container in the bundle |
+| `--max-log-bytes` | `1048576` | Max log bytes per container in the bundle |
+| `--output` / `--json` | stdout text | Write the report to a file / emit JSON |
+
+The report is also available as JSON (`--json` or a `.json --output` extension),
+which carries `nodeDetails`, `gpu`, `icmsRequests`, and `stuckNamespaces`.
 
 ---
 

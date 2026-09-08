@@ -16,9 +16,7 @@
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
 metadata:
-  name: dynamo-operator-test
-  annotations:
-    nvidia.com/dynamo-discovery-backend: etcd
+  name: myllm
 spec:
   services:
     Frontend:
@@ -36,9 +34,13 @@ spec:
       resources:
         {{- . | toYaml | nindent 8 }}
       {{- end }}
+      {{- if gt (int .Values.frontend.nodeCount) 1 }}
+      multinode:
+        nodeCount: {{ .Values.frontend.nodeCount }}
+      {{- end }}
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.9.0
+          image: {{ .Values.frontend.image }}
       envs:
         - name: DYN_ROUTER_MODE
           value: kv
@@ -52,15 +54,18 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       componentType: worker
-      replicas: {{ .Values.vllmDecodeWorker.replicas | default 2 }}
+      {{- with $worker := .Values.vllmDecodeWorker }}
+      replicas: {{ $worker.replicas | default 1 }}
+      {{- if gt (int $worker.nodeCount) 1 }}
+      multinode:
+        nodeCount: {{ $worker.nodeCount }}
+      {{- end }}
       resources:
-        {{- (required "vllmDecodeWorker.resources must be set" .Values.vllmDecodeWorker.resources) | toYaml | nindent 8 }}
-      envs:
-      - name: HF_TOKEN
-        value: {{ .Values.env.HF_TOKEN }}
+        {{- (required "vllmDecodeWorker.resources must be set" $worker.resources) | toYaml | nindent 8 }}
+      envFromSecret: hf-token-secret
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.9.0
+          image: {{ $worker.image }}
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3
@@ -69,7 +74,11 @@ spec:
           args:
           - --model
           - Qwen/Qwen3-0.6B
-          - --is-decode-worker
+          - --disaggregation-mode
+          - decode
+          - --tensor-parallel-size
+          - {{ mul (default 1 (int $worker.nodeCount)) (default 1 (int $worker.resources.limits.gpu)) | quote }}
+      {{- end }}
     VllmPrefillWorker:
       {{- with .Values.annotations }}
       annotations:
@@ -80,15 +89,18 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       componentType: worker
-      replicas: {{ .Values.vllmPrefillWorker.replicas | default 2 }}
+      {{- with $worker := .Values.vllmPrefillWorker }}
+      replicas: {{ $worker.replicas | default 1 }}
+      {{- if gt (int $worker.nodeCount) 1 }}
+      multinode:
+        nodeCount: {{ $worker.nodeCount }}
+      {{- end }}
       resources:
-        {{- (required "vllmPrefillWorker.resources must be set" .Values.vllmPrefillWorker.resources) | toYaml | nindent 8 }}
-      envs:
-      - name: HF_TOKEN
-        value: {{ .Values.env.HF_TOKEN }}
+        {{- (required "vllmPrefillWorker.resources must be set" $worker.resources) | toYaml | nindent 8 }}
+      envFromSecret: hf-token-secret
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.9.0
+          image: {{ $worker.image }}
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3
@@ -97,4 +109,12 @@ spec:
           args:
           - --model
           - Qwen/Qwen3-0.6B
-          - --is-prefill-worker
+          - --disaggregation-mode
+          - prefill
+          - --tensor-parallel-size
+          - {{ mul (default 1 (int $worker.nodeCount)) (default 1 (int $worker.resources.limits.gpu)) | quote }}
+          - --kv-transfer-config
+          - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+          - --kv-events-config
+          - '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}'
+      {{- end }}

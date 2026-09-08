@@ -14,7 +14,9 @@
 # limitations under the License.
 
 target
-.git
+# Keep Git metadata in the build context for the binary-builder's read-only
+# source-context mount. When present, it is linked only for Cargo's build
+# metadata collection and never copied into an image layer.
 .cursor
 .vscode
 plans

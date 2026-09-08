@@ -31,7 +31,8 @@ secrets_path: "local_env/vault/secrets.json"
 tracing_key: ""
 nvcf_api:
   oauth2_token_api_address: ""
-  nvcf_api_address: "http://localhost:8082"
+  oauth2_token_scope: "autoscaler:auth"
+  nvcf_api_grpc_address: "http://localhost:50051"
   disable_auth: true
   dry_run: true
 cassandra:
@@ -62,7 +63,6 @@ scaling:
   discover_new_functions_interval_seconds: 30
   lookback_seconds: 600
   decay_factor: 0.1
-  accounts_without_worker_metrics: ""
   policy:
     type: Static
     settings:

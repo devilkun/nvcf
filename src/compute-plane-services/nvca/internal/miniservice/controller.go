@@ -61,8 +61,10 @@ import (
 	nvcav1alpha1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
 	nvcav2beta1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/miniservice"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
+	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/profiling"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
@@ -120,6 +122,9 @@ type ControllerOptions struct {
 	CustomAnnotations *sync.Map
 	// Kartas are live Karta objects from the cluster, to include in status checkers.
 	Kartas []*kartav1alpha1.Karta
+	// NsightProfilingAllowlist tracks which functions should have NVIDIA Nsight GPU
+	// profiling enabled. Shared with BackendK8sCache.
+	NsightProfilingAllowlist *profiling.Allowlist
 
 	// Internal use.
 	cacheDir string
@@ -131,6 +136,8 @@ type registrationInstanceTypeCache interface {
 }
 
 const (
+	controllerName = "miniservice-controller"
+
 	defaultCacheDir = "/var/run/nvca/reval-rendered-helmcharts"
 )
 
@@ -180,15 +187,14 @@ func BuildController(ctx context.Context,
 		tracer:            otel.NewTracer(),
 		Decoder:           newFlexibleDecoder(mgr.GetScheme(), extraGVKs...),
 		NFClient:          nflient,
-		eventRecorder:     mgr.GetEventRecorderFor("miniservice-controller"),
+		eventRecorder:     mgr.GetEventRecorderFor(controllerName),
 		chartCache:        chartcache.New(opts.cacheDir),
 		regITCache:        regITCache,
 		enabledAttrs:      enabledAttrs,
 		gvkCache:          gvkc,
 		now:               time.Now,
 		newImpersonatingClient: func(namespace string) (client.Client, error) {
-			const userNameFormat = "system:serviceaccount:%s:" + serviceAccountName
-			username := fmt.Sprintf(userNameFormat, namespace)
+			username := miniservice.InstanceServiceAccountUsername(namespace)
 			cfg := rest.CopyConfig(mgr.GetConfig())
 			cfg.Impersonate = rest.ImpersonationConfig{UserName: username}
 			c, err := client.New(cfg, client.Options{
@@ -199,7 +205,8 @@ func BuildController(ctx context.Context,
 			}
 			return c, err
 		},
-		newPermissionsChecker: newSelfSubjectAccessReviewPermissionsChecker,
+		newPermissionsChecker:             newSelfSubjectAccessReviewPermissionsChecker,
+		failedWorkloadUpdateRevisionCache: map[string]error{},
 	}
 
 	if r.regITCache == nil {
@@ -410,7 +417,7 @@ func (r *Reconciler) newNVLinkOptMetricsRunnable(mgr ctrl.Manager) manager.Runna
 	})
 }
 
-// updateNVLinkOptMetrics is a helper for the NVLink opt metrics runnable that actuall updates metrics.
+// updateNVLinkOptMetrics is a helper for the NVLink opt metrics runnable that actually updates metrics.
 func (r *Reconciler) updateNVLinkOptMetrics(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 

@@ -16,7 +16,8 @@
 use std::time::Duration;
 
 use crate::statistics::{
-    NoiseClassification, classify_noise, summarize_distribution, upper_nearest_rank_index,
+    DistributionStats, NoiseClassification, classify_noise, summarize_distribution,
+    upper_nearest_rank_index,
 };
 
 use super::{
@@ -29,12 +30,12 @@ pub(super) fn summarize_aggregates(
     noise_threshold_cv: f64,
 ) -> Vec<TransportAggregateSummary> {
     [
-        TransportKind::CustomProtocol,
-        TransportKind::Http3H3Quinn,
-        TransportKind::WebTransportH3Quinn,
+        (TransportKind::RawQuic, 11),
+        (TransportKind::Http3H3Quinn, 17),
+        (TransportKind::WebTransportH3Quinn, 23),
     ]
     .into_iter()
-    .filter_map(|transport| {
+    .filter_map(|(transport, seed)| {
         let transport_runs = runs
             .iter()
             .filter(|run| run.transport == transport)
@@ -42,93 +43,73 @@ pub(super) fn summarize_aggregates(
         if transport_runs.is_empty() {
             return None;
         }
-        let seed = match transport {
-            TransportKind::CustomProtocol => 11,
-            TransportKind::Http3H3Quinn => 17,
-            TransportKind::WebTransportH3Quinn => 23,
-        };
-        let throughput_rps = summarize_distribution(
-            &transport_runs
-                .iter()
-                .map(|run| run.summary.throughput_rps)
-                .collect::<Vec<_>>(),
-            seed,
-        );
+        let throughput_rps = summarize_runs(&transport_runs, seed, |run| {
+            Some(run.summary.throughput_rps)
+        });
         let classification = classify_noise(&throughput_rps, noise_threshold_cv);
         Some(TransportAggregateSummary {
             transport,
             trial_count: transport_runs.len(),
             classification,
             throughput_rps,
-            goodput_mib_s: summarize_distribution(
-                &transport_runs
-                    .iter()
-                    .map(|run| run.summary.goodput_mib_s)
-                    .collect::<Vec<_>>(),
-                seed + 1,
-            ),
-            latency_p95_us: summarize_distribution(
-                &transport_runs
-                    .iter()
-                    .filter_map(|run| run.summary.latency_us.p95.map(|value| value as f64))
-                    .collect::<Vec<_>>(),
-                seed + 2,
-            ),
-            response_headers_p95_us: summarize_distribution(
-                &transport_runs
-                    .iter()
-                    .filter_map(|run| {
-                        run.summary
-                            .response_headers_us
-                            .p95
-                            .map(|value| value as f64)
-                    })
-                    .collect::<Vec<_>>(),
-                seed + 3,
-            ),
-            first_body_p95_us: summarize_distribution(
-                &transport_runs
-                    .iter()
-                    .filter_map(|run| run.summary.first_body_us.p95.map(|value| value as f64))
-                    .collect::<Vec<_>>(),
-                seed + 4,
-            ),
+            goodput_mib_s: summarize_runs(&transport_runs, seed + 1, |run| {
+                Some(run.summary.goodput_mib_s)
+            }),
+            latency_p95_us: summarize_runs(&transport_runs, seed + 2, |run| {
+                run.summary.latency_us.p95.map(|value| value as f64)
+            }),
+            response_headers_p95_us: summarize_runs(&transport_runs, seed + 3, |run| {
+                run.summary
+                    .response_headers_us
+                    .p95
+                    .map(|value| value as f64)
+            }),
+            first_body_p95_us: summarize_runs(&transport_runs, seed + 4, |run| {
+                run.summary.first_body_us.p95.map(|value| value as f64)
+            }),
         })
     })
     .collect()
+}
+
+fn summarize_runs(
+    runs: &[&TransportRunOutcome],
+    seed: u64,
+    value: impl Fn(&TransportRunOutcome) -> Option<f64>,
+) -> DistributionStats {
+    summarize_distribution(
+        &runs.iter().filter_map(|run| value(run)).collect::<Vec<_>>(),
+        seed,
+    )
 }
 
 pub(super) fn summarize_comparisons(
     aggregates: &[TransportAggregateSummary],
     min_effect_size_percent: f64,
 ) -> Vec<TransportComparisonSummary> {
-    let baseline = aggregates
+    let Some(baseline) = aggregates
         .iter()
-        .find(|aggregate| aggregate.transport == TransportKind::CustomProtocol);
-    let Some(baseline) = baseline else {
+        .find(|aggregate| aggregate.transport == TransportKind::RawQuic)
+    else {
         return Vec::new();
     };
 
     aggregates
         .iter()
-        .filter(|candidate| candidate.transport != TransportKind::CustomProtocol)
+        .filter(|candidate| candidate.transport != TransportKind::RawQuic)
         .map(|candidate| {
-            let throughput_delta_percent =
-                match (baseline.throughput_rps.mean, candidate.throughput_rps.mean) {
-                    (Some(baseline), Some(candidate)) if baseline.abs() > f64::EPSILON => {
-                        Some((candidate - baseline) / baseline * 100.0)
-                    }
-                    _ => None,
-                };
-            let confidence_intervals_overlap = match (
-                &baseline.throughput_rps.mean_ci_95,
-                &candidate.throughput_rps.mean_ci_95,
-            ) {
-                (Some(left), Some(right)) => {
-                    Some(left.lower <= right.upper && right.lower <= left.upper)
-                }
-                _ => None,
-            };
+            let throughput_delta_percent = baseline
+                .throughput_rps
+                .mean
+                .zip(candidate.throughput_rps.mean)
+                .filter(|(baseline, _)| baseline.abs() > f64::EPSILON)
+                .map(|(baseline, candidate)| (candidate - baseline) / baseline * 100.0);
+            let confidence_intervals_overlap = baseline
+                .throughput_rps
+                .mean_ci_95
+                .as_ref()
+                .zip(candidate.throughput_rps.mean_ci_95.as_ref())
+                .map(|(left, right)| left.lower <= right.upper && right.lower <= left.upper);
             let classifications_support_comparison = baseline.classification
                 == NoiseClassification::Reliable
                 && candidate.classification == NoiseClassification::Reliable;
@@ -141,7 +122,7 @@ pub(super) fn summarize_comparisons(
             });
 
             TransportComparisonSummary {
-                baseline: TransportKind::CustomProtocol,
+                baseline: TransportKind::RawQuic,
                 candidate: candidate.transport,
                 throughput_delta_percent,
                 min_effect_size_percent,
@@ -157,78 +138,49 @@ pub(super) fn summarize_samples(
     samples: &[RequestSample],
     measured_duration: Duration,
 ) -> TransportRunSummary {
+    let successful = || samples.iter().filter(|sample| sample.ok);
     let success_count = samples.iter().filter(|sample| sample.ok).count();
     let failure_count = samples.len() - success_count;
     let measured_duration_secs = measured_duration.as_secs_f64();
-    let throughput_rps = if measured_duration_secs > 0.0 {
-        success_count as f64 / measured_duration_secs
-    } else {
-        0.0
+    let per_second = |count: usize| {
+        if measured_duration.is_zero() {
+            0.0
+        } else {
+            count as f64 / measured_duration_secs
+        }
     };
-    let transferred_bytes = samples
-        .iter()
-        .filter(|sample| sample.ok)
+    let transferred_bytes = successful()
         .map(|sample| sample.request_bytes + sample.response_bytes)
         .sum::<usize>();
-    let goodput_mib_s = if measured_duration_secs > 0.0 {
-        transferred_bytes as f64 / measured_duration_secs / 1024.0 / 1024.0
-    } else {
-        0.0
-    };
 
     TransportRunSummary {
         transport,
         request_count: samples.len(),
         success_count,
         failure_count,
-        measured_duration_ms: duration_ms(measured_duration),
-        throughput_rps,
-        goodput_mib_s,
-        latency_us: summarize_values(
-            samples
-                .iter()
-                .filter(|sample| sample.ok)
-                .map(|sample| sample.completion_us),
-        ),
+        measured_duration_ms: measured_duration.as_millis().try_into().unwrap_or(u64::MAX),
+        throughput_rps: per_second(success_count),
+        goodput_mib_s: per_second(transferred_bytes) / 1024.0 / 1024.0,
+        latency_us: summarize_values(successful().map(|sample| sample.completion_us)),
         response_headers_us: summarize_values(
-            samples
-                .iter()
-                .filter(|sample| sample.ok)
-                .filter_map(|sample| sample.response_headers_us),
+            successful().filter_map(|sample| sample.response_headers_us),
         ),
-        first_body_us: summarize_values(
-            samples
-                .iter()
-                .filter(|sample| sample.ok)
-                .filter_map(|sample| sample.first_body_us),
-        ),
+        first_body_us: summarize_values(successful().filter_map(|sample| sample.first_body_us)),
     }
 }
 
 fn summarize_values(values: impl Iterator<Item = u64>) -> LatencySummary {
     let mut values = values.collect::<Vec<_>>();
-    if values.is_empty() {
-        return LatencySummary::default();
-    }
     values.sort_unstable();
+    let percentile = |rank| {
+        upper_nearest_rank_index(values.len(), rank).and_then(|index| values.get(index).copied())
+    };
     LatencySummary {
         min: values.first().copied(),
-        p50: percentile(&values, 0.50),
-        p90: percentile(&values, 0.90),
-        p95: percentile(&values, 0.95),
-        p99: percentile(&values, 0.99),
+        p50: percentile(0.50),
+        p90: percentile(0.90),
+        p95: percentile(0.95),
+        p99: percentile(0.99),
         max: values.last().copied(),
     }
-}
-
-fn percentile(sorted_values: &[u64], percentile: f64) -> Option<u64> {
-    if sorted_values.is_empty() {
-        return None;
-    }
-    let index = upper_nearest_rank_index(sorted_values.len(), percentile)?;
-    sorted_values.get(index).copied()
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }

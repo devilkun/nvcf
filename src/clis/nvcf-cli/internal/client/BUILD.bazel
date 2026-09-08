@@ -26,6 +26,7 @@ go_library(
         "queues.go",
         "registry.go",
         "secrets.go",
+        "tasks.go",
     ],
     importpath = "nvcf-cli/internal/client",
     visibility = ["//src/clis/nvcf-cli:__subpackages__"],
@@ -34,6 +35,7 @@ go_library(
         "@com_github_spf13_viper//:viper",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//credentials",
+        "@org_golang_x_oauth2//:oauth2",
         "@org_golang_x_oauth2//clientcredentials",
     ],
 )
@@ -46,11 +48,14 @@ go_test(
         "host_header_transport_test.go",
         "llm_config_test.go",
         "multi_token_transport_test.go",
+        "tasks_test.go",
     ],
     embed = [":client"],
     deps = [
+        "//src/clis/nvcf-cli/internal/state",
         "@com_github_spf13_viper//:viper",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_x_oauth2//:oauth2",
     ],
 )

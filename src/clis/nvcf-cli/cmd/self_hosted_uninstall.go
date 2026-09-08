@@ -100,9 +100,15 @@ func runUninstallDestroy(c *cobra.Command) error {
 		kubeCtx = selfHostedComputePlaneContext
 	}
 
+	stackSource := selfHostedControlPlaneStack
+	stackOCI := builtInControlPlaneStackOCI()
+	if uninstallComputePlane {
+		stackSource = selfHostedComputePlaneStack
+		stackOCI = builtInComputePlaneStackOCI()
+	}
 	resolved, err := selfhosted.ResolveStack(ctx, selfhosted.StackOptions{
-		Source:        selfHostedStack,
-		BuiltInOCIRef: builtInStackOCI(),
+		Source:        stackSource,
+		BuiltInOCIRef: stackOCI,
 	})
 	if err != nil {
 		return fmt.Errorf("resolve stack: %w", err)

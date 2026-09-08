@@ -20,12 +20,24 @@ go_library(
     srcs = ["profile.go"],
     importpath = "nvcf-cli/internal/selfhosted/controlplaneprofile",
     visibility = ["//src/clis/nvcf-cli:__subpackages__"],
-    deps = ["@in_gopkg_yaml_v3//:yaml_v3"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/trustbundle",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
 )
 
 go_test(
-    name = "profile_test",
-    srcs = ["profile_test.go"],
+    name = "controlplaneprofile_test",
+    srcs = [
+        "addons_test.go",
+        "profile_test.go",
+        "trust_test.go",
+    ],
     embed = [":controlplaneprofile"],
-    deps = ["@com_github_stretchr_testify//assert", "@com_github_stretchr_testify//require"],
+    deps = [
+        "//src/clis/nvcf-cli/internal/trustbundle",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
 )

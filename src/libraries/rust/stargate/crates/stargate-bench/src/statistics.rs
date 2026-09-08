@@ -26,7 +26,7 @@ pub struct ConfidenceInterval {
     pub upper: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DistributionStats {
     pub count: usize,
@@ -53,35 +53,29 @@ pub enum NoiseClassification {
 
 pub fn summarize_distribution(values: &[f64], bootstrap_seed: u64) -> DistributionStats {
     if values.is_empty() {
-        return DistributionStats {
-            count: 0,
-            min: None,
-            max: None,
-            mean: None,
-            median: None,
-            mad: None,
-            coefficient_of_variation: None,
-            p90: None,
-            p95: None,
-            p99: None,
-            mean_ci_95: None,
-        };
+        return DistributionStats::default();
     }
 
     let mut sorted = values.to_vec();
     sorted.sort_by(|left, right| left.total_cmp(right));
-    let mean = average(&sorted);
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
     let median = percentile(&sorted, 0.50);
-    let mad = median.map(|median| {
-        let mut deviations = sorted
-            .iter()
-            .map(|value| (value - median).abs())
-            .collect::<Vec<_>>();
-        deviations.sort_by(|left, right| left.total_cmp(right));
-        percentile(&deviations, 0.50).unwrap_or(0.0)
-    });
+    let mut deviations = sorted
+        .iter()
+        .map(|value| (value - median).abs())
+        .collect::<Vec<_>>();
+    deviations.sort_by(|left, right| left.total_cmp(right));
+    let mad = percentile(&deviations, 0.50);
     let coefficient_of_variation = if sorted.len() > 1 && mean.abs() > f64::EPSILON {
-        Some(stddev(&sorted, mean) / mean.abs())
+        let variance = sorted
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / (sorted.len() - 1) as f64;
+        Some(variance.sqrt() / mean.abs())
     } else {
         None
     };
@@ -91,12 +85,12 @@ pub fn summarize_distribution(values: &[f64], bootstrap_seed: u64) -> Distributi
         min: sorted.first().copied(),
         max: sorted.last().copied(),
         mean: Some(mean),
-        median,
-        mad,
+        median: Some(median),
+        mad: Some(mad),
         coefficient_of_variation,
-        p90: percentile(&sorted, 0.90),
-        p95: percentile(&sorted, 0.95),
-        p99: percentile(&sorted, 0.99),
+        p90: Some(percentile(&sorted, 0.90)),
+        p95: Some(percentile(&sorted, 0.95)),
+        p99: Some(percentile(&sorted, 0.99)),
         mean_ci_95: bootstrap_mean_ci(&sorted, bootstrap_seed),
     }
 }
@@ -118,53 +112,31 @@ fn bootstrap_mean_ci(values: &[f64], seed: u64) -> Option<ConfidenceInterval> {
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut means = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
-    for _ in 0..BOOTSTRAP_RESAMPLES {
-        let mut total = 0.0;
-        for _ in 0..values.len() {
-            let index = rng.random_range(0..values.len());
-            total += values[index];
-        }
-        means.push(total / values.len() as f64);
-    }
+    let mut means = (0..BOOTSTRAP_RESAMPLES)
+        .map(|_| {
+            (0..values.len())
+                .map(|_| values[rng.random_range(0..values.len())])
+                .fold(0.0_f64, |total, value| total + value)
+                / values.len() as f64
+        })
+        .collect::<Vec<_>>();
     means.sort_by(|left, right| left.total_cmp(right));
     Some(ConfidenceInterval {
-        lower: percentile(&means, 0.025).unwrap_or_else(|| means[0]),
-        upper: percentile(&means, 0.975).unwrap_or_else(|| means[means.len() - 1]),
+        lower: percentile(&means, 0.025),
+        upper: percentile(&means, 0.975),
     })
 }
 
-fn average(values: &[f64]) -> f64 {
-    values.iter().sum::<f64>() / values.len() as f64
-}
-
-fn stddev(values: &[f64], mean: f64) -> f64 {
-    let variance = values
-        .iter()
-        .map(|value| {
-            let delta = value - mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / (values.len() - 1) as f64;
-    variance.sqrt()
-}
-
-fn percentile(sorted_values: &[f64], percentile: f64) -> Option<f64> {
-    if sorted_values.is_empty() {
-        return None;
-    }
-    let index = upper_nearest_rank_index(sorted_values.len(), percentile)?;
-    sorted_values.get(index).copied()
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    sorted_values[upper_nearest_rank_index(sorted_values.len(), percentile)
+        .expect("percentiles require non-empty samples and a finite rank")]
 }
 
 pub(crate) fn upper_nearest_rank_index(len: usize, percentile: f64) -> Option<usize> {
-    if len == 0 || !percentile.is_finite() {
-        return None;
-    }
     // Keep benchmark reports conservative and consistent with the pre-existing transport summary:
     // even-sized samples choose the upper rank, so p50([10, 1000]) reports 1000.
-    Some(((len - 1) as f64 * percentile.clamp(0.0, 1.0)).ceil() as usize)
+    (len > 0 && percentile.is_finite())
+        .then(|| ((len - 1) as f64 * percentile.clamp(0.0, 1.0)).ceil() as usize)
 }
 
 #[cfg(test)]
@@ -195,6 +167,16 @@ mod tests {
             classify_noise(&stats, 0.02),
             NoiseClassification::Inconclusive
         );
+    }
+
+    #[test]
+    fn bootstrap_confidence_interval_preserves_positive_zero_accumulation() {
+        let interval = summarize_distribution(&[-0.0, -0.0], 1)
+            .mean_ci_95
+            .expect("two samples should produce a confidence interval");
+
+        assert_eq!(interval.lower.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(interval.upper.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]

@@ -5,21 +5,10 @@
 #
 # The values-driven Helmfile install path expects the operator to
 # author topology-correct URLs in the environment file. This fixture
-# is the multi-cluster variant; the single-cluster equivalent
-# (self-managed-local-bdd.yaml) carries in-cluster DNS that only
-# resolves inside the control-plane k3d cluster. See
-# tests/bdd/AGENTS.md "CLI vs Helmfile install paths" for why the
-# two paths each need their own fixture.
-#
-# The .test hostnames in global.nvcaOperator.selfManaged below are
-# the same ones the CLI feature asserts in
-# features/multi-cluster-up.feature under
-# controlPlane.endpoints.computeReachable. Both come from
-# tools/ncp-local-cluster/scripts/configure-control-plane-endpoints.sh,
-# which aliases them to the control-plane LB container so traffic
-# from the compute cluster reaches the right place. If you change
-# those hostnames, change all three (script, fixture, CLI feature)
-# together.
+# keeps the same service-DNS URL shape as the single-cluster local
+# fixture. In the multi-cluster topology those names resolve to alias
+# Services in the compute cluster, and the alias Endpoints point at
+# the control-plane load balancer.
 global:
   nodeSelectors:
     enabled: false
@@ -41,17 +30,28 @@ global:
     registry: nvcr.io
     repository: REPLACE_WITH_SAMPLE_NGC_ORG/REPLACE_WITH_SAMPLE_NGC_TEAM
 
-  # Compute-reachable URLs for the multi-cluster topology. The
-  # compute-control-plane-endpoints script aliases these `.test`
-  # hostnames to the control-plane LB container over the docker
-  # network. In-cluster URLs (api.sis.svc.cluster.local etc.) only
-  # resolve inside the control-plane k3d cluster, so the
-  # single-cluster fixture's values do not work here.
-  nvcaOperator:
-    selfManaged:
-      icmsServiceURL: http://sis.nvcf-control-plane.test:8080
-      revalServiceURL: http://reval.nvcf-control-plane.test:8080
-      natsURL: nats://nats.nvcf-control-plane.test:4222
+  workerEndpoints:
+    essServiceURL: http://ess-api.ess.svc.cluster.local:8080
+    invocationServiceURL: http://invocation.nvcf.svc.cluster.local:8080
+    # This DNS name is local to each cluster. On the compute cluster, the
+    # ncp-local alias Service forwards it to the control-plane load balancer.
+    # NVCF API advertises this value as LLM_REQUEST_ROUTER_ADDRESS.
+    llmRequestRouterAddress: https://llm-request-router.nvcf.svc.cluster.local:50071
+
+# Local BDD does not install the optional observability stack.
+observability:
+  profile: disabled
+
+# The published chart defaults target production-sized nodes. Keep the local
+# split-cluster fixture schedulable after the core services are placed.
+stateMetrics:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 cassandra:
   replicaCount: 1
@@ -69,10 +69,6 @@ openbao:
     # Single-node local cluster: hard anti-affinity would leave the 2nd replica Pending.
     replicas: 1
 
-api:
-  env:
-    NVCF_SIDECARS_LLM_ROUTER_CLIENT_IMAGE: nvcr.io/REPLACE_WITH_SAMPLE_NGC_ORG/REPLACE_WITH_SAMPLE_NGC_TEAM/stargate-client:0.2.0
-
 # LLM gateway talks to nvcf-api over plaintext gRPC in local dev
 # (api.nvcf.svc.cluster.local:9090 has no TLS).
 addons:
@@ -86,18 +82,34 @@ addons:
         serviceMonitor:
           enabled: false
     requestRouter:
-      replicaCount: 1
+      # Validate authority/SNI demultiplexing across three concrete Stargates.
+      chartPath: ../../../helm/llm-request-router/llm-request-router
+      replicaCount: 3
+      grpcTls:
+        enabled: true
+        mode: certManager
+        secretName: llm-request-router-grpc-tls
+        dnsNames:
+          - llm-request-router.nvcf.svc.cluster.local
+      backendRouter:
+        # These are control-plane-local for Stargate and compute-reachable
+        # through the identically named alias Service in the compute cluster.
+        pylonGrpcDialAddress: https://llm-request-router.nvcf.svc.cluster.local:50071
+        pylonReverseTunnelDialAddress: llm-request-router.nvcf.svc.cluster.local:50072
       metrics:
         serviceMonitor:
           enabled: false
+    pki:
+      enabled: true
+      allowedDomains: cluster.local
+      # The compute-reachable dial address is deliberately decoupled from the
+      # gRPC authority and QUIC SNI. Pylon preserves the per-Stargate identity.
+      dnsNames:
+        - llm-request-router.nvcf.svc.cluster.local
+        - "*.llm-request-router-headless.nvcf.svc.cluster.local"
 
-agentConfig:
-  mergeConfig: |
-    cluster:
-      validationPolicy:
-        name: Unrestricted
-    workload:
-      stargateQUICInsecure: true
+grpcproxy:
+  workerConnectBaseURL: http://grpc.nvcf.svc.cluster.local:10086
 
 # Gateway API Ingress (POC)
 # Application Developer role: Only HTTPRoutes
@@ -105,6 +117,7 @@ agentConfig:
 ingress:
   gatewayApi:
     enabled: true
+    chartPath: ../../../helm/gateway-routes/chart
     controllerNamespace: envoy-gateway-system
     gateways:
       shared:
@@ -117,6 +130,23 @@ ingress:
         name: shared-gw
         namespace: envoy-gateway-system
         listenerName: nats
+      llmGrpc:
+        name: grpc-gw
+        namespace: envoy-gateway-system
+        listenerName: llm-grpc
+      llmQuic:
+        name: grpc-gw
+        namespace: envoy-gateway-system
+        listenerName: llm-quic
     routes:
+      grpcWorker:
+        enabled: true
+        listenerName: worker-tcp
       nats:
+        enabled: true
+      llmWorker:
+        enabled: true
+        backend:
+          namespace: nvcf
+      ess:
         enabled: true

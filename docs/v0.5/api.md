@@ -144,18 +144,16 @@ for these endpoints.
 ### Direct API key creation
 
 The CLI calls the API Keys service for you. If you need to call it directly,
-send `NVCF_TOKEN`, then set `expires_at` and the `scopes` array explicitly.
+set `expires_at` and the `scopes` array explicitly.
 
 ```bash
 GATEWAY_ADDR=<your-gateway-address>
-NVCF_TOKEN=<token-from-nvcf-cli-init>
 EXPIRES_AT=$(date -u -v+1d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
 SERVICE_ID="nvidia-cloud-functions-ncp-service-id-aketm"
 
 curl -s -X POST "http://${GATEWAY_ADDR}/v1/keys" \
   -H "Host: api-keys.${GATEWAY_ADDR}" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${NVCF_TOKEN}" \
   -H "Key-Issuer-Service: nvcf-api" \
   -H "Key-Issuer-Id: ${SERVICE_ID}" \
   -H "Key-Owner-Id: test@nvcf-api.local" \

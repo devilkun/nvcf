@@ -65,9 +65,9 @@ func (c K8sComputeBackend) applyContainerTaskCreationMessage(ctx context.Context
 
 	metrics := nvcametrics.FromContext(ctx)
 
-	c.bk8s.eventRecorder.Eventf(req,
+	c.bk8s.EmitICMSEventf(req,
 		corev1.EventTypeNormal, string(types.EventCategoryInstanceCreation),
-		"Creating %d remaining requested instances", int(instCount)-len(activeInstances),
+		"Creating %d remaining requested instances", nil, int(instCount)-len(activeInstances),
 	)
 
 	labelsForReq := types.GetLabelsForRequest(req, c.bk8s.featureFlagFetcher)
@@ -130,6 +130,14 @@ func (c K8sComputeBackend) applyContainerTaskCreationMessage(ctx context.Context
 		metricLabels := metrics.WithDefaultLabelValues(EventTranslateTaskError)
 		metrics.EventErrorTotal.WithLabelValues(metricLabels...).Inc()
 		return err
+	}
+	envs := c.bk8s.cfg.Agent.BYOOOTelCollectorEnvVars()
+	for _, obj := range objs {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok {
+			continue
+		}
+		k8sutil.AddBYOOOTelCollectorEnvVarsToPodSpec(&pod.Spec, envs)
 	}
 
 	ownerRefsForReq := getOwnerRefForRequest(req)
@@ -216,7 +224,7 @@ func (c K8sComputeBackend) applyContainerTaskCreationMessage(ctx context.Context
 
 		if c.bk8s.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.KAIScheduler) {
 			workloadPod.Spec.SchedulerName = kaischeduler.SchedulerName
-			workloadPod.Labels[kaischeduler.SchedulerQueueLabel] = kaischeduler.GetQName()
+			workloadPod.Labels[kaischeduler.SchedulerQueueLabel] = kaischeduler.DefaultQueue
 		}
 
 		// Task pods must only be created once.
@@ -259,9 +267,12 @@ func (c K8sComputeBackend) applyContainerTaskCreationMessage(ctx context.Context
 			}
 		}
 
-		// Container task utils and init resources are toggled by feature flag.
-		if c.bk8s.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.EnforceContainerTaskResourceLimits) {
-			k8sutil.SetNVCFInfraContainerResources(corev1.ResourceList(c.bk8s.cfg.Agent.UtilsResources), workloadPod)
+		// Container task utils and init resource limits are toggled by feature flag.
+		setResourceLimits := c.bk8s.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.EnforceContainerTaskResourceLimits)
+		k8sutil.SetNVCFInfraContainerResources(corev1.ResourceList(c.bk8s.cfg.Agent.UtilsResources), workloadPod, setResourceLimits)
+		// Only validate the whole pod if limits are required, since other containers may not have them
+		// when the feature flag is disabled.
+		if setResourceLimits {
 			if err := k8sutil.ValidateAllContainerResourcesSet(workloadPod); err != nil {
 				log.WithError(err).Error("Container task pod resources are invalid")
 				return nvcaerrors.TerminalError(err)
@@ -294,9 +305,9 @@ func (c K8sComputeBackend) applyContainerTaskCreationMessage(ctx context.Context
 		})
 
 		if podCreated {
-			c.bk8s.eventRecorder.Eventf(req, corev1.EventTypeNormal,
+			c.bk8s.EmitICMSEventf(req, corev1.EventTypeNormal,
 				string(types.EventCategoryInstanceCreation), "Created %v Instance %v",
-				nvcav2beta1.InstanceTypePod, instanceID,
+				instanceUpdate(instanceID), nvcav2beta1.InstanceTypePod, instanceID,
 			)
 		}
 	}

@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +35,8 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -143,6 +146,42 @@ func TestExtractOpenAIJSONBody(t *testing.T) {
 		_, err = extractOpenAIJSONBody(req)
 		require.ErrorIs(t, err, errModelFieldMissing)
 	})
+}
+
+func TestExtractOpenAIJSONBodyDoesNotRetainPayload(t *testing.T) {
+	const (
+		modelName   = "model-retention-probe"
+		payloadSize = 32 << 20
+	)
+
+	runtime.GC()
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	model := func() string {
+		requestBody := append([]byte(`{"model":"`+modelName+`","padding":"`), bytes.Repeat([]byte{'x'}, payloadSize)...)
+		requestBody = append(requestBody, '"', '}')
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(requestBody))
+
+		body, err := extractOpenAIJSONBody(req)
+		require.NoError(t, err)
+		require.NoError(t, req.Body.Close())
+		return body.Model
+	}()
+
+	runtime.GC()
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	var retained uint64
+	if after.HeapAlloc > before.HeapAlloc {
+		retained = after.HeapAlloc - before.HeapAlloc
+	}
+	require.Less(t, retained, uint64(payloadSize/2))
+	require.Equal(t, modelName, model)
+	runtime.KeepAlive(model)
 }
 
 func TestExtractOpenAIMultipartBody(t *testing.T) {
@@ -287,6 +326,69 @@ func TestBuildModelMapping(t *testing.T) {
 	assert.False(t, shadowIsPublic)
 }
 
+func TestBuildModelMappingPreservesAndDefaultsShadowSamplingMethod(t *testing.T) {
+	privateModelMatcher := regexp.MustCompile("^private/")
+
+	mapping, err := buildModelMapping(map[string]ModelNameToFunctionIdVersionId{
+		"facebook/opt-125m": {
+			FunctionId:           "func-123",
+			ShadowModelNames:     []string{"private/facebook/opt-125m-shadow"},
+			ShadowSamplingMethod: config.ShadowSamplingMethodPerBearerKey,
+		},
+		"meta/llama-3.1-8b": {
+			FunctionId:       "func-456",
+			ShadowModelNames: []string{"private/meta/llama-3.1-8b-shadow"},
+		},
+		"private/facebook/opt-125m-shadow": {
+			FunctionId: "shadow-func",
+		},
+		"private/meta/llama-3.1-8b-shadow": {
+			FunctionId: "shadow-func-2",
+		},
+	}, privateModelMatcher)
+	require.NoError(t, err)
+
+	assert.Equal(t, config.ShadowSamplingMethodPerBearerKey, mapping.modelNameToNVCFUrl["facebook/opt-125m"].shadowSamplingMethod)
+	assert.Equal(t, config.ShadowSamplingMethodRandom, mapping.modelNameToNVCFUrl["meta/llama-3.1-8b"].shadowSamplingMethod)
+}
+
+func TestResolveModelMappedRequestAddsMetricAttributes(t *testing.T) {
+	director := &OpenAIDirector{}
+	modelToNVCFURL := map[string]FunctionInfo{
+		"facebook/opt-125m": {
+			functionId: "func-123",
+		},
+	}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"facebook/opt-125m"}`),
+	)
+	labeler := &otelhttp.Labeler{}
+	req = req.WithContext(otelhttp.ContextWithLabeler(req.Context(), labeler))
+	rec := httptest.NewRecorder()
+
+	resolved, handled := director.resolveModelMappedRequest(rec, req, modelToNVCFURL)
+	require.False(t, handled)
+	require.NoError(t, resolved.request.Body.Close())
+
+	assertLabelerHasAttribute(t, labeler.Get(), "openai_model_name", attribute.StringValue("facebook/opt-125m"))
+	assertLabelerHasAttribute(t, labeler.Get(), "function_id", attribute.StringValue("func-123"))
+}
+
+func assertLabelerHasAttribute(t *testing.T, attrs []attribute.KeyValue, key attribute.Key, want attribute.Value) {
+	t.Helper()
+
+	for _, attr := range attrs {
+		if attr.Key == key {
+			require.Equal(t, want, attr.Value)
+			return
+		}
+	}
+	t.Fatalf("missing metric attribute %q in %#v", key, attrs)
+}
+
 func TestBuildModelMappingPreservesMultipleShadowTargets(t *testing.T) {
 	privateModelMatcher := regexp.MustCompile("^private/")
 
@@ -331,6 +433,7 @@ func TestConvertIntoModelNameToFunctionIdAndVersionIdMappingV2(t *testing.T) {
 			ShadowModelName:                "private/facebook/opt-125m-shadow",
 			ShadowModelNames:               []string{"private/facebook/opt-125m-shadow-b"},
 			ShadowPercentage:               &shadowPct,
+			ShadowSamplingMethod:           config.ShadowSamplingMethodPerBearerKey,
 			ShadowCancelOnClientDisconnect: true,
 		},
 	})
@@ -349,6 +452,7 @@ func TestConvertIntoModelNameToFunctionIdAndVersionIdMappingV2(t *testing.T) {
 		"private/facebook/opt-125m-shadow-b",
 	}, expected.ShadowModelNames)
 	assert.Equal(t, &shadowPct, expected.ShadowPercentage)
+	assert.Equal(t, config.ShadowSamplingMethodPerBearerKey, expected.ShadowSamplingMethod)
 	assert.True(t, expected.ShadowCancelOnClientDisconnect)
 }
 
@@ -427,6 +531,55 @@ func TestDispatchShadowIfNeededReplaysHandlerAndRewritesBody(t *testing.T) {
 		},
 	}
 	director.dispatchShadowIfNeeded(resolved, modelMapping)
+
+	assert.Eventually(t, func() bool { return received.Load() }, 5*time.Second, 10*time.Millisecond)
+
+	var shadowBody map[string]any
+	require.NoError(t, json.Unmarshal([]byte(receivedBody), &shadowBody))
+	assert.Equal(t, "private/facebook/opt-125m-shadow", shadowBody["model"])
+	assert.Equal(t, true, shadowBody["stream"])
+}
+
+func TestDispatchShadowIfNeededPerBearerKeyUsesBearerBucket(t *testing.T) {
+	var receivedBody string
+	var received atomic.Bool
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = string(body)
+		received.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	vanity, err := NewVanityDirector(backend.URL, backend.Client().Transport)
+	require.NoError(t, err)
+
+	modelMapping := map[string]FunctionInfo{
+		"facebook/opt-125m": {
+			functionId:           "primary-func",
+			shadowModelNames:     []string{"private/facebook/opt-125m-shadow"},
+			shadowPercentage:     47,
+			shadowSamplingMethod: config.ShadowSamplingMethodPerBearerKey,
+		},
+		"private/facebook/opt-125m-shadow": {
+			functionId: "shadow-func",
+		},
+	}
+
+	director := &OpenAIDirector{
+		shadower:           NewTrafficShadower(10, 30*time.Second),
+		vanityDirector:     vanity,
+		shadowRandomBucket: func() int { return 99 },
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"facebook/opt-125m","stream":true}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	director.dispatchShadowIfNeeded(resolvedOpenAIRequest{
+		request:      req,
+		functionInfo: modelMapping["facebook/opt-125m"],
+	}, modelMapping)
 
 	assert.Eventually(t, func() bool { return received.Load() }, 5*time.Second, 10*time.Millisecond)
 
@@ -753,7 +906,7 @@ func TestNewOpenAIDirectorV2DeduplicatesModels(t *testing.T) {
 			cfg.OpenAI.Embeddings = tc.embeddings
 			cfg.OpenAI.Responses = tc.responses
 
-			director, err := NewOpenAIDirectorV2(cfg, privateModelMatcher, nil, nil)
+			director, err := NewOpenAIDirectorV2(cfg, privateModelMatcher, nil, nil, nil)
 			require.NoError(t, err)
 
 			var modelIDs []string

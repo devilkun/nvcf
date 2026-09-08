@@ -12,7 +12,7 @@ external webhook flows.
 - `internal/router/`: Gin HTTP routing
 - `internal/config/`: Viper configuration
 - `internal/tracing/`: OpenTelemetry and Lightstep tracing
-- `deploy/`: Helm chart assets
+- `../../../deploy/helm/nats-auth-callout/`: Helm chart assets
 
 ## Build and Test
 
@@ -34,7 +34,8 @@ make dev-swagger
 ```
 
 CI subproject id: `nats-auth-callout`. Native Bazel validation and release
-wiring live in `tools/ci/subproject-validations.yaml`.
+wiring live in `tools/ci/subproject-validations.yaml`, an internal GitLab CI
+config not present in this public snapshot.
 
 ## Plugin Work
 

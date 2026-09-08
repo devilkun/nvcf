@@ -19,9 +19,12 @@ package gateway
 
 import (
 	config "ai-api-gateway-service/gateway_config"
+	"ai-api-gateway-service/middleware"
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -56,16 +59,18 @@ const (
 )
 
 type OpenAIDirector struct {
-	chatCompletions  ModelMapping
-	completions      ModelMapping
-	embeddings       ModelMapping
-	responses        ModelMapping
-	imageGenerations ModelMapping
-	imageEdits       ModelMapping
-	imageVariations  ModelMapping
-	allPublicModels  []ModelInfo // list of models used for the /v1/models
-	vanityDirector   *VanityDirector
-	shadower         *TrafficShadower
+	chatCompletions    ModelMapping
+	completions        ModelMapping
+	embeddings         ModelMapping
+	responses          ModelMapping
+	imageGenerations   ModelMapping
+	imageEdits         ModelMapping
+	imageVariations    ModelMapping
+	allPublicModels    []ModelInfo // list of models used for the /v1/models
+	vanityDirector     *VanityDirector
+	llmGatewayDirector *LLMGatewayDirector
+	shadower           *TrafficShadower
+	shadowRandomBucket func() int
 
 	// Cache for filtered models
 	filteredModelsCache        []ModelInfo
@@ -91,12 +96,19 @@ type FunctionInfo struct {
 	pathOverride                   *string
 	usePexec                       bool
 	sessionTimeout                 config.SessionTimeoutSeconds
+	customHeaders                  config.CustomHeaders
 	eol                            time.Time
 	offlineMessage                 string
 	tooManyRequestsMessage         string
 	shadowModelNames               []string
 	shadowPercentage               int
+	shadowSamplingMethod           config.ShadowSamplingMethod
 	shadowCancelOnClientDisconnect bool
+	functionType                   config.FunctionType
+}
+
+func (f FunctionInfo) targetsLLMGateway() bool {
+	return f.functionType == config.FunctionTypeLLM
 }
 
 type ModelMapping struct {
@@ -122,12 +134,15 @@ type ModelNameToFunctionIdVersionId struct {
 	OutgoingPathOverride           string
 	UsePexec                       bool
 	SessionTimeout                 config.SessionTimeoutSeconds
+	CustomHeaders                  config.CustomHeaders
 	EOL                            time.Time
 	OfflineMessage                 string
 	TooManyRequestsMessage         string
 	ShadowModelNames               []string
 	ShadowPercentage               *int
+	ShadowSamplingMethod           config.ShadowSamplingMethod
 	ShadowCancelOnClientDisconnect bool
+	FunctionType                   config.FunctionType
 }
 
 type openAIRequestBody struct {
@@ -138,6 +153,7 @@ type openAIRequestBody struct {
 type resolvedOpenAIRequest struct {
 	request      *http.Request
 	functionInfo FunctionInfo
+	modelName    string
 }
 
 type primaryProxyObserver struct {
@@ -228,18 +244,22 @@ func buildModelMapping(
 		if entry.OutgoingPathOverride != "" {
 			pathOverride = &entry.OutgoingPathOverride
 		}
+		initializeShadowDropMetrics(entry.ShadowModelNames)
 		modelNameToNVCFUrl[modelName] = FunctionInfo{
 			functionId:                     entry.FunctionId,
 			functionVersionId:              entry.FunctionVersionId,
 			pathOverride:                   pathOverride,
 			usePexec:                       entry.UsePexec,
 			sessionTimeout:                 entry.SessionTimeout,
+			customHeaders:                  entry.CustomHeaders,
 			eol:                            entry.EOL,
 			offlineMessage:                 entry.OfflineMessage,
 			tooManyRequestsMessage:         entry.TooManyRequestsMessage,
 			shadowModelNames:               entry.ShadowModelNames,
 			shadowPercentage:               defaultShadowPercentage(entry.ShadowPercentage),
+			shadowSamplingMethod:           defaultShadowSamplingMethod(entry.ShadowSamplingMethod),
 			shadowCancelOnClientDisconnect: entry.ShadowCancelOnClientDisconnect,
+			functionType:                   entry.FunctionType,
 		}
 
 		// build the modelInfo list and modelName to modelInfo map
@@ -256,7 +276,7 @@ func buildModelMapping(
 	return ModelMapping{modelNameToNVCFUrl, modelNameToModelInfo}, nil
 }
 
-func NewOpenAIDirectorV2(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, shadower *TrafficShadower) (*OpenAIDirector, error) {
+func NewOpenAIDirectorV2(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, llmGatewayDirector *LLMGatewayDirector, shadower *TrafficShadower) (*OpenAIDirector, error) {
 	chatCompletions, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ChatCompletions), privateModelMatcher)
 	if err != nil {
 		return nil, err
@@ -313,16 +333,17 @@ func NewOpenAIDirectorV2(mapping *config.GatewayConfig, privateModelMatcher *reg
 	})
 
 	return &OpenAIDirector{
-		chatCompletions:  chatCompletions,
-		completions:      completions,
-		embeddings:       embeddings,
-		responses:        responses,
-		imageGenerations: imageGenerations,
-		imageEdits:       imageEdits,
-		imageVariations:  imageVariations,
-		allPublicModels:  allModels,
-		vanityDirector:   vanityDirector,
-		shadower:         shadower,
+		chatCompletions:    chatCompletions,
+		completions:        completions,
+		embeddings:         embeddings,
+		responses:          responses,
+		imageGenerations:   imageGenerations,
+		imageEdits:         imageEdits,
+		imageVariations:    imageVariations,
+		allPublicModels:    allModels,
+		vanityDirector:     vanityDirector,
+		llmGatewayDirector: llmGatewayDirector,
+		shadower:           shadower,
 	}, nil
 }
 
@@ -394,12 +415,15 @@ func convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping map[string]co
 			OutgoingPathOverride:           entry.OutgoingPathOverride,
 			UsePexec:                       entry.UsePexec,
 			SessionTimeout:                 entry.SessionTimeout,
+			CustomHeaders:                  entry.CustomHeaders,
 			EOL:                            entry.EOL,
 			OfflineMessage:                 entry.OfflineMessage,
 			TooManyRequestsMessage:         entry.TooManyRequestsMessage,
 			ShadowModelNames:               effectiveShadowModelNames(entry.ShadowModelName, entry.ShadowModelNames),
 			ShadowPercentage:               entry.ShadowPercentage,
+			ShadowSamplingMethod:           entry.ShadowSamplingMethod,
 			ShadowCancelOnClientDisconnect: entry.ShadowCancelOnClientDisconnect,
+			FunctionType:                   entry.FunctionType,
 		}
 	}
 
@@ -411,6 +435,13 @@ func defaultShadowPercentage(shadowPercentage *int) int {
 		return 100
 	}
 	return *shadowPercentage
+}
+
+func defaultShadowSamplingMethod(shadowSamplingMethod config.ShadowSamplingMethod) config.ShadowSamplingMethod {
+	if shadowSamplingMethod == "" {
+		return config.ShadowSamplingMethodRandom
+	}
+	return shadowSamplingMethod
 }
 
 func effectiveShadowModelNames(legacyModelName string, modelNames []string) []string {
@@ -509,6 +540,9 @@ func (d *OpenAIDirector) GetModel(writer http.ResponseWriter, request *http.Requ
 		d.imageEdits.modelNameToNVCFUrl,
 		d.imageVariations.modelNameToNVCFUrl,
 	)
+	if ok {
+		middleware.AddOpenAIRequestMetricAttributes(request.Context(), modelName, funcInfo.functionId)
+	}
 	if ok && writeFunctionStatusError(writer, funcInfo.offlineMessage, funcInfo.eol, modelName) {
 		return
 	}
@@ -607,6 +641,7 @@ func (d *OpenAIDirector) resolveModelMappedRequest(writer http.ResponseWriter, r
 		http.NotFound(writer, request)
 		return resolvedOpenAIRequest{}, true
 	}
+	middleware.AddOpenAIRequestMetricAttributes(request.Context(), body.Model, nvcfUrl.functionId)
 
 	if writeFunctionStatusError(writer, nvcfUrl.offlineMessage, nvcfUrl.eol, body.Model) {
 		_ = request.Body.Close()
@@ -626,6 +661,7 @@ func (d *OpenAIDirector) resolveModelMappedRequest(writer http.ResponseWriter, r
 	return resolvedOpenAIRequest{
 		request:      request,
 		functionInfo: nvcfUrl,
+		modelName:    body.Model,
 	}, false
 }
 
@@ -633,15 +669,14 @@ func (d *OpenAIDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, 
 	if isShadowRequest(resolved.request) {
 		return func(error) {}
 	}
-	shadowModelNames := resolved.functionInfo.shadowModelNames
-	if len(shadowModelNames) == 0 || d.shadower == nil {
+	if d.shadower == nil {
 		return func(error) {}
 	}
-	pct := resolved.functionInfo.shadowPercentage
-	if pct < 100 && rand.IntN(100) >= pct {
+	if !shouldDispatchShadow(resolved.request, resolved.functionInfo, d.randomShadowBucket) {
 		return func(error) {}
 	}
 
+	shadowModelNames := resolved.functionInfo.shadowModelNames
 	shadowCtx, finishShadowPrimary := shadowContext(resolved.request, resolved.functionInfo.shadowCancelOnClientDisconnect)
 
 	// Clone body only for shadowed requests — avoids allocation on the hot path.
@@ -709,10 +744,101 @@ func (d *OpenAIDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, 
 	return finishShadowPrimary
 }
 
+func (d *OpenAIDirector) randomShadowBucket() int {
+	if d.shadowRandomBucket != nil {
+		return d.shadowRandomBucket()
+	}
+	return rand.IntN(100)
+}
+
+func shouldDispatchShadow(req *http.Request, info FunctionInfo, randomBucket func() int) bool {
+	if len(info.shadowModelNames) == 0 {
+		return false
+	}
+	if info.shadowPercentage >= 100 {
+		return true
+	}
+	if info.shadowSamplingMethod == config.ShadowSamplingMethodPerBearerKey {
+		credential, ok := bearerCredential(req)
+		return ok && shadowBucketForBearerCredential(credential) < info.shadowPercentage
+	}
+	return randomBucket() < info.shadowPercentage
+}
+
+func bearerCredential(req *http.Request) ([]byte, bool) {
+	values := req.Header.Values("Authorization")
+	if len(values) != 1 {
+		return nil, false
+	}
+
+	const scheme = "Bearer"
+	value := values[0]
+	if len(value) <= len(scheme) || !strings.EqualFold(value[:len(scheme)], scheme) {
+		return nil, false
+	}
+
+	remainder := value[len(scheme):]
+	if remainder == "" || strings.TrimLeft(remainder, " \t") == remainder {
+		return nil, false
+	}
+
+	credential := strings.TrimLeft(remainder, " \t")
+	if credential == "" {
+		return nil, false
+	}
+	return []byte(credential), true
+}
+
+func shadowBucketForBearerCredential(credential []byte) int {
+	digest := sha256.Sum256(credential)
+	// Use the first 8 digest bytes as a stable uint64. This is enough entropy for
+	// 100 buckets while keeping the bucket algorithm simple to reproduce.
+	return int(binary.BigEndian.Uint64(digest[:8]) % 100)
+}
+
+// proxyToLLMGateway rewrites the request model to the functionID/modelName form
+// the LLM Gateway routes on, so vanity callers never see the function ID.
+func (d *OpenAIDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved resolvedOpenAIRequest) error {
+	if d.llmGatewayDirector == nil {
+		writeBadGatewayProblem(writer, resolved.request, fmt.Errorf("LLM Gateway upstream is not configured"))
+		return nil
+	}
+
+	body, err := io.ReadAll(resolved.request.Body)
+	_ = resolved.request.Body.Close()
+	if err != nil {
+		writeBadGatewayProblem(writer, resolved.request, fmt.Errorf("failed to read request body: %w", err))
+		return nil
+	}
+
+	rewritten, err := rewriteShadowRequestModel(body, resolved.functionInfo.functionId+"/"+resolved.modelName)
+	if err != nil {
+		writeBadGatewayProblem(writer, resolved.request, err)
+		return nil
+	}
+
+	resolved.request.Body = io.NopCloser(bytes.NewReader(rewritten))
+	resolved.request.ContentLength = int64(len(rewritten))
+
+	return d.llmGatewayDirector.ServeProxy(
+		LLMGatewayRequest{
+			CustomHeaders:  resolved.functionInfo.customHeaders,
+			EOL:            resolved.functionInfo.eol,
+			OfflineMessage: resolved.functionInfo.offlineMessage,
+		},
+		writer,
+		resolved.request,
+	)
+}
+
 func (d *OpenAIDirector) proxyResolvedRequest(writer http.ResponseWriter, resolved resolvedOpenAIRequest) error {
 	if resolved.functionInfo.sessionTimeout > 0 {
 		span := trace.SpanFromContext(resolved.request.Context())
 		span.SetAttributes(traceAttrSessionTimeoutSeconds.Int(int(resolved.functionInfo.sessionTimeout)))
+	}
+
+	if resolved.functionInfo.targetsLLMGateway() {
+		return d.proxyToLLMGateway(writer, resolved)
 	}
 
 	observer := &primaryProxyObserver{}
@@ -723,6 +849,7 @@ func (d *OpenAIDirector) proxyResolvedRequest(writer http.ResponseWriter, resolv
 			PathOverride:      resolved.functionInfo.pathOverride,
 			UsePexec:          resolved.functionInfo.usePexec,
 			SessionTimeout:    resolved.functionInfo.sessionTimeout,
+			CustomHeaders:     resolved.functionInfo.customHeaders,
 			EOL:               resolved.functionInfo.eol,
 			OfflineMessage:    resolved.functionInfo.offlineMessage,
 		},
@@ -862,6 +989,7 @@ func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
 		return openAIRequestBody{}, errModelFieldMissing
 	}
 
+	body.Model = strings.Clone(body.Model)
 	return body, nil
 }
 

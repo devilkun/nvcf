@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG GRPC_HEALTH_PROBE_VERSION=v0.4.38
+ARG GRPC_HEALTH_PROBE_VERSION=v0.4.53
 
 ##########################################
 ##### COMMON BUILDER STAGE (BUILDPLATFORM)
 ##########################################
 # Pinned alongside rust-toolchain.toml (1.94.0 stable, 2026-03-05).
-FROM --platform=$BUILDPLATFORM rust:1.96-bookworm AS builder-base
+FROM --platform=$BUILDPLATFORM rust:1.97-bookworm AS builder-base
 
 ARG TARGETARCH
 
@@ -57,29 +57,37 @@ COPY crates ./crates
 ##########################################
 FROM --platform=$BUILDPLATFORM builder-base AS binary-builder
 
+# Production runtime targets keep release artifacts unless a caller such as
+# Tilt explicitly selects the faster behavior-testing profile.
+ARG CARGO_PROFILE=release
+
 # Generated schema outputs in the cached target dir must not race concurrent
 # Tilt/CI image builds using different source revisions.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=bind,source=.,target=/build-context,readonly \
+    --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/stargate/target,sharing=locked \
     set -eux; \
+    if [ -d /build-context/.git ]; then \
+        ln -s /build-context/.git .git; \
+    fi; \
     case "${TARGETARCH}" in \
         amd64) rust_target=x86_64-unknown-linux-gnu ;; \
         arm64) rust_target=aarch64-unknown-linux-gnu ;; \
         *) echo "unsupported TARGETARCH '${TARGETARCH}'" >&2; exit 1 ;; \
     esac; \
-    echo ":: building stargate binaries for ${TARGETARCH} (${rust_target})"; \
+    echo ":: building stargate binaries for ${TARGETARCH} (${rust_target}) with profile ${CARGO_PROFILE}"; \
     touch crates/proto/proto/*.proto crates/protocol/quic.capnp; \
     mkdir -p /out; \
-    cargo build -p stargate --release --target "${rust_target}"; \
-    cargo build -p stargate-k8s-router --release --target "${rust_target}"; \
-    cargo build -p mock-dynamo -p pylon --release --target "${rust_target}"; \
-    cp "target/${rust_target}/release/stargate" \
-       "target/${rust_target}/release/stargate-webtransport-l7-proxy" \
-       "target/${rust_target}/release/stargate-k8s-router" \
-       "target/${rust_target}/release/mock-dynamo" \
-       "target/${rust_target}/release/pylon" \
-       /out/
+    cargo build -p stargate -p stargate-k8s-router -p mock-dynamo -p pylon \
+      --profile "${CARGO_PROFILE}" --target "${rust_target}"; \
+    cp "target/${rust_target}/${CARGO_PROFILE}/stargate" \
+       "target/${rust_target}/${CARGO_PROFILE}/stargate-worker-auth-gateway" \
+       "target/${rust_target}/${CARGO_PROFILE}/stargate-k8s-router" \
+       "target/${rust_target}/${CARGO_PROFILE}/mock-dynamo" \
+       "target/${rust_target}/${CARGO_PROFILE}/pylon" \
+       /out/; \
+    rm -f .git
 
 ##########################################
 ##### GRPC HEALTH PROBE (BUILDPLATFORM)
@@ -99,7 +107,18 @@ RUN curl -sSfL -o /usr/local/bin/grpc_health_probe \
 #########################
 ### BASE RUNTIME STAGE ##
 #########################
-FROM nvcr.io/nvidia/distroless/cc:v4.0.6 AS runtime-base
+FROM nvcr.io/nvidia/distroless/cc:v4.1.2 AS runtime-base
+
+################################
+### TILT INTEGRATION RUNTIME ###
+################################
+FROM runtime-base AS integration-runtime
+
+COPY --from=health-probe-downloader /usr/local/bin/grpc_health_probe /usr/local/bin/grpc_health_probe
+COPY --from=binary-builder /out/ /usr/local/bin/
+
+ENTRYPOINT []
+CMD []
 
 ############################
 ### STARGATE RUNTIME #######
@@ -110,7 +129,7 @@ ARG TARGETARCH
 # Health probe changes less often than the binary, so copy it first for layer caching.
 COPY --from=health-probe-downloader /usr/local/bin/grpc_health_probe /usr/local/bin/grpc_health_probe
 COPY --from=binary-builder /out/stargate /usr/local/bin/stargate
-COPY --from=binary-builder /out/stargate-webtransport-l7-proxy /usr/local/bin/stargate-webtransport-l7-proxy
+COPY --from=binary-builder /out/stargate-k8s-router /usr/local/bin/stargate-k8s-router
 
 ENTRYPOINT ["stargate"]
 CMD []

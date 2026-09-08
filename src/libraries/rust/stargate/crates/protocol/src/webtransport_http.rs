@@ -19,11 +19,12 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 
 // WebTransport carries an HTTP-like head followed by raw body bytes on each
-// bidirectional stream. Keep this codec independent from the custom QUIC
+// bidirectional stream. Keep this codec independent from the raw QUIC
 // Cap'n Proto tunnel framing.
 const WEBTRANSPORT_HTTP_MAGIC: &[u8; 8] = b"SGWTHTP1";
 const WEBTRANSPORT_HTTP_KIND_REQUEST: u8 = 1;
 const WEBTRANSPORT_HTTP_KIND_RESPONSE: u8 = 2;
+const WEBTRANSPORT_HTTP_PAYLOAD_LEN_OFFSET: usize = WEBTRANSPORT_HTTP_MAGIC.len() + 1;
 const WEBTRANSPORT_HTTP_PREFIX_LEN: usize = WEBTRANSPORT_HTTP_MAGIC.len() + 1 + 4;
 const MAX_WEBTRANSPORT_HTTP_HEAD_LEN: usize = 1024 * 1024;
 const MAX_WEBTRANSPORT_HTTP_HEADER_COUNT: u32 = 4096;
@@ -92,11 +93,10 @@ pub async fn write_webtransport_http_body(
 pub async fn read_webtransport_http_body_chunk(
     rx: &mut quinn::RecvStream,
 ) -> Result<Option<Bytes>, ProtocolError> {
-    let chunk = rx
-        .read_chunk(usize::MAX, true)
+    rx.read_chunk(usize::MAX, true)
         .await
-        .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))?;
-    Ok(chunk.map(|chunk| chunk.bytes))
+        .map(|chunk| chunk.map(|chunk| chunk.bytes))
+        .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
 }
 
 pub fn finish_webtransport_http_stream(tx: &mut quinn::SendStream) -> Result<(), ProtocolError> {
@@ -104,10 +104,10 @@ pub fn finish_webtransport_http_stream(tx: &mut quinn::SendStream) -> Result<(),
         .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
 }
 
-fn encode_webtransport_http_request_head_payload(
+fn encode_webtransport_http_request_head(
     head: &WebTransportHttpRequestHead,
 ) -> Result<Bytes, ProtocolError> {
-    let mut payload = Vec::new();
+    let mut payload = webtransport_http_head_prefix(WEBTRANSPORT_HTTP_KIND_REQUEST);
     write_len_prefixed_bytes(
         &mut payload,
         head.method.as_str().as_bytes(),
@@ -119,54 +119,37 @@ fn encode_webtransport_http_request_head_payload(
         u32::MAX as usize,
     )?;
     encode_header_map(&mut payload, &head.headers)?;
-    Ok(Bytes::from(payload))
-}
-
-fn encode_webtransport_http_response_head_payload(
-    head: &WebTransportHttpResponseHead,
-) -> Result<Bytes, ProtocolError> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&head.status.as_u16().to_be_bytes());
-    encode_header_map(&mut payload, &head.headers)?;
-    Ok(Bytes::from(payload))
-}
-
-fn encode_webtransport_http_request_head(
-    head: &WebTransportHttpRequestHead,
-) -> Result<Bytes, ProtocolError> {
-    encode_webtransport_http_head(
-        WEBTRANSPORT_HTTP_KIND_REQUEST,
-        encode_webtransport_http_request_head_payload(head)?,
-    )
+    finish_webtransport_http_head(payload)
 }
 
 fn encode_webtransport_http_response_head(
     head: &WebTransportHttpResponseHead,
 ) -> Result<Bytes, ProtocolError> {
-    encode_webtransport_http_head(
-        WEBTRANSPORT_HTTP_KIND_RESPONSE,
-        encode_webtransport_http_response_head_payload(head)?,
-    )
+    let mut payload = webtransport_http_head_prefix(WEBTRANSPORT_HTTP_KIND_RESPONSE);
+    payload.extend_from_slice(&head.status.as_u16().to_be_bytes());
+    encode_header_map(&mut payload, &head.headers)?;
+    finish_webtransport_http_head(payload)
 }
 
-fn encode_webtransport_http_head(kind: u8, payload: Bytes) -> Result<Bytes, ProtocolError> {
-    if payload.len() > MAX_WEBTRANSPORT_HTTP_HEAD_LEN {
-        return Err(ProtocolError::ProtocolViolation(format!(
-            "WebTransport HTTP head too large: {} bytes",
-            payload.len()
-        )));
-    }
-    let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        ProtocolError::ProtocolViolation(format!(
-            "WebTransport HTTP head too large: {} bytes",
-            payload.len()
-        ))
-    })?;
-    let mut encoded = Vec::with_capacity(WEBTRANSPORT_HTTP_PREFIX_LEN + payload.len());
+fn webtransport_http_head_prefix(kind: u8) -> Vec<u8> {
+    let mut encoded = Vec::new();
     encoded.extend_from_slice(WEBTRANSPORT_HTTP_MAGIC);
     encoded.push(kind);
-    encoded.extend_from_slice(&payload_len.to_be_bytes());
-    encoded.extend_from_slice(&payload);
+    encoded.extend_from_slice(&0_u32.to_be_bytes());
+    encoded
+}
+
+fn finish_webtransport_http_head(mut encoded: Vec<u8>) -> Result<Bytes, ProtocolError> {
+    let payload_len = encoded.len() - WEBTRANSPORT_HTTP_PREFIX_LEN;
+    if payload_len > MAX_WEBTRANSPORT_HTTP_HEAD_LEN {
+        return Err(ProtocolError::ProtocolViolation(format!(
+            "WebTransport HTTP head too large: {} bytes",
+            payload_len
+        )));
+    }
+    let payload_len = u32::try_from(payload_len).expect("head size is capped below u32::MAX");
+    encoded[WEBTRANSPORT_HTTP_PAYLOAD_LEN_OFFSET..WEBTRANSPORT_HTTP_PREFIX_LEN]
+        .copy_from_slice(&payload_len.to_be_bytes());
     Ok(Bytes::from(encoded))
 }
 
@@ -189,9 +172,8 @@ async fn read_webtransport_http_head_payload(
             "unexpected WebTransport HTTP head kind: expected {expected_kind}, got {kind}"
         )));
     }
-    let payload_len_offset = WEBTRANSPORT_HTTP_MAGIC.len() + 1;
     let payload_len = u32::from_be_bytes(
-        prefix[payload_len_offset..payload_len_offset + 4]
+        prefix[WEBTRANSPORT_HTTP_PAYLOAD_LEN_OFFSET..WEBTRANSPORT_HTTP_PREFIX_LEN]
             .try_into()
             .expect("fixed-size payload length slice"),
     ) as usize;
@@ -315,22 +297,24 @@ impl<'a> PayloadCursor<'a> {
     }
 
     fn read_u16(&mut self, field: &str) -> Result<u16, ProtocolError> {
-        let bytes = self.read_exact(field, 2)?;
-        Ok(u16::from_be_bytes(
-            bytes.try_into().expect("fixed-size u16 slice"),
-        ))
+        self.read_exact(field, 2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
     fn read_u32(&mut self, field: &str) -> Result<u32, ProtocolError> {
-        let bytes = self.read_exact(field, 4)?;
-        Ok(u32::from_be_bytes(
-            bytes.try_into().expect("fixed-size u32 slice"),
-        ))
+        self.read_exact(field, 4)
+            .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn read_len_prefixed_string_u32(&mut self, field: &str) -> Result<String, ProtocolError> {
         let bytes = self.read_len_prefixed_bytes_u32(field)?;
-        self.read_string(field, bytes)
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|error| {
+                ProtocolError::ProtocolViolation(format!(
+                    "invalid UTF-8 WebTransport HTTP {field}: {error}"
+                ))
+            })
     }
 
     fn read_len_prefixed_bytes_u16(&mut self, field: &str) -> Result<&'a [u8], ProtocolError> {
@@ -341,16 +325,6 @@ impl<'a> PayloadCursor<'a> {
     fn read_len_prefixed_bytes_u32(&mut self, field: &str) -> Result<&'a [u8], ProtocolError> {
         let len = self.read_u32(field)? as usize;
         self.read_exact(field, len)
-    }
-
-    fn read_string(&mut self, field: &str, bytes: &'a [u8]) -> Result<String, ProtocolError> {
-        std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|error| {
-                ProtocolError::ProtocolViolation(format!(
-                    "invalid UTF-8 WebTransport HTTP {field}: {error}"
-                ))
-            })
     }
 
     fn read_exact(&mut self, field: &str, len: usize) -> Result<&'a [u8], ProtocolError> {
@@ -391,6 +365,17 @@ mod tests {
     use super::*;
     use crate::tunnel_contract::{HEADER_MODEL, HEADER_STARGATE_RETRYABLE};
 
+    const GET_REQUEST_FIELDS: &[u8] = b"\0\x03GET\0\0\0\x01/";
+
+    fn assert_head_prefix(encoded: &[u8], kind: u8) -> &[u8] {
+        assert_eq!(
+            &encoded[..WEBTRANSPORT_HTTP_MAGIC.len()],
+            WEBTRANSPORT_HTTP_MAGIC
+        );
+        assert_eq!(encoded[WEBTRANSPORT_HTTP_MAGIC.len()], kind);
+        &encoded[WEBTRANSPORT_HTTP_PREFIX_LEN..]
+    }
+
     #[test]
     fn request_head_roundtrips_http_semantics() {
         let mut headers = HeaderMap::new();
@@ -404,15 +389,7 @@ mod tests {
         };
 
         let encoded = encode_webtransport_http_request_head(&head).unwrap();
-        assert_eq!(
-            &encoded[..WEBTRANSPORT_HTTP_MAGIC.len()],
-            WEBTRANSPORT_HTTP_MAGIC
-        );
-        assert_eq!(
-            encoded[WEBTRANSPORT_HTTP_MAGIC.len()],
-            WEBTRANSPORT_HTTP_KIND_REQUEST
-        );
-        let payload = &encoded[WEBTRANSPORT_HTTP_PREFIX_LEN..];
+        let payload = assert_head_prefix(&encoded, WEBTRANSPORT_HTTP_KIND_REQUEST);
         let decoded = decode_webtransport_http_request_head_payload(payload).unwrap();
 
         assert_eq!(decoded.method, Method::POST);
@@ -438,15 +415,7 @@ mod tests {
         };
 
         let encoded = encode_webtransport_http_response_head(&head).unwrap();
-        assert_eq!(
-            &encoded[..WEBTRANSPORT_HTTP_MAGIC.len()],
-            WEBTRANSPORT_HTTP_MAGIC
-        );
-        assert_eq!(
-            encoded[WEBTRANSPORT_HTTP_MAGIC.len()],
-            WEBTRANSPORT_HTTP_KIND_RESPONSE
-        );
-        let payload = &encoded[WEBTRANSPORT_HTTP_PREFIX_LEN..];
+        let payload = assert_head_prefix(&encoded, WEBTRANSPORT_HTTP_KIND_RESPONSE);
         let decoded = decode_webtransport_http_response_head_payload(payload).unwrap();
 
         assert_eq!(decoded.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -469,11 +438,7 @@ mod tests {
 
     #[test]
     fn request_head_rejects_excessive_header_count_before_allocation() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&3_u16.to_be_bytes());
-        payload.extend_from_slice(b"GET");
-        payload.extend_from_slice(&1_u32.to_be_bytes());
-        payload.extend_from_slice(b"/");
+        let mut payload = GET_REQUEST_FIELDS.to_vec();
         payload.extend_from_slice(&(MAX_WEBTRANSPORT_HTTP_HEADER_COUNT + 1).to_be_bytes());
 
         let error = decode_webtransport_http_request_head_payload(&payload).unwrap_err();
@@ -488,11 +453,7 @@ mod tests {
 
     #[test]
     fn request_head_rejects_non_utf8_header_value() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&3_u16.to_be_bytes());
-        payload.extend_from_slice(b"GET");
-        payload.extend_from_slice(&1_u32.to_be_bytes());
-        payload.extend_from_slice(b"/");
+        let mut payload = GET_REQUEST_FIELDS.to_vec();
         payload.extend_from_slice(&1_u32.to_be_bytes());
         payload.extend_from_slice(&8_u16.to_be_bytes());
         payload.extend_from_slice(b"x-binary");

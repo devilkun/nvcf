@@ -1,5 +1,5 @@
 @startuml
-title Kubernetes Multi-Stargate Forwarding Flow
+title Development-Only Kubernetes Multi-Stargate Peer Relay Flow
 
 skinparam backgroundColor white
 skinparam shadowing false
@@ -21,20 +21,24 @@ box "Kubernetes" #f5f5f5
 end box
 
 box "Stargate Pod A" #f0f7e8
-  participant "gRPC + Forwarding\n(Pod A)" as GrpcA
+  participant "gRPC + Dev Peer Relay\n(Pod A)" as GrpcA
   participant "Reverse Listener\n(Pod A)" as ReverseA
   participant "HTTP Proxy\n(Pod A)" as ProxyA
 end box
 
 box "Stargate Pod B" #f0f7e8
-  participant "gRPC + Forwarding\n(Pod B)" as GrpcB
+  participant "gRPC + Dev Peer Relay\n(Pod B)" as GrpcB
   participant "Reverse Listener\n(Pod B)" as ReverseB
 end box
 
 note over ClusterIP
-  This diagram shows the built-in peer-relay
-  topology when the optional backend-facing
-  stargate-k8s-router is not deployed.
+  DEVELOPMENT ONLY: this diagram shows the
+  built-in peer-relay topology when
+  --enable-dev-peer-forwarding is explicitly set
+  and the backend-facing stargate-k8s-router
+  is not deployed.
+  The flag defaults to false and must not be
+  used in production.
   Backend clients use ClusterIP for gRPC
   registration and QUIC reverse tunnel.
   A DNS rewrite rule maps the configured
@@ -60,6 +64,10 @@ end note
 GrpcA -> HeadlessSvc: DNS lookup ready endpoints
 HeadlessSvc --> GrpcA: SRV targets\n[stargate-0..., stargate-1...]
 note right of GrpcA
+  Headless DNS and pod identity provide discovery
+  in every Kubernetes deployment. They do not
+  enable this relay without the explicit flag.
+
   WatchStargates returns hostnames
   from --advertised-hostname-template, e.g.:
   - stargate-0.stargate.external:50071
@@ -70,7 +78,7 @@ BackendCli -> ClusterIP: WatchStargates
 ClusterIP -> GrpcA: (routed to any pod)
 GrpcA --> BackendCli: StargateInfo snapshots\n(Pod A + Pod B hostnames)
 
-== gRPC Registration Forwarding ==
+== Development-Only gRPC Registration Relay ==
 note over BackendCli
   Client opens RegisterInferenceServer
   to Pod A's hostname through ClusterIP.
@@ -96,7 +104,7 @@ note over GrpcA
   for this backend.
 end note
 
-== QUIC Reverse Tunnel Forwarding ==
+== Development-Only QUIC Reverse Tunnel Relay ==
 note over BackendCli
   Client connects reverse tunnel to
   the ACK pylon dial address, defaulting

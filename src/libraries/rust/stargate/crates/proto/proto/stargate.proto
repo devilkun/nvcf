@@ -20,7 +20,6 @@ package stargate;
 service StargateControlPlane {
   rpc WatchStargates(WatchStargatesRequest) returns (stream WatchStargatesResponse);
   rpc RegisterInferenceServer(stream InferenceServerRegistration) returns (stream InferenceServerAck);
-  rpc SubmitClusterCalibration(SubmitClusterCalibrationRequest) returns (SubmitClusterCalibrationResponse);
 }
 
 // Frontend-facing model discovery service. Stargate serves this on a dedicated
@@ -74,12 +73,10 @@ message ListModelsResponse {
 }
 
 message ModelStats {
-  // Aggregation note for multi-backend clusters: Stargate currently aggregates
-  // backend-scoped fields below across active backends that share a
-  // `cluster_id` according to each field's semantics, and takes the latest
-  // active backend snapshot for the cluster-scoped fields below. This is
-  // routing policy, not a permanent API contract; individual fields may move
-  // between sections if the reported semantics change.
+  // For active backends that share a cluster_id, Stargate sums request-local
+  // rates and gauges, takes the maximum max_output_tps, combines priority queue
+  // estimates using input-throughput weighting, and sources shared engine state
+  // from one backend.
 
   // Sticky last valid mean input TPS for this backend observation. Stargate
   // never receives live/raw input TPS. For shared clusters, active backend
@@ -95,24 +92,23 @@ message ModelStats {
   // value, add a new field rather than overloading `queued_input_size`.
   uint64 queued_input_size = 4;
 
-  // Cluster-scoped shared-hardware/scheduler state.
+  // Maximum observed output TPS used as fallback routing capacity.
   double max_output_tps = 5;
+  // Cluster-scoped shared engine state. These fields are not summed.
   uint64 kv_cache_capacity_tokens = 6;
   uint64 kv_cache_used_tokens = 7;
   uint64 kv_cache_free_tokens = 8;
-  // Current number of model requests consuming scheduling capacity in the
-  // underlying cluster. Stargate currently treats this as latest-wins across
-  // active backends that share a `cluster_id`.
+  // Current number of requests handled by this backend.
   uint64 num_running_queries = 9;
   // Cluster scheduler concurrency capacity. A value of 0 means the backend did
   // not report this metric; routers should not apply the full-backend admission
   // filter.
   uint64 max_engine_concurrency = 10;
-  // Sum of input tokens across active/queued requests for this model in the
-  // underlying cluster.
+  // Sum of input tokens across requests handled by this backend.
   uint64 total_query_input_size = 11;
-  // Cluster queue-time estimates keyed by request priority. When populated,
-  // priority-aware routers should prefer this over aggregate queue work.
+  // Backend queue-time estimates keyed by request priority. When populated,
+  // priority-aware routers should prefer the cluster aggregate of this map over
+  // aggregate queue work.
   map<uint32, uint64> queue_time_estimate_ms_by_priority = 12;
   // Number of live requests still in input/prefill processing.
   uint64 input_processing_queries = 13;
@@ -141,15 +137,15 @@ message InferenceServerRegistration {
   map<string, InferenceServerModelRegistration> models = 3;
   bool reverse_tunnel = 4;
   string cluster_id = 5;
-  // When true, each receiving Stargate gates its local cluster route until
-  // one assigned pylon submits an initial cluster calibration result.
-  // Backend activity remains independent runtime state, not calibration proof.
-  bool coordinated_calibration = 6;
+  reserved 6;
+  reserved "coordinated_calibration";
 }
 
 message InferenceServerModelRegistration {
   ModelStats stats = 1;
   InferenceServerStatus status = 2;
+  reserved 3;
+  reserved "calibration";
 }
 
 message InferenceServerAck {
@@ -157,36 +153,10 @@ message InferenceServerAck {
   // tunnel. Pylons use this as QUIC SNI when the dial address differs from the
   // routing target.
   string reverse_tunnel_target = 1;
-  repeated ModelCalibrationDirective model_calibration_directives = 2;
+  reserved 2;
+  reserved "model_calibration_directives";
   // Non-empty address pylons should dial for reverse QUIC tunnels. This equals
   // `reverse_tunnel_target` unless Stargate is configured to preserve a per-pod
   // routing/SNI identity while routing UDP through a separate load balancer.
   string reverse_tunnel_pylon_dial_addr = 3;
-}
-
-message ModelCalibrationDirective {
-  string model_id = 1;
-  CalibrationState state = 2;
-  // Present only for RUN. The assigned pylon must return this opaque token
-  // through SubmitClusterCalibration; siblings never receive capacity values.
-  string assignment_token = 3;
-}
-
-message SubmitClusterCalibrationRequest {
-  string inference_server_id = 1;
-  string cluster_id = 2;
-  string model_id = 3;
-  string assignment_token = 4;
-  double measured_last_mean_input_tps = 5;
-}
-
-message SubmitClusterCalibrationResponse {
-  CalibrationState state = 1;
-}
-
-enum CalibrationState {
-  CALIBRATION_STATE_UNKNOWN = 0;
-  CALIBRATION_STATE_WAITING = 1;
-  CALIBRATION_STATE_RUN = 2;
-  CALIBRATION_STATE_COMPLETE = 3;
 }

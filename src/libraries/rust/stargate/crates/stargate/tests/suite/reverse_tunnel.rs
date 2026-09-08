@@ -15,31 +15,189 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::common::sse::{
+    assert_sse_done, chat_completion_contents, json_events, parse_sse_events,
+};
 use crate::common::{
-    bind_ephemeral_udp, init_crypto, make_stargate_runtime_with_reverse,
-    make_stargate_runtime_with_reverse_and_lb, start_dummy_backend, wait_for_inference_server_ids,
+    bind_ephemeral_udp, init_crypto, make_stargate_runtime_with_reverse_and_lb,
+    reverse_registration_config, start_dummy_backend, wait_for_inference_server_ids,
     wait_for_routing, wait_for_unroutable, with_proxy_headers,
 };
 use axum::Router;
-use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::{get, post};
 use pylon_lib::{
-    BringupConfig, InferenceServerRegistrationClient, InferenceServerRegistrationConfig,
-    OutputTokenParserFactory, ReverseQuicTunnelConfig, TunnelError, start_reverse_quic_tunnel,
+    InferenceServerRegistrationClient, InferenceServerRegistrationConfig, PylonRuntimeState,
+    ReverseQuicTunnelConfig, ReverseQuicTunnelHandle, TunnelError, start_reverse_quic_tunnel,
 };
+use stargate::runtime::StargateHandle;
 use stargate_proto::pb::InferenceServerRegistration;
 use stargate_proto::pb::InferenceServerStatus;
 use stargate_proto::pb::stargate_control_plane_client::StargateControlPlaneClient;
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
+
+const ROUTING_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ReverseStargate {
+    reverse_addr: SocketAddr,
+    grpc_addr: SocketAddr,
+    http_addr: SocketAddr,
+    handle: StargateHandle,
+}
+
+impl ReverseStargate {
+    async fn start(id: &str) -> Self {
+        Self::start_with_lb(id, None).await
+    }
+
+    async fn start_with_lb(id: &str, lb_config_path: Option<String>) -> Self {
+        init_crypto();
+        let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
+        let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse_and_lb(
+            id,
+            reverse_addr,
+            Some(reverse_socket),
+            lb_config_path,
+        );
+        let handle = runtime.start().await.expect("stargate failed to start");
+        Self {
+            reverse_addr,
+            grpc_addr,
+            http_addr,
+            handle,
+        }
+    }
+
+    fn register_backend(
+        &self,
+        inference_server_id: &str,
+        backend_addr: SocketAddr,
+        model: &str,
+    ) -> InferenceServerRegistrationClient {
+        let mut client = InferenceServerRegistrationClient::default();
+        client
+            .start(reverse_backend_registration(
+                self.grpc_addr,
+                inference_server_id,
+                backend_addr,
+                model,
+            ))
+            .unwrap_or_else(|error| {
+                panic!("failed to register reverse backend {inference_server_id}: {error}")
+            });
+        client
+    }
+
+    async fn wait_for_routing(&self, model: &str) {
+        wait_for_routing(self.http_addr, model, ROUTING_TIMEOUT).await;
+    }
+
+    async fn post_json(
+        &self,
+        path: &str,
+        model: &str,
+        request_id: &str,
+        body: &serde_json::Value,
+    ) -> reqwest::Response {
+        with_proxy_headers(
+            reqwest::Client::new().post(format!("http://{}{path}", self.http_addr)),
+            model,
+            request_id,
+        )
+        .header("content-type", "application/json")
+        .json(body)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("reverse tunnel request {request_id} failed: {error}"))
+    }
+
+    async fn post_streaming_chat(&self, model: &str, request_id: &str) -> reqwest::Response {
+        self.post_json(
+            "/v1/chat/completions",
+            model,
+            request_id,
+            &serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }),
+        )
+        .await
+    }
+
+    async fn shutdown(self) {
+        self.handle.begin_shutdown();
+        assert!(
+            self.handle.wait_for_shutdown(SHUTDOWN_TIMEOUT).await,
+            "stargate should shut down within {SHUTDOWN_TIMEOUT:?}"
+        );
+    }
+}
+
+fn assert_backend_headers(response: &reqwest::Response, inference_server_id: &str, url: &str) {
+    let headers = response.headers();
+    for (name, expected) in [
+        ("x-inference-server-id", inference_server_id),
+        ("x-inference-server-url", url),
+        ("x-stargate-cluster-id", inference_server_id),
+    ] {
+        let actual = headers
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .to_str()
+            .unwrap_or_else(|error| panic!("invalid {name}: {error}"));
+        assert_eq!(actual, expected, "unexpected {name}");
+    }
+}
+
+async fn connect_reverse_tunnel(
+    target: &str,
+    inference_server_id: &str,
+    retry_interval: Duration,
+    failure_context: &str,
+) -> ReverseQuicTunnelHandle {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+    let mut poll = tokio::time::interval(retry_interval);
+    loop {
+        let mut config = ReverseQuicTunnelConfig::new(
+            target.to_string(),
+            inference_server_id.to_string(),
+            "http://127.0.0.1:9999".to_string(),
+        );
+        config.quic_insecure = true;
+        match start_reverse_quic_tunnel(config).await {
+            Ok(handle) => return handle,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                poll.tick().await;
+            }
+            Err(error) => panic!("{failure_context}: {error}"),
+        }
+    }
+}
+
+fn reverse_backend_registration(
+    grpc_addr: SocketAddr,
+    inference_server_id: &str,
+    backend_addr: SocketAddr,
+    model: &str,
+) -> InferenceServerRegistrationConfig {
+    reverse_registration_config(
+        vec![grpc_addr.to_string()],
+        inference_server_id,
+        format!("http://{backend_addr}"),
+        PylonRuntimeState::new(InferenceServerStatus::Active, &[model.to_string()]),
+    )
+}
 
 async fn start_dummy_backend_with_responses(model: &str) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -48,25 +206,14 @@ async fn start_dummy_backend_with_responses(model: &str) -> std::net::SocketAddr
         .route("/v1/chat/completions", post(endpoint_contract_response))
         .route("/v1/responses", post(endpoint_contract_response))
         .route("/health", get(|| async { "ok" }))
-        .with_state(EndpointContractState {
-            model: model.to_string(),
-        });
+        .with_state(model.to_string());
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
     addr
 }
 
-#[derive(Clone)]
-struct EndpointContractState {
-    model: String,
-}
-
-async fn endpoint_contract_response(
-    State(state): State<EndpointContractState>,
-    req: Request,
-) -> Response {
-    let model = state.model;
+async fn endpoint_contract_response(State(model): State<String>, req: Request) -> Response {
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -78,68 +225,47 @@ async fn endpoint_contract_response(
         } else {
             "responses unavailable"
         };
-        let mut response = axum::Json(serde_json::json!({
-            "error": error,
-        }))
-        .into_response();
-        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        return response;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": error,
+            })),
+        )
+            .into_response();
     }
-
     let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
         .await
         .expect("request body should be readable");
     let request_json: serde_json::Value =
         serde_json::from_slice(&body).expect("request body should be json");
-
     let is_chat_completion = path_and_query.starts_with("/v1/chat/completions");
     if is_chat_completion
         && request_json.get("stream").and_then(|value| value.as_bool()) != Some(true)
     {
         return axum::Json(serde_json::json!({
-            "id": "chatcmpl-reverse-test",
-            "object": "chat.completion",
-            "model": model,
+            "id": "chatcmpl-reverse-test", "object": "chat.completion", "model": model,
             "path_and_query": path_and_query,
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": "reverse contract echo" },
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": 1,
-                "completion_tokens": 3,
-                "total_tokens": 4,
-            },
+            "choices": [{"index": 0, "message": {
+                "role": "assistant", "content": "reverse contract echo"
+            }, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 3, "total_tokens": 4},
         }))
         .into_response();
     }
-
     let stream_body = if is_chat_completion {
         format!(
             "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
             serde_json::json!({
-                "id": "chatcmpl-reverse-test",
-                "object": "chat.completion.chunk",
-                "model": model.clone(),
-                "path_and_query": path_and_query.clone(),
-                "choices": [{
-                    "index": 0,
-                    "delta": { "role": "assistant" },
-                    "finish_reason": null,
-                }],
+                "id": "chatcmpl-reverse-test", "object": "chat.completion.chunk",
+                "model": model.clone(), "path_and_query": path_and_query.clone(),
+                "choices": [{"index": 0, "delta": {"role": "assistant"},
+                    "finish_reason": null}],
             }),
             serde_json::json!({
-                "id": "chatcmpl-reverse-test",
-                "object": "chat.completion.chunk",
-                "model": model,
-                "path_and_query": path_and_query,
-                "request": request_json,
-                "choices": [{
-                    "index": 0,
-                    "delta": { "content": "reverse contract echo" },
-                    "finish_reason": null,
-                }],
+                "id": "chatcmpl-reverse-test", "object": "chat.completion.chunk",
+                "model": model, "path_and_query": path_and_query, "request": request_json,
+                "choices": [{"index": 0, "delta": {"content": "reverse contract echo"},
+                    "finish_reason": null}],
             })
         )
     } else {
@@ -147,656 +273,268 @@ async fn endpoint_contract_response(
             "event: response.completed\ndata: {}\n\n",
             serde_json::json!({
                 "type": "response.completed",
-                "response": {
-                    "object": "response",
-                    "model": model,
-                    "path_and_query": path_and_query,
-                    "request": request_json,
-                },
+                "response": {"object": "response", "model": model,
+                    "path_and_query": path_and_query, "request": request_json},
             })
         )
     };
+    ([("content-type", "text/event-stream")], stream_body).into_response()
+}
 
-    let mut response = Response::new(Body::from(stream_body));
-    response.headers_mut().insert(
-        HeaderName::from_static("content-type"),
-        HeaderValue::from_static("text/event-stream"),
-    );
-    response
+fn assert_json_string_fields(actual: &serde_json::Value, expected: &[(&str, &str)]) {
+    for (pointer, value) in expected {
+        assert_eq!(
+            actual.pointer(pointer).and_then(serde_json::Value::as_str),
+            Some(*value),
+            "unexpected {pointer}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn reverse_tunnel_proxies_chat_endpoint_contract() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-chat-contract",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-chat-contract").await;
     let backend_addr = start_dummy_backend_with_responses("rt-chat-contract-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-chat-contract-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-chat-contract-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-chat-contract-model", Duration::from_secs(10)).await;
-
-    let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/chat/completions?trace=reverse-chat");
+    let mut reg_client = stargate.register_backend(
+        "rt-chat-contract-inst",
+        backend_addr,
+        "rt-chat-contract-model",
+    );
+    stargate.wait_for_routing("rt-chat-contract-model").await;
     let body = serde_json::json!({
         "model": "rt-chat-contract-model",
         "messages": [{"role": "user", "content": "reverse contract"}],
         "stream": true,
     });
-
-    let resp = with_proxy_headers(
-        http_client.post(&stargate_url),
-        "rt-chat-contract-model",
-        "req-rt-chat-contract",
-    )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("reverse chat contract request failed");
+    let resp = stargate
+        .post_json(
+            "/v1/chat/completions?trace=reverse-chat",
+            "rt-chat-contract-model",
+            "req-rt-chat-contract",
+            &body,
+        )
+        .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("x-inference-server-id")
-            .expect("missing x-inference-server-id")
-            .to_str()
-            .unwrap(),
-        "rt-chat-contract-inst"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("x-inference-server-url")
-            .expect("missing x-inference-server-url")
-            .to_str()
-            .unwrap(),
-        format!("http://{backend_addr}")
-    );
-    assert_eq!(
-        resp.headers()
-            .get("x-stargate-cluster-id")
-            .expect("missing x-stargate-cluster-id")
-            .to_str()
-            .unwrap(),
-        "rt-chat-contract-inst"
+    assert_backend_headers(
+        &resp,
+        "rt-chat-contract-inst",
+        &format!("http://{backend_addr}"),
     );
     let response_text = resp.text().await.expect("response should be text");
-    assert!(response_text.contains(r#""object":"chat.completion.chunk""#));
-    assert!(response_text.contains(r#""model":"rt-chat-contract-model""#));
-    assert!(
-        response_text.contains(r#""path_and_query":"/v1/chat/completions?trace=reverse-chat""#)
+    let events = parse_sse_events(&response_text).expect("response should be valid SSE");
+    assert_sse_done(&events);
+    let payloads = json_events(&events);
+    let payload = payloads
+        .iter()
+        .find(|payload| {
+            payload.pointer("/choices/0/delta/content")
+                == Some(&serde_json::json!("reverse contract echo"))
+        })
+        .unwrap_or_else(|| {
+            panic!("reverse chat SSE payload did not preserve the endpoint contract: {payloads:#?}")
+        });
+    assert_json_string_fields(
+        payload,
+        &[
+            ("/object", "chat.completion.chunk"),
+            ("/model", "rt-chat-contract-model"),
+            ("/path_and_query", "/v1/chat/completions?trace=reverse-chat"),
+            ("/request/messages/0/content", "reverse contract"),
+        ],
     );
-    assert!(response_text.contains(r#""content":"reverse contract echo""#));
-    assert!(response_text.contains(r#""content":"reverse contract""#));
-    assert!(response_text.contains("[DONE]"));
-
     reg_client.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverse_tunnel_proxies_streaming_response() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) =
-        make_stargate_runtime_with_reverse("test-sg-rt-stream", reverse_addr, Some(reverse_socket));
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-stream").await;
     let backend_addr = start_dummy_backend("rt-stream-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-stream-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-stream-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-stream-model", Duration::from_secs(10)).await;
-
-    let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rt-stream-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-
-    let resp = with_proxy_headers(
-        http_client.post(&stargate_url),
-        "rt-stream-model",
-        "req-rt-stream",
-    )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("streaming request failed");
+    let mut reg_client =
+        stargate.register_backend("rt-stream-inst", backend_addr, "rt-stream-model");
+    stargate.wait_for_routing("rt-stream-model").await;
+    let resp = stargate
+        .post_streaming_chat("rt-stream-model", "req-rt-stream")
+        .await;
     assert_eq!(resp.status(), 200);
-
     let sse_text = resp.text().await.expect("failed to read streaming body");
-    assert!(sse_text.contains("Hello"), "SSE should contain 'Hello'");
-    assert!(sse_text.contains(" world"), "SSE should contain ' world'");
-    assert!(sse_text.contains("!"), "SSE should contain '!'");
-    assert!(sse_text.contains("[DONE]"), "SSE should end with [DONE]");
-
+    let events = parse_sse_events(&sse_text).expect("streaming body should be valid SSE");
+    assert_sse_done(&events);
+    assert_eq!(
+        chat_completion_contents(&events),
+        vec!["Hello", " world", "!"]
+    );
     reg_client.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverse_tunnel_proxies_responses_response() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-responses",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-responses").await;
     let backend_addr = start_dummy_backend_with_responses("rt-responses-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-responses-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-responses-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-responses-model", Duration::from_secs(10)).await;
-
-    let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/responses?trace=reverse-responses");
+    let mut reg_client =
+        stargate.register_backend("rt-responses-inst", backend_addr, "rt-responses-model");
+    stargate.wait_for_routing("rt-responses-model").await;
     let body = serde_json::json!({
         "model": "rt-responses-model",
         "input": "hi",
         "max_output_tokens": 2,
         "stream": true,
     });
-
-    let resp = with_proxy_headers(
-        http_client.post(&stargate_url),
-        "rt-responses-model",
-        "req-rt-responses",
-    )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("responses request failed");
+    let resp = stargate
+        .post_json(
+            "/v1/responses?trace=reverse-responses",
+            "rt-responses-model",
+            "req-rt-responses",
+            &body,
+        )
+        .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("x-inference-server-id")
-            .expect("missing x-inference-server-id")
-            .to_str()
-            .unwrap(),
-        "rt-responses-inst"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("x-inference-server-url")
-            .expect("missing x-inference-server-url")
-            .to_str()
-            .unwrap(),
-        format!("http://{backend_addr}")
-    );
-    assert_eq!(
-        resp.headers()
-            .get("x-stargate-cluster-id")
-            .expect("missing x-stargate-cluster-id")
-            .to_str()
-            .unwrap(),
-        "rt-responses-inst"
+    assert_backend_headers(
+        &resp,
+        "rt-responses-inst",
+        &format!("http://{backend_addr}"),
     );
     let response_text = resp.text().await.expect("response should be text");
-    assert!(response_text.contains("event: response.completed"));
-    assert!(response_text.contains(r#""type":"response.completed""#));
-    assert!(response_text.contains(r#""object":"response""#));
-    assert!(response_text.contains(r#""model":"rt-responses-model""#));
-    assert!(response_text.contains(r#""path_and_query":"/v1/responses?trace=reverse-responses""#));
-    assert!(response_text.contains(r#""input":"hi""#));
-    assert!(response_text.contains(r#""stream":true"#));
-
+    let events = parse_sse_events(&response_text).expect("response should be valid SSE");
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| event.event_name.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["response.completed"]
+    );
+    let payloads = json_events(&events);
+    let completed = payloads
+        .iter()
+        .find(|payload| payload["type"] == "response.completed")
+        .expect("responses stream should include response.completed");
+    assert_json_string_fields(
+        completed,
+        &[
+            ("/response/object", "response"),
+            ("/response/model", "rt-responses-model"),
+            (
+                "/response/path_and_query",
+                "/v1/responses?trace=reverse-responses",
+            ),
+            ("/response/request/input", "hi"),
+        ],
+    );
+    assert_eq!(completed["response"]["request"]["stream"], true);
     reg_client.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverse_tunnel_forwards_endpoint_upstream_errors() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-endpoint-errors",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-endpoint-errors").await;
     let backend_addr = start_dummy_backend_with_responses("rt-error-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-error-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-error-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-error-model", Duration::from_secs(10)).await;
-
-    let http_client = reqwest::Client::new();
+    let mut reg_client = stargate.register_backend("rt-error-inst", backend_addr, "rt-error-model");
+    stargate.wait_for_routing("rt-error-model").await;
     let expected_url = format!("http://{backend_addr}");
     let cases = [
         (
             "/v1/chat/completions?fail=1",
-            serde_json::json!({
-                "model": "rt-error-model",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true,
-            }),
             "chat completions unavailable",
+            serde_json::json!({"model": "rt-error-model", "messages": [{"role": "user",
+                "content": "hi"}], "stream": true}),
         ),
         (
             "/v1/responses?fail=1",
-            serde_json::json!({
-                "model": "rt-error-model",
-                "input": "hi",
-                "stream": true,
-            }),
             "responses unavailable",
+            serde_json::json!({"model": "rt-error-model", "input": "hi", "stream": true}),
         ),
     ];
-
-    for (path, body, expected_error) in cases {
-        let resp = with_proxy_headers(
-            http_client.post(format!("http://{http_addr}{path}")),
-            "rt-error-model",
-            &format!("req-rt-error-{path}"),
-        )
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .expect("reverse upstream error request failed");
+    for (path, expected_error, body) in cases {
+        let resp = stargate
+            .post_json(
+                path,
+                "rt-error-model",
+                &format!("req-rt-error-{path}"),
+                &body,
+            )
+            .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            resp.headers()
-                .get("x-inference-server-id")
-                .expect("missing x-inference-server-id")
-                .to_str()
-                .unwrap(),
-            "rt-error-inst"
-        );
-        assert_eq!(
-            resp.headers()
-                .get("x-inference-server-url")
-                .expect("missing x-inference-server-url")
-                .to_str()
-                .unwrap(),
-            expected_url
-        );
-        assert_eq!(
-            resp.headers()
-                .get("x-stargate-cluster-id")
-                .expect("missing x-stargate-cluster-id")
-                .to_str()
-                .unwrap(),
-            "rt-error-inst"
-        );
+        assert_backend_headers(&resp, "rt-error-inst", &expected_url);
         let response_json: serde_json::Value = resp.json().await.expect("response should be json");
         assert_eq!(response_json["error"], expected_error);
     }
-
     reg_client.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
-/// The QUIC tunnel enforces streaming for chat completions. Non-streaming
-/// requests through a reverse tunnel should also be rejected with 400.
+/// Reverse-tunnel chat completions must reject non-streaming requests with 400.
 #[tokio::test]
 async fn reverse_tunnel_rejects_non_streaming_chat_completions() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-nonstream",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-nonstream").await;
     let backend_addr = start_dummy_backend("rt-ns-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-ns-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-ns-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-ns-model", Duration::from_secs(10)).await;
-
-    let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/chat/completions");
+    let mut reg_client = stargate.register_backend("rt-ns-inst", backend_addr, "rt-ns-model");
+    stargate.wait_for_routing("rt-ns-model").await;
     let body = serde_json::json!({
         "model": "rt-ns-model",
         "messages": [{"role": "user", "content": "hi"}],
     });
-
-    let resp = with_proxy_headers(
-        http_client.post(&stargate_url),
-        "rt-ns-model",
-        "req-rt-nonstream",
-    )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("non-streaming request failed");
+    let resp = stargate
+        .post_json(
+            "/v1/chat/completions",
+            "rt-ns-model",
+            "req-rt-nonstream",
+            &body,
+        )
+        .await;
     assert_eq!(
         resp.status(),
         400,
         "non-streaming chat completions should be rejected by reverse tunnel"
     );
-
     reg_client.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverse_tunnel_disconnection_removes_from_routing() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-disconnect",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-disconnect").await;
     let backend_addr = start_dummy_backend("rt-disc-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-disc-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-disc-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-disc-model", Duration::from_secs(10)).await;
-
+    let mut reg_client = stargate.register_backend("rt-disc-inst", backend_addr, "rt-disc-model");
+    stargate.wait_for_routing("rt-disc-model").await;
     reg_client.stop();
-
-    wait_for_unroutable(http_addr, "rt-disc-model", Duration::from_secs(10)).await;
-
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    wait_for_unroutable(stargate.http_addr, "rt-disc-model", ROUTING_TIMEOUT).await;
+    stargate.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverse_tunnel_reconnection_restores_routing() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-reconnect",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-reconnect").await;
     let backend_addr = start_dummy_backend("rt-recon-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-recon-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-recon-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-recon-model", Duration::from_secs(10)).await;
-
+    let mut reg_client = stargate.register_backend("rt-recon-inst", backend_addr, "rt-recon-model");
+    stargate.wait_for_routing("rt-recon-model").await;
     reg_client.stop();
-    wait_for_unroutable(http_addr, "rt-recon-model", Duration::from_secs(10)).await;
+    wait_for_unroutable(stargate.http_addr, "rt-recon-model", ROUTING_TIMEOUT).await;
 
-    // Re-register with the same backend
-    let mut reg_client2 = InferenceServerRegistrationClient::default();
-    let _channels2 = reg_client2
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-recon-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-recon-model".to_string()],
-        )
-        .expect("re-registration failed");
-
-    wait_for_routing(http_addr, "rt-recon-model", Duration::from_secs(10)).await;
-
-    let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rt-recon-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-    let resp = with_proxy_headers(
-        http_client.post(&stargate_url),
-        "rt-recon-model",
-        "req-rt-recon-verify",
-    )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("request after reconnection failed");
+    // The same backend identity must become routable again.
+    let mut reg_client2 =
+        stargate.register_backend("rt-recon-inst", backend_addr, "rt-recon-model");
+    stargate.wait_for_routing("rt-recon-model").await;
+    let resp = stargate
+        .post_streaming_chat("rt-recon-model", "req-rt-recon-verify")
+        .await;
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
-    assert!(text.contains("[DONE]"), "SSE should end with [DONE]");
-
+    assert_sse_done(&parse_sse_events(&text).expect("reconnected stream should be valid SSE"));
     reg_client2.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverse_tunnel_unregistered_id_rejected() {
-    init_crypto();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (_grpc_addr, _http_addr, runtime) =
-        make_stargate_runtime_with_reverse("test-sg-rt-unreg", reverse_addr, Some(reverse_socket));
-    let handle = runtime.start().await.expect("stargate failed to start");
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let stargate = ReverseStargate::start("test-sg-rt-unreg").await;
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
     let mut poll = tokio::time::interval(Duration::from_millis(50));
+
     let result = loop {
         let mut cfg = ReverseQuicTunnelConfig::new(
-            format!("localhost:{}", reverse_addr.port()),
+            format!("localhost:{}", stargate.reverse_addr.port()),
             "totally-unknown-inst".to_string(),
             "http://127.0.0.1:9999".to_string(),
         );
@@ -825,99 +563,23 @@ async fn reverse_tunnel_unregistered_id_rejected() {
             panic!("expected reverse handshake rejection for unregistered id");
         }
     }
-
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
 #[tokio::test]
 async fn reverse_tunnel_multiple_instances() {
-    init_crypto();
-
     let mut tmp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
     write!(tmp_file, r#"{{"default": "round-robin", "models": {{}}}}"#)
         .expect("failed to write config");
     let config_path = tmp_file.path().to_str().unwrap().to_string();
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse_and_lb(
-        "test-sg-rt-multi",
-        reverse_addr,
-        Some(reverse_socket),
-        Some(config_path),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start_with_lb("test-sg-rt-multi", Some(config_path)).await;
     let backend_addr_a = start_dummy_backend("rt-multi-model").await;
     let backend_addr_b = start_dummy_backend("rt-multi-model").await;
-
-    let mut reg_a = InferenceServerRegistrationClient::default();
-    let _channels_a = reg_a
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-multi-a".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr_a}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr_a}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-multi-model".to_string()],
-        )
-        .expect("registration failed");
-
-    let mut reg_b = InferenceServerRegistrationClient::default();
-    let _channels_b = reg_b
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-multi-b".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr_b}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr_b}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-multi-model".to_string()],
-        )
-        .expect("registration failed");
-
-    // Wait for both instances to become routable
-    let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rt-multi-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
+    let mut reg_a = stargate.register_backend("rt-multi-a", backend_addr_a, "rt-multi-model");
+    let mut reg_b = stargate.register_backend("rt-multi-b", backend_addr_b, "rt-multi-model");
 
     let seen = wait_for_inference_server_ids(
-        http_addr,
+        stargate.http_addr,
         "rt-multi-model",
         "req-rt-multi-wait",
         2,
@@ -931,19 +593,11 @@ async fn reverse_tunnel_multiple_instances() {
         "expected both reverse tunnel instances to register, saw: {seen:?}"
     );
 
-    // Verify both IDs appear in subsequent requests (round-robin)
     let mut ids = HashSet::new();
     for _ in 0..6 {
-        let resp = with_proxy_headers(
-            http_client.post(&stargate_url),
-            "rt-multi-model",
-            "req-rt-multi-run",
-        )
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .expect("request failed");
+        let resp = stargate
+            .post_streaming_chat("rt-multi-model", "req-rt-multi-run")
+            .await;
         assert_eq!(resp.status(), 200);
         let id = resp
             .headers()
@@ -959,39 +613,25 @@ async fn reverse_tunnel_multiple_instances() {
         2,
         "round-robin over 6 requests should hit both instances, saw: {ids:?}"
     );
-
     reg_a.stop();
     reg_b.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
-/// Regression: the reverse tunnel loop used to reconnect on every registration
-/// heartbeat ACK because the endpoint watch receiver fires whenever the sender
-/// calls `send()`, even with the same value. When the endpoint hadn't actually
-/// changed, the select fell through, the tunnel handle was dropped, and the
-/// outer loop created a brand-new QUIC connection -- producing a reconnect
-/// storm visible as hundreds of "reverse tunnel connected" log lines per second.
-///
-/// This test registers a reverse-tunnel instance, waits for it to become
-/// routable, then lets heartbeats flow for 3 seconds. It captures tracing
-/// events and asserts that "reverse tunnel connected" fires exactly once.
+/// Regression: duplicate registration heartbeat ACKs once caused a QUIC reconnect
+/// storm. Count connection events through 30 ACK opportunities and prove the
+/// established tunnel remains connected and functional.
 #[tokio::test]
 async fn reverse_tunnel_does_not_reconnect_on_duplicate_acks() {
-    init_crypto();
-
     let connect_count = Arc::new(AtomicU64::new(0));
-
     struct ConnectCounter(Arc<AtomicU64>);
-
     impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for ConnectCounter {
         fn on_event(
             &self,
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            let meta = event.metadata();
-            if meta.target().contains("pylon_lib") {
+            if event.metadata().target().contains("pylon_lib") {
                 struct MessageVisitor<'a>(&'a AtomicU64);
                 impl tracing::field::Visit for MessageVisitor<'_> {
                     fn record_debug(
@@ -999,11 +639,10 @@ async fn reverse_tunnel_does_not_reconnect_on_duplicate_acks() {
                         field: &tracing::field::Field,
                         value: &dyn std::fmt::Debug,
                     ) {
-                        if field.name() == "message" {
-                            let msg = format!("{value:?}");
-                            if msg.contains("reverse tunnel connected") {
-                                self.0.fetch_add(1, Ordering::Relaxed);
-                            }
+                        if field.name() == "message"
+                            && format!("{value:?}").contains("reverse tunnel connected")
+                        {
+                            self.0.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -1011,7 +650,6 @@ async fn reverse_tunnel_does_not_reconnect_on_duplicate_acks() {
             }
         }
     }
-
     let _guard = {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -1019,52 +657,13 @@ async fn reverse_tunnel_does_not_reconnect_on_duplicate_acks() {
             .with(ConnectCounter(connect_count.clone()))
             .set_default()
     };
-
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-no-storm",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let handle = runtime.start().await.expect("stargate failed to start");
-
+    let stargate = ReverseStargate::start("test-sg-rt-no-storm").await;
     let backend_addr = start_dummy_backend("rt-storm-model").await;
-
-    let mut reg_client = InferenceServerRegistrationClient::default();
-    let _channels = reg_client
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "rt-storm-inst".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: format!("http://{backend_addr}"),
-                upstream_http_base_url: Some(format!("http://{backend_addr}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: true,
-                bringup: BringupConfig::default(),
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["rt-storm-model".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing(http_addr, "rt-storm-model", Duration::from_secs(10)).await;
-
-    // Reset counter after initial connection is established
+    let mut reg_client = stargate.register_backend("rt-storm-inst", backend_addr, "rt-storm-model");
+    stargate.wait_for_routing("rt-storm-model").await;
     connect_count.store(0, Ordering::SeqCst);
 
-    // Let ~30 heartbeat ACK opportunities pass. If the bug is present, the
-    // tunnel reconnects on duplicate ACKs and the counter trips during this window.
+    // Any reconnect during 30 heartbeat opportunities must fail immediately.
     let mut heartbeat_window = tokio::time::interval(Duration::from_millis(100));
     heartbeat_window.tick().await;
     for _ in 0..30 {
@@ -1076,26 +675,10 @@ async fn reverse_tunnel_does_not_reconnect_on_duplicate_acks() {
         );
     }
 
-    // Verify the tunnel is still functional
-    let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/chat/completions");
-    let body = serde_json::json!({
-        "model": "rt-storm-model",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": true,
-    });
-    let resp = with_proxy_headers(
-        http_client.post(&stargate_url),
-        "rt-storm-model",
-        "req-rt-storm-verify",
-    )
-    .header("content-type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .expect("request after steady-state failed");
+    let resp = stargate
+        .post_streaming_chat("rt-storm-model", "req-rt-storm-verify")
+        .await;
     assert_eq!(resp.status(), 200);
-
     let reconnects = connect_count.load(Ordering::SeqCst);
     assert_eq!(
         reconnects, 0,
@@ -1104,32 +687,17 @@ async fn reverse_tunnel_does_not_reconnect_on_duplicate_acks() {
     );
 
     reg_client.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }
 
-/// Reproduces a connection leak: dropping a ReverseQuicTunnelHandle without
-/// calling shutdown() leaves the QUIC connection alive on the server. A
-/// subsequent connection attempt with the same inference_server_id is then
-/// NACKed as "duplicate connection" indefinitely.
-///
-/// This simulates what happens when the registration loop calls task.abort()
-/// on the reverse tunnel task without cleanly shutting down the handle.
+/// Regression: dropping a tunnel handle without `shutdown()` must release the
+/// server connection so the same inference-server identity can reconnect.
 #[tokio::test]
 async fn dropped_handle_does_not_block_reconnection() {
-    init_crypto();
+    let stargate = ReverseStargate::start("test-sg-rt-drop-leak").await;
 
-    let (reverse_addr, reverse_socket) = bind_ephemeral_udp();
-    let (grpc_addr, _http_addr, runtime) = make_stargate_runtime_with_reverse(
-        "test-sg-rt-drop-leak",
-        reverse_addr,
-        Some(reverse_socket),
-    );
-    let sg_handle = runtime.start().await.expect("stargate failed to start");
-
-    // Register the inference server via raw gRPC so the server allows
-    // the reverse tunnel handshake.
-    let endpoint = format!("http://{grpc_addr}");
+    // Raw gRPC registration authorizes the reverse handshake.
+    let endpoint = format!("http://{}", stargate.grpc_addr);
     let channel = Channel::from_shared(endpoint)
         .unwrap()
         .connect()
@@ -1143,7 +711,6 @@ async fn dropped_handle_does_not_block_reconnection() {
         inference_server_url: "http://127.0.0.1:9999".to_string(),
         models: Default::default(),
         reverse_tunnel: true,
-        coordinated_calibration: false,
     })
     .await
     .unwrap();
@@ -1152,60 +719,25 @@ async fn dropped_handle_does_not_block_reconnection() {
         .await
         .expect("registration rpc failed");
 
-    let target = format!("localhost:{}", reverse_addr.port());
-
-    // Connect the first reverse tunnel, retrying until registration propagates.
-    let handle1 = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut poll = tokio::time::interval(Duration::from_millis(50));
-        loop {
-            let mut cfg = ReverseQuicTunnelConfig::new(
-                target.clone(),
-                "drop-leak-inst".to_string(),
-                "http://127.0.0.1:9999".to_string(),
-            );
-            cfg.quic_insecure = true;
-            match start_reverse_quic_tunnel(cfg).await {
-                Ok(h) => break h,
-                Err(_) if tokio::time::Instant::now() < deadline => {
-                    poll.tick().await;
-                }
-                Err(e) => panic!("first reverse tunnel failed: {e}"),
-            }
-        }
-    };
-
-    // Drop the handle WITHOUT calling shutdown(), simulating task.abort().
+    let target = format!("localhost:{}", stargate.reverse_addr.port());
+    let handle1 = connect_reverse_tunnel(
+        &target,
+        "drop-leak-inst",
+        Duration::from_millis(50),
+        "first reverse tunnel failed",
+    )
+    .await;
+    // Simulate task abortion rather than graceful tunnel shutdown.
     drop(handle1);
-
-    // Retry the second connection until the server detects the first handle's close.
-    let handle2 = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut poll = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            let mut cfg = ReverseQuicTunnelConfig::new(
-                target.clone(),
-                "drop-leak-inst".to_string(),
-                "http://127.0.0.1:9999".to_string(),
-            );
-            cfg.quic_insecure = true;
-            match start_reverse_quic_tunnel(cfg).await {
-                Ok(h) => break h,
-                Err(_) if tokio::time::Instant::now() < deadline => {
-                    poll.tick().await;
-                }
-                Err(e) => panic!(
-                    "second reverse tunnel should succeed after first handle was dropped, \
-                     but got: {e}"
-                ),
-            }
-        }
-    };
+    let handle2 = connect_reverse_tunnel(
+        &target,
+        "drop-leak-inst",
+        Duration::from_millis(100),
+        "second reverse tunnel should succeed after first handle was dropped",
+    )
+    .await;
     handle2.shutdown().await;
-
-    // Drop the registration request sender so the gRPC stream ends before
-    // stargate shutdown; otherwise tonic graceful shutdown can block.
+    // End the gRPC stream before tonic's graceful shutdown.
     drop(tx);
-    sg_handle.begin_shutdown();
-    sg_handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    stargate.shutdown().await;
 }

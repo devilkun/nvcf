@@ -26,6 +26,10 @@ pub const ALPN_PROTOCOL: &str = "stargate-quic/1";
 const MAX_QUIC_HEADER_COUNT: usize = 4096;
 const CAPNP_BYTES_PER_WORD: usize = 8;
 const CAPNP_BODY_MESSAGE_FIXED_WORDS: usize = 4;
+const CAPNP_LIST_ELEMENT_SIZE_BYTE: u64 = 2;
+const CAPNP_LIST_ELEMENT_SIZE_INLINE_COMPOSITE: u64 = 7;
+const CAPNP_MESSAGE_POINTER: u64 = (1 << 32) | (1 << 48);
+const CAPNP_PAYLOAD_POINTER: u64 = 1 << 48;
 // Cap'n Proto stores list lengths in a 29-bit pointer field; Text/Data are byte lists.
 const CAPNP_LIST_ELEMENT_COUNT_MAX: usize = (1usize << 29) - 1;
 // Intra-segment pointer offsets are signed 30-bit word counts.
@@ -45,101 +49,43 @@ pub enum QuicMessage {
 }
 
 impl std::fmt::Display for QuicMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            QuicMessage::Header(_) => write!(f, "Header"),
-            QuicMessage::Body(_) => write!(f, "Body"),
-            QuicMessage::Trailer(_) => write!(f, "Trailer"),
-        }
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Header(_) => "Header",
+            Self::Body(_) => "Body",
+            Self::Trailer(_) => "Trailer",
+        })
     }
 }
 
 impl QuicMessage {
     pub fn to_builder(&self) -> Result<TypedBuilder<quic_capnp::message::Owned>, ProtocolError> {
+        let mut builder = typed_builder::<quic_capnp::message::Owned>();
         match self {
-            QuicMessage::Header(header) => {
-                let mut builder: TypedBuilder<quic_capnp::message::Owned> =
-                    TypedBuilder::new_default();
-                builder.init_root();
-                let mut header_builder = builder.get_root()?.init_headers();
-                header_builder
-                    .reborrow()
-                    .init_entries(header.entries.len() as u32);
-                let mut entries_builder = header_builder.get_entries()?;
-                for (i, (key, value)) in header.entries.iter().enumerate() {
-                    let mut entry = entries_builder.reborrow().get(i as u32);
-                    entry.set_key(key)?;
-                    entry.set_value(value)?;
-                }
-                Ok(builder)
+            Self::Header(header) => {
+                write_entries(builder.get_root()?.init_headers(), &header.entries)?
             }
-            QuicMessage::Body(body) => {
-                let mut builder: TypedBuilder<quic_capnp::message::Owned> =
-                    TypedBuilder::new_default();
-                builder.init_root();
-                let mut body_builder = builder.get_root()?.init_body();
-                body_builder.reborrow().set_content(&body.content);
-                Ok(builder)
-            }
-            QuicMessage::Trailer(trailer) => {
-                let mut builder: TypedBuilder<quic_capnp::message::Owned> =
-                    TypedBuilder::new_default();
-                builder.init_root();
-                let mut header_builder = builder.get_root()?.init_trailers();
-                header_builder
-                    .reborrow()
-                    .init_entries(trailer.entries.len() as u32);
-                let mut entries_builder = header_builder.get_entries()?;
-                for (i, (key, value)) in trailer.entries.iter().enumerate() {
-                    let mut entry = entries_builder.reborrow().get(i as u32);
-                    entry.set_key(key)?;
-                    entry.set_value(value)?;
-                }
-                Ok(builder)
+            Self::Body(body) => builder.get_root()?.init_body().set_content(&body.content),
+            Self::Trailer(trailer) => {
+                write_entries(builder.get_root()?.init_trailers(), &trailer.entries)?
             }
         }
+        Ok(builder)
     }
 
     pub fn from_reader(
         reader: TypedReader<capnp::serialize::OwnedSegments, quic_capnp::message::Owned>,
     ) -> Result<Self, ProtocolError> {
-        let root = reader.get()?;
-        let which = root.which().map_err(|e| {
-            ProtocolError::ProtocolViolation(format!("unknown QuicMessage discriminant: {e}"))
-        })?;
-        match which {
-            quic_capnp::message::Which::Headers(Ok(headers)) => {
-                let entries = headers.get_entries()?;
-                let mut vec = Vec::with_capacity(entries.len() as usize);
-                for entry in entries {
-                    let k = entry.get_key()?.to_str().map_err(|e| {
-                        ProtocolError::InvalidHeader(format!("non-UTF8 header key: {e}"))
-                    })?;
-                    let v = entry.get_value()?.to_str().map_err(|e| {
-                        ProtocolError::InvalidHeader(format!("non-UTF8 header value: {e}"))
-                    })?;
-                    vec.push((k.to_owned(), v.to_owned()));
-                }
-                Ok(QuicMessage::Header(QuicHeader { entries: vec }))
-            }
-            quic_capnp::message::Which::Body(Ok(body)) => {
-                let content = body.get_content()?.to_vec().into();
-                Ok(QuicMessage::Body(QuicBody { content }))
-            }
-            quic_capnp::message::Which::Trailers(Ok(trailers)) => {
-                let entries = trailers.get_entries()?;
-                let mut vec = Vec::with_capacity(entries.len() as usize);
-                for entry in entries {
-                    let k = entry.get_key()?.to_str().map_err(|e| {
-                        ProtocolError::InvalidHeader(format!("non-UTF8 trailer key: {e}"))
-                    })?;
-                    let v = entry.get_value()?.to_str().map_err(|e| {
-                        ProtocolError::InvalidHeader(format!("non-UTF8 trailer value: {e}"))
-                    })?;
-                    vec.push((k.to_owned(), v.to_owned()));
-                }
-                Ok(QuicMessage::Trailer(QuicTrailer { entries: vec }))
-            }
+        match reader.get()?.which().map_err(unknown_discriminant)? {
+            quic_capnp::message::Which::Headers(Ok(headers)) => Ok(Self::Header(QuicHeader {
+                entries: entries_from_capnp_map(headers, ("header key", "header value"))?,
+            })),
+            quic_capnp::message::Which::Body(Ok(body)) => Ok(Self::Body(QuicBody {
+                content: body.get_content()?.to_vec().into(),
+            })),
+            quic_capnp::message::Which::Trailers(Ok(trailers)) => Ok(Self::Trailer(QuicTrailer {
+                entries: entries_from_capnp_map(trailers, ("trailer key", "trailer value"))?,
+            })),
             _ => Err(ProtocolError::ProtocolViolation(
                 "unknown QuicMessage type".to_string(),
             )),
@@ -162,6 +108,34 @@ pub struct QuicTrailer {
     pub entries: Vec<(String, String)>,
 }
 
+fn unknown_discriminant(error: capnp::NotInSchema) -> ProtocolError {
+    ProtocolError::ProtocolViolation(format!("unknown QuicMessage discriminant: {error}"))
+}
+
+fn io_error(error: impl std::error::Error + Send + Sync + 'static) -> ProtocolError {
+    ProtocolError::Io(std::io::Error::other(error))
+}
+
+fn typed_builder<T: Owned>() -> TypedBuilder<T> {
+    let mut builder = TypedBuilder::new_default();
+    builder.init_root();
+    builder
+}
+
+fn write_entries(
+    mut map: quic_capnp::map::Builder<'_, capnp::text::Owned, capnp::text::Owned>,
+    entries: &[(String, String)],
+) -> Result<(), ProtocolError> {
+    validate_quic_header_count(entries.len())?;
+    let mut output = map.reborrow().init_entries(entries.len() as u32);
+    for (index, (key, value)) in entries.iter().enumerate() {
+        let mut entry = output.reborrow().get(index as u32);
+        entry.set_key(key)?;
+        entry.set_value(value)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub enum QuicBodyOrTrailer {
     Body(Bytes),
@@ -172,7 +146,7 @@ pub async fn read_from_stream<T: Owned>(
     rx: &mut quinn::RecvStream,
 ) -> Result<Option<TypedReader<capnp::serialize::OwnedSegments, T>>, ProtocolError> {
     let reader = capnp_futures::serialize::try_read_message(rx, READER_OPTIONS).await?;
-    Ok(reader.map(|reader| TypedReader::new(reader)))
+    Ok(reader.map(TypedReader::new))
 }
 
 pub async fn write_to_stream(
@@ -181,31 +155,31 @@ pub async fn write_to_stream(
 ) -> Result<(), ProtocolError> {
     tx.write_chunk(serialize_message(builder))
         .await
-        .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
+        .map_err(io_error)
 }
 
 pub async fn write_header_map_to_stream(
     tx: &mut quinn::SendStream,
     headers: &HeaderMap,
 ) -> Result<(), ProtocolError> {
-    tx.write_chunk(serialize_header_map_message(
-        headers,
-        HeaderMapMessageKind::Header,
-    )?)
-    .await
-    .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
+    write_header_map(tx, headers, HeaderMapMessageKind::Header).await
 }
 
 pub async fn write_trailer_map_to_stream(
     tx: &mut quinn::SendStream,
     trailers: &HeaderMap,
 ) -> Result<(), ProtocolError> {
-    tx.write_chunk(serialize_header_map_message(
-        trailers,
-        HeaderMapMessageKind::Trailer,
-    )?)
-    .await
-    .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
+    write_header_map(tx, trailers, HeaderMapMessageKind::Trailer).await
+}
+
+async fn write_header_map(
+    tx: &mut quinn::SendStream,
+    headers: &HeaderMap,
+    kind: HeaderMapMessageKind,
+) -> Result<(), ProtocolError> {
+    tx.write_chunk(serialize_header_map_message(headers, kind)?)
+        .await
+        .map_err(io_error)
 }
 
 pub async fn write_body_to_stream(
@@ -213,20 +187,14 @@ pub async fn write_body_to_stream(
     body: Bytes,
 ) -> Result<(), ProtocolError> {
     let (prefix, body, padding) = body_message_chunks(body)?;
-    if body.is_empty() && padding.is_empty() {
-        tx.write_chunk(prefix)
-            .await
-            .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
+    if body.is_empty() {
+        tx.write_chunk(prefix).await.map_err(io_error)
     } else if padding.is_empty() {
         let mut chunks = [prefix, body];
-        tx.write_all_chunks(&mut chunks)
-            .await
-            .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
+        tx.write_all_chunks(&mut chunks).await.map_err(io_error)
     } else {
         let mut chunks = [prefix, body, padding];
-        tx.write_all_chunks(&mut chunks)
-            .await
-            .map_err(|error| ProtocolError::Io(std::io::Error::other(error)))
+        tx.write_all_chunks(&mut chunks).await.map_err(io_error)
     }
 }
 
@@ -236,11 +204,7 @@ pub async fn read_header_map_from_stream(
     let Some(reader) = read_from_stream::<quic_capnp::message::Owned>(rx).await? else {
         return Ok(None);
     };
-    let root = reader.get()?;
-    let which = root.which().map_err(|e| {
-        ProtocolError::ProtocolViolation(format!("unknown QuicMessage discriminant: {e}"))
-    })?;
-    match which {
+    match reader.get()?.which().map_err(unknown_discriminant)? {
         quic_capnp::message::Which::Headers(headers) => {
             header_map_from_capnp_map(headers?).map(Some)
         }
@@ -259,22 +223,28 @@ pub async fn read_body_or_trailer_from_stream(
     let Some(reader) = read_from_stream::<quic_capnp::message::Owned>(rx).await? else {
         return Ok(None);
     };
-    let root = reader.get()?;
-    let which = root.which().map_err(|e| {
-        ProtocolError::ProtocolViolation(format!("unknown QuicMessage discriminant: {e}"))
-    })?;
-    match which {
+    match reader.get()?.which().map_err(unknown_discriminant)? {
         quic_capnp::message::Which::Body(body) => {
             let content = body?.get_content()?.to_vec().into();
             Ok(Some(QuicBodyOrTrailer::Body(content)))
         }
-        quic_capnp::message::Which::Trailers(trailers) => Ok(Some(QuicBodyOrTrailer::Trailer(
-            header_map_from_capnp_map(trailers?)?,
-        ))),
+        quic_capnp::message::Which::Trailers(trailers) => header_map_from_capnp_map(trailers?)
+            .map(QuicBodyOrTrailer::Trailer)
+            .map(Some),
         quic_capnp::message::Which::Headers(_) => Err(ProtocolError::ProtocolViolation(
             "expected body message, got header".to_string(),
         )),
     }
+}
+
+pub(crate) async fn expect_stream_end(rx: &mut quinn::RecvStream) -> Result<(), ProtocolError> {
+    let Some(reader) = read_from_stream::<quic_capnp::message::Owned>(rx).await? else {
+        return Ok(());
+    };
+    let message = QuicMessage::from_reader(reader)?;
+    Err(ProtocolError::ProtocolViolation(format!(
+        "expected none after trailer, got {message}"
+    )))
 }
 
 fn serialize_message(builder: TypedBuilder<quic_capnp::message::Owned>) -> Bytes {
@@ -283,92 +253,63 @@ fn serialize_message(builder: TypedBuilder<quic_capnp::message::Owned>) -> Bytes
     ))
 }
 
-#[cfg(test)]
-fn serialize_body_message(body: Bytes) -> Result<Bytes, ProtocolError> {
-    let (prefix, body, padding) = body_message_chunks(body)?;
-    let mut encoded = Vec::with_capacity(prefix.len() + body.len() + padding.len());
-    encoded.extend_from_slice(&prefix);
-    encoded.extend_from_slice(&body);
-    encoded.extend_from_slice(&padding);
-    Ok(Bytes::from(encoded))
-}
-
 fn serialize_header_map_message(
     headers: &HeaderMap,
     kind: HeaderMapMessageKind,
 ) -> Result<Bytes, ProtocolError> {
-    let entries = header_map_text_entries(headers)?;
-    let entry_count = entries.len();
-    let entry_words = checked_header_map_words(entry_count, 2)?;
-    let mut text_cursor_words = 5usize
-        .checked_add(entry_words)
-        .ok_or_else(|| custom_header_too_large(entry_count))?;
-    let mut text_layout = Vec::with_capacity(entry_count);
-    for (index, (key, value)) in entries.iter().enumerate() {
-        let key_word = text_cursor_words;
-        text_cursor_words = text_cursor_words
-            .checked_add(capnp_text_word_len(key.len())?)
-            .ok_or_else(|| custom_header_too_large(entry_count))?;
-        let value_word = text_cursor_words;
-        text_cursor_words = text_cursor_words
-            .checked_add(capnp_text_word_len(value.len())?)
-            .ok_or_else(|| custom_header_too_large(entry_count))?;
-        let key_pointer_word = 5 + index * 2;
-        let value_pointer_word = key_pointer_word + 1;
-        checked_capnp_pointer_offset_words(key_pointer_word, key_word)?;
-        checked_capnp_pointer_offset_words(value_pointer_word, value_word)?;
-        text_layout.push((key_word, value_word));
+    validate_header_map(headers)?;
+    let entry_count = headers.len();
+    // The header-count limit makes these conversions and this multiplication exact.
+    let entry_count_u32 = entry_count as u32;
+    let entry_words = entry_count_u32 * 2;
+    let mut text_cursor_words = 5 + entry_words as usize;
+    for (index, (key, value)) in headers.iter().enumerate() {
+        let value = header_value_to_str(key, value)?;
+        let mut text_words = [0; 2];
+        for (text_word, byte_len) in text_words.iter_mut().zip([key.as_str().len(), value.len()]) {
+            *text_word = text_cursor_words;
+            text_cursor_words = text_cursor_words
+                .checked_add(capnp_text_word_len(byte_len)?)
+                .ok_or_else(|| raw_quic_header_too_large(entry_count))?;
+        }
+        for (field, text_word) in text_words.into_iter().enumerate() {
+            checked_capnp_pointer_offset_words(5 + index * 2 + field, text_word)?;
+        }
     }
 
     let segment_words_u32 =
-        u32::try_from(text_cursor_words).map_err(|_| custom_header_too_large(entry_count))?;
-    let entry_count_u32 =
-        u32::try_from(entry_count).map_err(|_| custom_header_too_large(entry_count))?;
-    let entry_words = checked_capnp_list_element_count(entry_words, || {
-        format!("custom tunnel header list too large: {entry_count} entries")
-    })?;
-    let total_len = CAPNP_BYTES_PER_WORD
-        .checked_add(
-            text_cursor_words
-                .checked_mul(CAPNP_BYTES_PER_WORD)
-                .ok_or_else(|| custom_header_too_large(entry_count))?,
-        )
-        .ok_or_else(|| custom_header_too_large(entry_count))?;
+        u32::try_from(text_cursor_words).map_err(|_| raw_quic_header_too_large(entry_count))?;
+    let total_len = text_cursor_words
+        .checked_add(1)
+        .and_then(|words| words.checked_mul(CAPNP_BYTES_PER_WORD))
+        .ok_or_else(|| raw_quic_header_too_large(entry_count))?;
     let mut encoded = vec![0_u8; total_len];
 
-    put_u32_le(&mut encoded, 0, 0);
     put_u32_le(&mut encoded, 4, segment_words_u32);
-    put_capnp_word(&mut encoded, 0, capnp_struct_pointer_word(0, 1, 1));
-    put_capnp_word(&mut encoded, 1, kind.discriminant_word());
-    put_capnp_word(&mut encoded, 2, capnp_struct_pointer_word(0, 0, 1));
+    put_capnp_word(&mut encoded, 0, CAPNP_MESSAGE_POINTER);
+    put_capnp_word(&mut encoded, 1, kind as u64);
+    put_capnp_word(&mut encoded, 2, CAPNP_PAYLOAD_POINTER);
     put_capnp_word(
         &mut encoded,
         3,
-        capnp_composite_list_pointer_word(0, entry_words),
+        capnp_list_pointer_word(0, CAPNP_LIST_ELEMENT_SIZE_INLINE_COMPOSITE, entry_words),
     );
-    put_capnp_word(
-        &mut encoded,
-        4,
-        capnp_struct_list_tag_word(entry_count_u32, 0, 2),
-    );
+    put_capnp_word(&mut encoded, 4, capnp_struct_list_tag_word(entry_count_u32));
 
-    for (index, ((key, value), (key_word, value_word))) in
-        entries.iter().zip(text_layout.iter()).enumerate()
-    {
-        let key_pointer_word = 5 + index * 2;
-        let value_pointer_word = key_pointer_word + 1;
-        put_capnp_word(
-            &mut encoded,
-            key_pointer_word,
-            capnp_text_pointer_word(key_pointer_word, *key_word, key.len())?,
-        );
-        put_capnp_word(
-            &mut encoded,
-            value_pointer_word,
-            capnp_text_pointer_word(value_pointer_word, *value_word, value.len())?,
-        );
-        put_capnp_text(&mut encoded, *key_word, key.as_bytes());
-        put_capnp_text(&mut encoded, *value_word, value.as_bytes());
+    let mut text_word = 5 + entry_words as usize;
+    for (index, (name, value)) in headers.iter().enumerate() {
+        let value = header_value_to_str(name, value)?;
+        for (field, text) in [name.as_str(), value].into_iter().enumerate() {
+            let pointer_word = 5 + index * 2 + field;
+            put_capnp_word(
+                &mut encoded,
+                pointer_word,
+                capnp_text_pointer_word(pointer_word, text_word, text.len())?,
+            );
+            let text_offset = CAPNP_BYTES_PER_WORD + text_word * CAPNP_BYTES_PER_WORD;
+            encoded[text_offset..text_offset + text.len()].copy_from_slice(text.as_bytes());
+            text_word += capnp_text_word_len(text.len())?;
+        }
     }
 
     Ok(Bytes::from(encoded))
@@ -378,36 +319,25 @@ fn body_message_chunks(body: Bytes) -> Result<(Bytes, Bytes, Bytes), ProtocolErr
     let data_words = body.len().div_ceil(CAPNP_BYTES_PER_WORD);
     let segment_words = CAPNP_BODY_MESSAGE_FIXED_WORDS
         .checked_add(data_words)
-        .ok_or_else(|| {
-            ProtocolError::ProtocolViolation(format!(
-                "custom tunnel body too large: {} bytes",
-                body.len()
-            ))
-        })?;
-    let segment_words_u32 = u32::try_from(segment_words).map_err(|_| {
-        ProtocolError::ProtocolViolation(format!(
-            "custom tunnel body too large: {} bytes",
-            body.len()
-        ))
-    })?;
+        .ok_or_else(|| raw_quic_body_too_large(body.len()))?;
+    let segment_words_u32 =
+        u32::try_from(segment_words).map_err(|_| raw_quic_body_too_large(body.len()))?;
     let body_len = checked_body_list_element_count(body.len())?;
 
-    let mut prefix = Vec::with_capacity(
-        CAPNP_BYTES_PER_WORD + CAPNP_BODY_MESSAGE_FIXED_WORDS * CAPNP_BYTES_PER_WORD,
+    let mut prefix =
+        vec![0; CAPNP_BYTES_PER_WORD + CAPNP_BODY_MESSAGE_FIXED_WORDS * CAPNP_BYTES_PER_WORD];
+    put_u32_le(&mut prefix, 4, segment_words_u32);
+    put_capnp_word(&mut prefix, 0, CAPNP_MESSAGE_POINTER);
+    put_capnp_word(&mut prefix, 1, 1);
+    put_capnp_word(&mut prefix, 2, CAPNP_PAYLOAD_POINTER);
+    put_capnp_word(
+        &mut prefix,
+        3,
+        capnp_list_pointer_word(0, CAPNP_LIST_ELEMENT_SIZE_BYTE, body_len),
     );
-    prefix.extend_from_slice(&0_u32.to_le_bytes());
-    prefix.extend_from_slice(&segment_words_u32.to_le_bytes());
-    push_capnp_word(&mut prefix, capnp_struct_pointer_word(0, 1, 1));
-    push_capnp_word(&mut prefix, 1);
-    push_capnp_word(&mut prefix, capnp_struct_pointer_word(0, 0, 1));
-    push_capnp_word(&mut prefix, capnp_byte_list_pointer_word(0, body_len));
     let padding_len = data_words * CAPNP_BYTES_PER_WORD - body.len();
     let padding = Bytes::from_static(&CAPNP_ZERO_PADDING[..padding_len]);
     Ok((Bytes::from(prefix), body, padding))
-}
-
-fn push_capnp_word(out: &mut Vec<u8>, word: u64) {
-    out.extend_from_slice(&word.to_le_bytes());
 }
 
 fn put_u32_le(out: &mut [u8], offset: usize, value: u32) {
@@ -419,33 +349,17 @@ fn put_capnp_word(out: &mut [u8], segment_word_index: usize, word: u64) {
     out[offset..offset + CAPNP_BYTES_PER_WORD].copy_from_slice(&word.to_le_bytes());
 }
 
-fn capnp_struct_pointer_word(offset_words: i32, data_words: u16, pointer_words: u16) -> u64 {
-    let offset = (offset_words as u32) & 0x3fff_ffff;
-    u64::from(offset << 2) | (u64::from(data_words) << 32) | (u64::from(pointer_words) << 48)
-}
-
-fn capnp_composite_list_pointer_word(offset_words: i32, word_count: u32) -> u64 {
+fn capnp_list_pointer_word(offset_words: i32, element_size: u64, element_count: u32) -> u64 {
     const CAPNP_POINTER_KIND_LIST: u64 = 1;
-    const CAPNP_LIST_ELEMENT_SIZE_INLINE_COMPOSITE: u64 = 7;
     let offset = (offset_words as u32) & 0x3fff_ffff;
     CAPNP_POINTER_KIND_LIST
         | u64::from(offset << 2)
-        | (CAPNP_LIST_ELEMENT_SIZE_INLINE_COMPOSITE << 32)
-        | (u64::from(word_count) << 35)
+        | (element_size << 32)
+        | (u64::from(element_count) << 35)
 }
 
-fn capnp_struct_list_tag_word(element_count: u32, data_words: u16, pointer_words: u16) -> u64 {
-    u64::from(element_count << 2) | (u64::from(data_words) << 32) | (u64::from(pointer_words) << 48)
-}
-
-fn capnp_byte_list_pointer_word(offset_words: i32, len: u32) -> u64 {
-    const CAPNP_POINTER_KIND_LIST: u64 = 1;
-    const CAPNP_LIST_ELEMENT_SIZE_BYTE: u64 = 2;
-    let offset = (offset_words as u32) & 0x3fff_ffff;
-    CAPNP_POINTER_KIND_LIST
-        | u64::from(offset << 2)
-        | (CAPNP_LIST_ELEMENT_SIZE_BYTE << 32)
-        | (u64::from(len) << 35)
+fn capnp_struct_list_tag_word(element_count: u32) -> u64 {
+    u64::from(element_count << 2) | (2 << 48)
 }
 
 fn capnp_text_pointer_word(
@@ -454,13 +368,20 @@ fn capnp_text_pointer_word(
     byte_len: usize,
 ) -> Result<u64, ProtocolError> {
     let offset_words = checked_capnp_pointer_offset_words(pointer_word_index, text_word_index)?;
-    let len_with_nul = byte_len
-        .checked_add(1)
-        .ok_or_else(|| ProtocolError::ProtocolViolation("custom tunnel header too large".into()))?;
-    let len_with_nul = checked_capnp_list_element_count(len_with_nul, || {
-        format!("custom tunnel header field too large: {byte_len} bytes")
+    Ok(capnp_list_pointer_word(
+        offset_words,
+        CAPNP_LIST_ELEMENT_SIZE_BYTE,
+        checked_capnp_text_len(byte_len)?,
+    ))
+}
+
+fn checked_capnp_text_len(byte_len: usize) -> Result<u32, ProtocolError> {
+    let len_with_nul = byte_len.checked_add(1).ok_or_else(|| {
+        ProtocolError::ProtocolViolation("raw QUIC tunnel header too large".into())
     })?;
-    Ok(capnp_byte_list_pointer_word(offset_words, len_with_nul))
+    checked_capnp_list_element_count(len_with_nul, || {
+        format!("raw QUIC tunnel header field too large: {byte_len} bytes")
+    })
 }
 
 fn checked_capnp_pointer_offset_words(
@@ -474,126 +395,52 @@ fn checked_capnp_pointer_offset_words(
         })?;
     if offset_words > CAPNP_POINTER_OFFSET_WORDS_MAX {
         return Err(ProtocolError::ProtocolViolation(
-            "custom tunnel header text offset too large".into(),
+            "raw QUIC tunnel header text offset too large".into(),
         ));
     }
     Ok(offset_words as i32)
 }
 
-fn put_capnp_text(out: &mut [u8], text_word_index: usize, text: &[u8]) {
-    let offset = CAPNP_BYTES_PER_WORD + text_word_index * CAPNP_BYTES_PER_WORD;
-    out[offset..offset + text.len()].copy_from_slice(text);
-}
-
 fn capnp_text_word_len(byte_len: usize) -> Result<usize, ProtocolError> {
-    byte_len
-        .checked_add(1)
-        .ok_or_else(|| ProtocolError::ProtocolViolation("custom tunnel header too large".into()))
-        .and_then(|len_with_nul| {
-            checked_capnp_list_element_count(len_with_nul, || {
-                format!("custom tunnel header field too large: {byte_len} bytes")
-            })?;
-            Ok(len_with_nul.div_ceil(CAPNP_BYTES_PER_WORD))
-        })
-}
-
-fn checked_header_map_words(
-    entry_count: usize,
-    words_per_entry: usize,
-) -> Result<usize, ProtocolError> {
-    entry_count
-        .checked_mul(words_per_entry)
-        .ok_or_else(|| custom_header_too_large(entry_count))
+    Ok((checked_capnp_text_len(byte_len)? as usize).div_ceil(CAPNP_BYTES_PER_WORD))
 }
 
 fn checked_capnp_list_element_count<F>(count: usize, message: F) -> Result<u32, ProtocolError>
 where
     F: FnOnce() -> String,
 {
-    if count > CAPNP_LIST_ELEMENT_COUNT_MAX {
-        return Err(ProtocolError::ProtocolViolation(message()));
+    if count <= CAPNP_LIST_ELEMENT_COUNT_MAX {
+        Ok(count as u32)
+    } else {
+        Err(ProtocolError::ProtocolViolation(message()))
     }
-    Ok(count as u32)
 }
 
 fn checked_body_list_element_count(body_len: usize) -> Result<u32, ProtocolError> {
     checked_capnp_list_element_count(body_len, || {
-        format!("custom tunnel body too large: {body_len} bytes")
+        format!("raw QUIC tunnel body too large: {body_len} bytes")
     })
 }
 
-fn header_map_text_entries(headers: &HeaderMap) -> Result<Vec<(&str, &str)>, ProtocolError> {
-    if headers.len() > MAX_QUIC_HEADER_COUNT {
-        return Err(custom_header_too_large(headers.len()));
-    }
-    let mut entries = Vec::with_capacity(headers.len());
-    for (key, value) in headers {
-        entries.push((key.as_str(), header_value_to_str(key, value)?));
-    }
-    Ok(entries)
+fn validate_header_map(headers: &HeaderMap) -> Result<(), ProtocolError> {
+    validate_quic_header_count(headers.len())?;
+    headers
+        .iter()
+        .try_for_each(|(key, value)| header_value_to_str(key, value).map(|_| ()))
 }
 
-fn custom_header_too_large(entry_count: usize) -> ProtocolError {
-    ProtocolError::ProtocolViolation(format!("too many custom tunnel headers: {entry_count}"))
+fn raw_quic_header_too_large(entry_count: usize) -> ProtocolError {
+    ProtocolError::ProtocolViolation(format!("too many raw QUIC tunnel headers: {entry_count}"))
+}
+
+fn raw_quic_body_too_large(body_len: usize) -> ProtocolError {
+    ProtocolError::ProtocolViolation(format!("raw QUIC tunnel body too large: {body_len} bytes"))
 }
 
 #[derive(Debug, Clone, Copy)]
 enum HeaderMapMessageKind {
-    Header,
-    Trailer,
-}
-
-impl HeaderMapMessageKind {
-    fn discriminant_word(self) -> u64 {
-        match self {
-            Self::Header => 0,
-            Self::Trailer => 2,
-        }
-    }
-}
-
-#[cfg(test)]
-fn header_map_message_builder(
-    headers: &HeaderMap,
-    kind: HeaderMapMessageKind,
-) -> Result<TypedBuilder<quic_capnp::message::Owned>, ProtocolError> {
-    if headers.len() > MAX_QUIC_HEADER_COUNT {
-        return Err(ProtocolError::ProtocolViolation(format!(
-            "too many custom tunnel headers: {}",
-            headers.len()
-        )));
-    }
-    let mut builder: TypedBuilder<quic_capnp::message::Owned> = TypedBuilder::new_default();
-    builder.init_root();
-    let mut root = builder.get_root()?;
-    match kind {
-        HeaderMapMessageKind::Header => {
-            let mut header_builder = root.reborrow().init_headers();
-            write_header_map_entries(header_builder.reborrow(), headers)?;
-        }
-        HeaderMapMessageKind::Trailer => {
-            let mut trailer_builder = root.reborrow().init_trailers();
-            write_header_map_entries(trailer_builder.reborrow(), headers)?;
-        }
-    }
-    Ok(builder)
-}
-
-#[cfg(test)]
-fn write_header_map_entries(
-    mut header_builder: quic_capnp::map::Builder<'_, capnp::text::Owned, capnp::text::Owned>,
-    headers: &HeaderMap,
-) -> Result<(), ProtocolError> {
-    let mut entries_builder = header_builder
-        .reborrow()
-        .init_entries(headers.len().try_into().expect("header count checked"));
-    for (index, (key, value)) in headers.iter().enumerate() {
-        let value = header_value_to_str(key, value)?;
-        let mut entry = entries_builder.reborrow().get(index as u32);
-        entry.set_key(key.as_str())?;
-        entry.set_value(value)?;
-    }
-    Ok(())
+    Header = 0,
+    Trailer = 2,
 }
 
 fn header_map_from_capnp_map(
@@ -601,24 +448,48 @@ fn header_map_from_capnp_map(
 ) -> Result<HeaderMap, ProtocolError> {
     let entries = headers.get_entries()?;
     let entry_count = entries.len() as usize;
-    if entry_count > MAX_QUIC_HEADER_COUNT {
-        return Err(ProtocolError::ProtocolViolation(format!(
-            "too many custom tunnel headers: {entry_count}"
-        )));
-    }
+    validate_quic_header_count(entry_count)?;
     let mut header_map = HeaderMap::with_capacity(entry_count);
     for entry in entries {
-        let key = entry
-            .get_key()?
-            .to_str()
-            .map_err(|e| ProtocolError::InvalidHeader(format!("non-UTF8 header key: {e}")))?;
-        let value = entry
-            .get_value()?
-            .to_str()
-            .map_err(|e| ProtocolError::InvalidHeader(format!("non-UTF8 header value: {e}")))?;
+        let (key, value) = capnp_entry_text(entry, ("header key", "header value"))?;
         append_header_entry(&mut header_map, key, value)?;
     }
     Ok(header_map)
+}
+
+fn entries_from_capnp_map(
+    map: quic_capnp::map::Reader<'_, capnp::text::Owned, capnp::text::Owned>,
+    labels: (&str, &str),
+) -> Result<Vec<(String, String)>, ProtocolError> {
+    let entries = map.get_entries()?;
+    validate_quic_header_count(entries.len() as usize)?;
+    let mut output = Vec::with_capacity(entries.len() as usize);
+    for entry in entries {
+        let (key, value) = capnp_entry_text(entry, labels)?;
+        output.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(output)
+}
+
+fn capnp_entry_text<'a>(
+    entry: quic_capnp::map::entry::Reader<'a, capnp::text::Owned, capnp::text::Owned>,
+    (key_label, value_label): (&str, &str),
+) -> Result<(&'a str, &'a str), ProtocolError> {
+    let key = entry
+        .get_key()?
+        .to_str()
+        .map_err(|error| ProtocolError::InvalidHeader(format!("non-UTF8 {key_label}: {error}")))?;
+    let value = entry.get_value()?.to_str().map_err(|error| {
+        ProtocolError::InvalidHeader(format!("non-UTF8 {value_label}: {error}"))
+    })?;
+    Ok((key, value))
+}
+
+fn validate_quic_header_count(entry_count: usize) -> Result<(), ProtocolError> {
+    if entry_count > MAX_QUIC_HEADER_COUNT {
+        return Err(raw_quic_header_too_large(entry_count));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -629,8 +500,7 @@ pub struct HandshakeRequest {
 
 impl HandshakeRequest {
     pub fn to_builder(&self) -> Result<TypedBuilder<quic_capnp::handshake::Owned>, ProtocolError> {
-        let mut builder: TypedBuilder<quic_capnp::handshake::Owned> = TypedBuilder::new_default();
-        builder.init_root();
+        let mut builder = typed_builder::<quic_capnp::handshake::Owned>();
         let mut root = builder.get_root()?;
         root.reborrow()
             .set_inference_server_id(&self.inference_server_id);
@@ -644,29 +514,14 @@ impl HandshakeRequest {
         reader: TypedReader<capnp::serialize::OwnedSegments, quic_capnp::handshake::Owned>,
     ) -> Result<Self, ProtocolError> {
         let root = reader.get()?;
-        let inference_server_id = root
-            .get_inference_server_id()?
-            .to_str()
-            .map_err(|e| {
-                ProtocolError::ProtocolViolation(format!(
-                    "non-UTF8 inference_server_id in handshake: {e}"
-                ))
-            })?
-            .to_owned();
-        let auth_token = if root.has_auth_token() {
-            Some(
-                root.get_auth_token()?
-                    .to_str()
-                    .map_err(|e| {
-                        ProtocolError::ProtocolViolation(format!(
-                            "non-UTF8 auth_token in handshake: {e}"
-                        ))
-                    })?
-                    .to_owned(),
-            )
-        } else {
-            None
-        };
+        let inference_server_id = protocol_text(
+            root.get_inference_server_id()?,
+            "inference_server_id in handshake",
+        )?;
+        let auth_token = root
+            .has_auth_token()
+            .then(|| protocol_text(root.get_auth_token()?, "auth_token in handshake"))
+            .transpose()?;
         Ok(Self {
             inference_server_id,
             auth_token,
@@ -684,9 +539,7 @@ impl HandshakeAck {
     pub fn to_builder(
         &self,
     ) -> Result<TypedBuilder<quic_capnp::handshake_ack::Owned>, ProtocolError> {
-        let mut builder: TypedBuilder<quic_capnp::handshake_ack::Owned> =
-            TypedBuilder::new_default();
-        builder.init_root();
+        let mut builder = typed_builder::<quic_capnp::handshake_ack::Owned>();
         let mut root = builder.get_root()?;
         root.reborrow().set_accepted(self.accepted);
         root.reborrow().set_reason(&self.reason);
@@ -697,52 +550,57 @@ impl HandshakeAck {
         reader: TypedReader<capnp::serialize::OwnedSegments, quic_capnp::handshake_ack::Owned>,
     ) -> Result<Self, ProtocolError> {
         let root = reader.get()?;
-        let accepted = root.get_accepted();
-        let reason = root
-            .get_reason()?
-            .to_str()
-            .map_err(|e| {
-                ProtocolError::ProtocolViolation(format!("non-UTF8 reason in handshake ack: {e}"))
-            })?
-            .to_owned();
-        Ok(Self { accepted, reason })
+        Ok(Self {
+            accepted: root.get_accepted(),
+            reason: protocol_text(root.get_reason()?, "reason in handshake ack")?,
+        })
     }
+}
+
+fn protocol_text(text: capnp::text::Reader<'_>, label: &str) -> Result<String, ProtocolError> {
+    text.to_str()
+        .map(str::to_owned)
+        .map_err(|error| ProtocolError::ProtocolViolation(format!("non-UTF8 {label}: {error}")))
+}
+
+async fn write_capnp<T: Owned>(
+    tx: &mut quinn::SendStream,
+    builder: TypedBuilder<T>,
+) -> Result<(), ProtocolError> {
+    capnp_futures::serialize::write_message(tx, builder.borrow_inner())
+        .await
+        .map_err(io_error)
+}
+
+async fn read_required<T: Owned>(
+    rx: &mut quinn::RecvStream,
+    missing: &'static str,
+) -> Result<TypedReader<capnp::serialize::OwnedSegments, T>, ProtocolError> {
+    read_from_stream(rx)
+        .await?
+        .ok_or_else(|| ProtocolError::ProtocolViolation(missing.to_string()))
 }
 
 pub async fn write_handshake(
     tx: &mut quinn::SendStream,
     request: &HandshakeRequest,
 ) -> Result<(), ProtocolError> {
-    let builder = request.to_builder()?;
-    capnp_futures::serialize::write_message(tx, builder.borrow_inner())
-        .await
-        .map_err(|e| ProtocolError::Io(std::io::Error::other(e)))
+    write_capnp(tx, request.to_builder()?).await
 }
 
 pub async fn read_handshake(rx: &mut quinn::RecvStream) -> Result<HandshakeRequest, ProtocolError> {
-    let reader: TypedReader<capnp::serialize::OwnedSegments, quic_capnp::handshake::Owned> =
-        read_from_stream(rx).await?.ok_or_else(|| {
-            ProtocolError::ProtocolViolation("expected handshake message, got none".to_string())
-        })?;
-    HandshakeRequest::from_reader(reader)
+    HandshakeRequest::from_reader(read_required(rx, "expected handshake message, got none").await?)
 }
 
 pub async fn write_handshake_ack(
     tx: &mut quinn::SendStream,
     ack: &HandshakeAck,
 ) -> Result<(), ProtocolError> {
-    let builder = ack.to_builder()?;
-    capnp_futures::serialize::write_message(tx, builder.borrow_inner())
-        .await
-        .map_err(|e| ProtocolError::Io(std::io::Error::other(e)))
+    write_capnp(tx, ack.to_builder()?).await
 }
 
 pub async fn read_handshake_ack(rx: &mut quinn::RecvStream) -> Result<HandshakeAck, ProtocolError> {
-    let reader: TypedReader<capnp::serialize::OwnedSegments, quic_capnp::handshake_ack::Owned> =
-        read_from_stream(rx).await?.ok_or_else(|| {
-            ProtocolError::ProtocolViolation("expected handshake ack message, got none".to_string())
-        })?;
-    HandshakeAck::from_reader(reader)
+    HandshakeAck::from_reader(read_required(rx, "expected handshake ack message, got none").await?)
 }
 
 pub enum StreamStopCode {
@@ -762,88 +620,125 @@ impl From<StreamStopCode> for VarInt {
 mod tests {
     use super::*;
 
-    fn roundtrip(msg: &QuicMessage) -> QuicMessage {
-        let builder = msg.to_builder().unwrap();
-        let mut buf = Vec::new();
-        capnp::serialize::write_message(&mut buf, builder.borrow_inner()).unwrap();
-        let reader =
-            capnp::serialize::read_message(&mut &buf[..], capnp::message::ReaderOptions::default())
-                .unwrap();
-        let typed_reader =
-            TypedReader::<capnp::serialize::OwnedSegments, quic_capnp::message::Owned>::new(reader);
-        QuicMessage::from_reader(typed_reader).unwrap()
+    fn message_reader<T: Owned>(encoded: &[u8]) -> TypedReader<capnp::serialize::OwnedSegments, T> {
+        let mut encoded = encoded;
+        TypedReader::new(
+            capnp::serialize::read_message(&mut encoded, capnp::message::ReaderOptions::default())
+                .unwrap(),
+        )
+    }
+
+    fn decode_header_map(
+        encoded: &[u8],
+        kind: HeaderMapMessageKind,
+    ) -> Result<HeaderMap, ProtocolError> {
+        let reader = message_reader::<quic_capnp::message::Owned>(encoded);
+        let map = match (kind, reader.get().unwrap().which().unwrap()) {
+            (HeaderMapMessageKind::Header, quic_capnp::message::Which::Headers(map))
+            | (HeaderMapMessageKind::Trailer, quic_capnp::message::Which::Trailers(map)) => map?,
+            _ => panic!("unexpected raw QUIC message kind"),
+        };
+        header_map_from_capnp_map(map)
+    }
+
+    fn assert_protocol_violation<T>(result: Result<T, ProtocolError>, expected: &str) {
+        let Err(ProtocolError::ProtocolViolation(message)) = result else {
+            panic!("expected protocol violation")
+        };
+        assert!(message.contains(expected));
+    }
+
+    fn body_message_builder(content: &[u8]) -> TypedBuilder<quic_capnp::message::Owned> {
+        let mut builder = typed_builder::<quic_capnp::message::Owned>();
+        let mut root = builder.get_root().unwrap();
+        root.reborrow().init_body().set_content(content);
+        builder
+    }
+
+    fn header_map_message_builder(
+        headers: &HeaderMap,
+        kind: HeaderMapMessageKind,
+    ) -> TypedBuilder<quic_capnp::message::Owned> {
+        let entries = headers
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        match kind {
+            HeaderMapMessageKind::Header => QuicMessage::Header(QuicHeader { entries }),
+            HeaderMapMessageKind::Trailer => QuicMessage::Trailer(QuicTrailer { entries }),
+        }
+        .to_builder()
+        .unwrap()
+    }
+
+    fn oversized_entry_message_builder(
+        kind: HeaderMapMessageKind,
+    ) -> TypedBuilder<quic_capnp::message::Owned> {
+        let mut builder = typed_builder::<quic_capnp::message::Owned>();
+        let mut root = builder.get_root().unwrap();
+        let entry_count = (MAX_QUIC_HEADER_COUNT + 1) as u32;
+        match kind {
+            HeaderMapMessageKind::Header => root.reborrow().init_headers(),
+            HeaderMapMessageKind::Trailer => root.reborrow().init_trailers(),
+        }
+        .init_entries(entry_count);
+        builder
     }
 
     #[test]
-    fn multi_value_header_roundtrip() {
-        let msg = QuicMessage::Header(QuicHeader {
-            entries: vec![
-                ("set-cookie".to_string(), "a=1".to_string()),
-                ("set-cookie".to_string(), "b=2".to_string()),
-                ("content-type".to_string(), "text/plain".to_string()),
-            ],
-        });
-        let decoded = roundtrip(&msg);
-        match decoded {
-            QuicMessage::Header(h) => {
-                assert_eq!(h.entries.len(), 3);
-                assert_eq!(h.entries[0], ("set-cookie".to_string(), "a=1".to_string()));
-                assert_eq!(h.entries[1], ("set-cookie".to_string(), "b=2".to_string()));
-            }
-            other => panic!("expected Header, got {other}"),
+    fn raw_quic_parser_rejects_excessive_header_and_trailer_entries() {
+        for kind in [HeaderMapMessageKind::Header, HeaderMapMessageKind::Trailer] {
+            let encoded = serialize_message(oversized_entry_message_builder(kind));
+            assert_protocol_violation(
+                decode_header_map(&encoded, kind),
+                "too many raw QUIC tunnel headers",
+            );
+            assert_protocol_violation(
+                QuicMessage::from_reader(message_reader(&encoded)),
+                "too many raw QUIC tunnel headers",
+            );
         }
     }
 
     #[test]
-    fn multi_value_trailer_roundtrip() {
-        let msg = QuicMessage::Trailer(QuicTrailer {
-            entries: vec![
-                ("grpc-status".to_string(), "0".to_string()),
-                ("x-multi".to_string(), "first".to_string()),
-                ("x-multi".to_string(), "second".to_string()),
-            ],
+    fn quic_message_public_roundtrip_preserves_variants_and_entries() {
+        use QuicMessage::{Body, Header, Trailer};
+        let entries = [("a", "1"), ("a", "2"), ("b", "3")]
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .to_vec();
+        let header = Header(QuicHeader {
+            entries: entries.clone(),
         });
-        let decoded = roundtrip(&msg);
-        match decoded {
-            QuicMessage::Trailer(t) => {
-                assert_eq!(t.entries.len(), 3);
-                assert_eq!(t.entries[1], ("x-multi".to_string(), "first".to_string()));
-                assert_eq!(t.entries[2], ("x-multi".to_string(), "second".to_string()));
-            }
-            other => panic!("expected Trailer, got {other}"),
+        let body = Body(QuicBody {
+            content: Bytes::from_static(b"body"),
+        });
+        let trailer = Trailer(QuicTrailer { entries });
+        for message in [header, body, trailer] {
+            let encoded = serialize_message(message.to_builder().unwrap());
+            let decoded = QuicMessage::from_reader(message_reader(&encoded)).unwrap();
+            assert_eq!(serialize_message(decoded.to_builder().unwrap()), encoded);
         }
     }
 
     #[test]
-    fn body_roundtrip() {
-        let msg = QuicMessage::Body(QuicBody {
-            content: Bytes::from("hello world"),
-        });
-        let decoded = roundtrip(&msg);
-        match decoded {
-            QuicMessage::Body(b) => assert_eq!(b.content, Bytes::from("hello world")),
-            other => panic!("expected Body, got {other}"),
-        }
-    }
-
-    #[test]
-    fn optimized_body_serialization_decodes_as_capnp_body() {
-        for content in [Bytes::new(), Bytes::from_static(b"hello world")] {
-            let encoded = serialize_body_message(content.clone()).unwrap();
-            let reader = capnp::serialize::read_message(
-                &mut &encoded[..],
-                capnp::message::ReaderOptions::default(),
-            )
-            .unwrap();
-            let typed_reader = TypedReader::<
-                capnp::serialize::OwnedSegments,
-                quic_capnp::message::Owned,
-            >::new(reader);
-
-            match QuicMessage::from_reader(typed_reader).unwrap() {
-                QuicMessage::Body(body) => assert_eq!(body.content, content),
-                other => panic!("expected Body, got {other}"),
+    fn multi_value_header_and_trailer_roundtrip() {
+        use HeaderMapMessageKind::{Header, Trailer};
+        for (kind, name, expected) in [
+            (Header, "set-cookie", ["a=1", "b=2"]),
+            (Trailer, "x-multi", ["first", "second"]),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in expected {
+                headers.append(name, value.parse().unwrap());
             }
+            let encoded = serialize_header_map_message(&headers, kind).unwrap();
+            let decoded = decode_header_map(&encoded, kind).unwrap();
+            let actual: Vec<_> = decoded
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(actual, expected);
         }
     }
 
@@ -851,13 +746,9 @@ mod tests {
     fn optimized_body_serialization_matches_capnp_builder_wire_format() {
         for len in [0_usize, 1, 7, 8, 9, 31, 32, 33, 1024] {
             let content: Bytes = (0..len).map(|index| index as u8).collect::<Vec<_>>().into();
-            let optimized = serialize_body_message(content.clone()).unwrap();
-            let reference = serialize_message(
-                QuicMessage::Body(QuicBody { content })
-                    .to_builder()
-                    .unwrap(),
-            );
-
+            let (prefix, body, padding) = body_message_chunks(content.clone()).unwrap();
+            let optimized = Bytes::from([prefix, body, padding].concat());
+            let reference = serialize_message(body_message_builder(&content));
             assert_eq!(optimized, reference, "body length {len}");
         }
     }
@@ -869,10 +760,10 @@ mod tests {
             CAPNP_LIST_ELEMENT_COUNT_MAX as u32
         );
 
-        let error = checked_body_list_element_count(CAPNP_LIST_ELEMENT_COUNT_MAX + 1)
-            .expect_err("body length above Cap'n Proto list count must fail");
-        assert!(matches!(error, ProtocolError::ProtocolViolation(message)
-            if message.contains("custom tunnel body too large")));
+        assert_protocol_violation(
+            checked_body_list_element_count(CAPNP_LIST_ELEMENT_COUNT_MAX + 1),
+            "raw QUIC tunnel body too large",
+        );
     }
 
     #[test]
@@ -886,8 +777,7 @@ mod tests {
         for headers in [HeaderMap::new(), populated] {
             for kind in [HeaderMapMessageKind::Header, HeaderMapMessageKind::Trailer] {
                 let optimized = serialize_header_map_message(&headers, kind).unwrap();
-                let reference =
-                    serialize_message(header_map_message_builder(&headers, kind).unwrap());
+                let reference = serialize_message(header_map_message_builder(&headers, kind));
 
                 assert_eq!(
                     optimized,
@@ -910,15 +800,14 @@ mod tests {
         let word = capnp_text_pointer_word(0, 1, max_text_without_nul).unwrap();
         assert_eq!(word >> 35, CAPNP_LIST_ELEMENT_COUNT_MAX as u64);
 
-        let error = capnp_text_word_len(CAPNP_LIST_ELEMENT_COUNT_MAX)
-            .expect_err("text length plus NUL above Cap'n Proto list count must fail");
-        assert!(matches!(error, ProtocolError::ProtocolViolation(message)
-            if message.contains("custom tunnel header field too large")));
-
-        let error = capnp_text_pointer_word(0, 1, CAPNP_LIST_ELEMENT_COUNT_MAX)
-            .expect_err("text pointer length plus NUL above Cap'n Proto list count must fail");
-        assert!(matches!(error, ProtocolError::ProtocolViolation(message)
-            if message.contains("custom tunnel header field too large")));
+        assert_protocol_violation(
+            capnp_text_word_len(CAPNP_LIST_ELEMENT_COUNT_MAX),
+            "raw QUIC tunnel header field too large",
+        );
+        assert_protocol_violation(
+            capnp_text_pointer_word(0, 1, CAPNP_LIST_ELEMENT_COUNT_MAX),
+            "raw QUIC tunnel header field too large",
+        );
     }
 
     #[test]
@@ -929,17 +818,37 @@ mod tests {
             CAPNP_POINTER_OFFSET_WORDS_MAX as u64
         );
 
-        let error = capnp_text_pointer_word(0, CAPNP_POINTER_OFFSET_WORDS_MAX + 2, 0)
-            .expect_err("text offset above Cap'n Proto signed pointer field must fail");
-        assert!(matches!(error, ProtocolError::ProtocolViolation(message)
-            if message.contains("custom tunnel header text offset too large")));
+        assert_protocol_violation(
+            capnp_text_pointer_word(0, CAPNP_POINTER_OFFSET_WORDS_MAX + 2, 0),
+            "raw QUIC tunnel header text offset too large",
+        );
     }
 
     #[test]
-    fn to_builder_returns_result() {
-        let msg = QuicMessage::Body(QuicBody {
-            content: Bytes::from("test"),
-        });
-        assert!(msg.to_builder().is_ok());
+    fn quic_message_reader_preserves_malformed_discriminant_error() {
+        let mut encoded =
+            serialize_header_map_message(&HeaderMap::new(), HeaderMapMessageKind::Header)
+                .unwrap()
+                .to_vec();
+        encoded[16..18].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_protocol_violation(
+            QuicMessage::from_reader(message_reader(&encoded)),
+            "unknown QuicMessage discriminant",
+        );
+    }
+
+    #[test]
+    fn handshake_reports_malformed_inference_id_before_malformed_auth_token() {
+        let mut builder = typed_builder::<quic_capnp::handshake::Owned>();
+        let mut root = builder.get_root().unwrap();
+        let malformed = capnp::text::Reader(&[0xff]);
+        root.reborrow().set_inference_server_id(malformed);
+        root.reborrow().set_auth_token(malformed);
+        let encoded = capnp::serialize::write_message_to_words(builder.borrow_inner());
+        let reader = message_reader(&encoded);
+        assert_protocol_violation(
+            HandshakeRequest::from_reader(reader),
+            "non-UTF8 inference_server_id in handshake:",
+        );
     }
 }

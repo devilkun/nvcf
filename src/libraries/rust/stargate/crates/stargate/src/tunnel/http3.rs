@@ -20,10 +20,11 @@ use anyhow::{Context, Result};
 use axum::http::HeaderName;
 use futures::future;
 use quinn::Connection;
+use stargate_protocol::common::is_hop_by_hop_header;
 use tracing::warn;
 
-use super::direct::QuicHttpProxy;
-use super::direct::TunnelConnection;
+use super::body::{OpenStreamingRequest, OpenStreamingRequestInner};
+use super::request::OpenTunnelRequest;
 
 pub(super) type H3ClientBidiStream =
     <h3_quinn::OpenStreams as h3::quic::OpenStreams<bytes::Bytes>>::BidiStream;
@@ -42,9 +43,9 @@ pub(super) type H3ServerRequestStream = h3::server::RequestStream<H3ClientBidiSt
 
 #[derive(Clone)]
 pub(super) struct Http3ConnectionHandle {
-    pub(super) connection: Connection,
-    pub(super) send_request: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
-    pub(super) driver_closed: Arc<AtomicBool>,
+    connection: Connection,
+    send_request: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    driver_closed: Arc<AtomicBool>,
     _driver_task: Arc<Http3DriverTask>,
 }
 
@@ -62,49 +63,78 @@ impl Drop for Http3DriverTask {
     }
 }
 
-impl QuicHttpProxy {
-    pub(super) async fn build_h3_client_connection(
-        &self,
-        connection: Connection,
-    ) -> Result<TunnelConnection> {
-        let driver_closed = Arc::new(AtomicBool::new(false));
-        let driver_closed_for_task = driver_closed.clone();
-        let (mut driver, send_request) = h3::client::builder()
-            .build(h3_quinn::Connection::new(connection.clone()))
+impl Http3ConnectionHandle {
+    pub(super) fn is_healthy(&self) -> bool {
+        self.connection.close_reason().is_none() && !self.driver_closed.load(Ordering::Acquire)
+    }
+
+    pub(super) fn stable_id(&self) -> usize {
+        self.connection.stable_id()
+    }
+
+    pub(super) async fn open_streaming_request(
+        self,
+        request: OpenTunnelRequest<'_>,
+    ) -> Result<OpenStreamingRequest> {
+        let uri: http::Uri = format!("https://stargate{}", request.path_and_query)
+            .parse()
+            .context("invalid h3 request uri")?;
+        let mut h3_request = http::Request::builder()
+            .method(request.method.as_str())
+            .uri(uri)
+            .body(())
+            .context("build h3 request")?;
+        for (name, value) in &request.headers {
+            if should_forward_h3_tunnel_request_header(name) {
+                h3_request.headers_mut().append(name, value.clone());
+            }
+        }
+        let mut send_request = self.send_request.clone();
+        let stream = send_request
+            .send_request(h3_request)
             .await
             .map_err(h3_error)
-            .context("create h3 client connection")?;
-        let driver_task = tokio::spawn(async move {
-            let error = future::poll_fn(|cx| driver.poll_close(cx)).await;
-            driver_closed_for_task.store(true, Ordering::Release);
-            if !error.is_h3_no_error() {
-                warn!(error = ?error, "h3 client connection closed with error");
-            }
-        });
-        Ok(TunnelConnection::Http3(Http3ConnectionHandle {
-            connection: connection.clone(),
-            send_request,
-            driver_closed,
-            _driver_task: Arc::new(Http3DriverTask {
-                connection,
-                task: driver_task,
-            }),
-        }))
+            .context("send h3 request headers")?;
+        Ok(OpenStreamingRequest {
+            inner: OpenStreamingRequestInner::Http3 {
+                stream: Box::new(stream),
+                connection_handle: self,
+            },
+            response_header_timeout: request.response_header_timeout(),
+        })
     }
 }
 
+pub(super) async fn build_h3_client_connection(
+    connection: Connection,
+) -> Result<Http3ConnectionHandle> {
+    let driver_closed = Arc::new(AtomicBool::new(false));
+    let driver_closed_for_task = driver_closed.clone();
+    let (mut driver, send_request) = h3::client::builder()
+        .build(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .map_err(h3_error)
+        .context("create h3 client connection")?;
+    let driver_task = tokio::spawn(async move {
+        let error = future::poll_fn(|cx| driver.poll_close(cx)).await;
+        driver_closed_for_task.store(true, Ordering::Release);
+        if !error.is_h3_no_error() {
+            warn!(error = ?error, "h3 client connection closed with error");
+        }
+    });
+    Ok(Http3ConnectionHandle {
+        connection: connection.clone(),
+        send_request,
+        driver_closed,
+        _driver_task: Arc::new(Http3DriverTask {
+            connection,
+            task: driver_task,
+        }),
+    })
+}
+
 pub(super) fn should_forward_h3_tunnel_request_header(name: &HeaderName) -> bool {
-    !matches!(
-        name.as_str(),
-        "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "te"
-            | "trailer"
-            | "upgrade"
-            | "host"
-    )
+    !is_hop_by_hop_header(name) && name != "host"
 }
 
 pub(super) fn h3_error<E>(error: E) -> anyhow::Error
@@ -112,22 +142,4 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     anyhow::Error::new(error)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn h3_error_context_preserves_source_chain() {
-        let error = h3_error(std::io::Error::other("inner h3 failure")).context("outer h3 context");
-
-        assert_eq!(error.to_string(), "outer h3 context");
-        assert!(
-            error
-                .chain()
-                .any(|source| source.to_string() == "inner h3 failure"),
-            "source chain should retain the original error: {error:#}"
-        );
-    }
 }

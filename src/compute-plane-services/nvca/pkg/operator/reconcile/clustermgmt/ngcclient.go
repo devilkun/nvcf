@@ -518,6 +518,7 @@ func withAgentConfigMapper() clusterMapper {
 			if src.Agent.NATSHostOverride != "" {
 				dest.NVCFBackend.Spec.AgentConfig.NATSHostOverride = ptr.To(src.Agent.NATSHostOverride)
 			}
+			dest.NVCFBackend.Spec.AgentConfig.LLMRequestRouterAddress = src.Agent.LLMRequestRouterAddress
 		}
 
 		// Parse CacheMountOptionsEnabled from string.

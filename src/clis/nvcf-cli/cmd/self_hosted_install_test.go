@@ -45,6 +45,14 @@ func resetInstallFlags(t *testing.T) {
 	selfHostedToken = ""
 	selfHostedControlPlaneContext = ""
 	selfHostedComputePlaneContext = ""
+	prevRuntimeResolver := resolveSelfHostedHelmRuntimeMode
+	resolveSelfHostedHelmRuntimeMode = func(context.Context) (selfhosted.HelmRuntimeMode, error) {
+		return selfhosted.HelmRuntimeHelm3Legacy, nil
+	}
+	prevFetchRootCA := fetchControlPlaneRootCAPEM
+	fetchControlPlaneRootCAPEM = func(context.Context, string) (string, error) {
+		return "", nil
+	}
 	t.Cleanup(func() {
 		installControlPlane = false
 		installComputePlane = false
@@ -56,6 +64,8 @@ func resetInstallFlags(t *testing.T) {
 		selfHostedToken = ""
 		selfHostedControlPlaneContext = ""
 		selfHostedComputePlaneContext = ""
+		resolveSelfHostedHelmRuntimeMode = prevRuntimeResolver
+		fetchControlPlaneRootCAPEM = prevFetchRootCA
 	})
 }
 
@@ -76,7 +86,7 @@ func TestSelfHostedInstall_ControlPlane_NoApply(t *testing.T) {
 	rootCmd.SetOut(&stdout)
 	rootCmd.SetArgs([]string{
 		"self-hosted", "install", "--control-plane",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
 		"--no-apply",
 	})
 	require.NoError(t, rootCmd.Execute())
@@ -84,7 +94,7 @@ func TestSelfHostedInstall_ControlPlane_NoApply(t *testing.T) {
 	assert.Contains(t, stdout.String(), "kind: ConfigMap")
 }
 
-func TestSelfHostedInstall_ControlPlane_AppliesByDefault(t *testing.T) {
+func TestSelfHostedInstall_ControlPlane_Helm4AppliesStateFilesSequentially(t *testing.T) {
 	resetInstallFlags(t)
 	stackDir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(stackDir, "helmfile.d"), 0o755))
@@ -92,7 +102,7 @@ func TestSelfHostedInstall_ControlPlane_AppliesByDefault(t *testing.T) {
 
 	fakeBin := filepath.Join(t.TempDir(), "helmfile")
 	require.NoError(t, os.WriteFile(fakeBin,
-		[]byte("#!/bin/sh\nlast=\nfor arg in \"$@\"; do last=\"$arg\"; done\nprintf 'verb=%s\\n' \"$last\"\n"),
+		[]byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"),
 		0o755))
 	t.Setenv("PATH", filepath.Dir(fakeBin)+":"+os.Getenv("PATH"))
 	t.Setenv("HOME", t.TempDir())
@@ -114,14 +124,17 @@ func TestSelfHostedInstall_ControlPlane_AppliesByDefault(t *testing.T) {
 	}
 	require.NoError(t, sm.Save())
 
+	prevRuntimeResolver := resolveSelfHostedHelmRuntimeMode
 	prevAuthProbe := authProbe
 	prevInit := runSelfHostedInit
-	prevTTY := stdinIsTerminal
 	t.Cleanup(func() {
+		resolveSelfHostedHelmRuntimeMode = prevRuntimeResolver
 		authProbe = prevAuthProbe
 		runSelfHostedInit = prevInit
-		stdinIsTerminal = prevTTY
 	})
+	resolveSelfHostedHelmRuntimeMode = func(context.Context) (selfhosted.HelmRuntimeMode, error) {
+		return selfhosted.HelmRuntimeHelm4Compat, nil
+	}
 	authProbe = func(context.Context, string) (*auth.Fingerprint, error) {
 		return &auth.Fingerprint{IssuerURL: "http://api.localhost:8080", JWKSKid: "kid", APIKeysEndpoint: "http://api-keys.localhost:8080"}, nil
 	}
@@ -130,29 +143,27 @@ func TestSelfHostedInstall_ControlPlane_AppliesByDefault(t *testing.T) {
 		initCalls++
 		return nil
 	}
-	// Forced-refresh auth gate skips the cache and proceeds to init; stub the TTY
-	// seam to true so the non-interactive gate does not short-circuit.
-	stdinIsTerminal = func() bool { return true }
-
 	var stdout bytes.Buffer
 	rootCmd.SetOut(&stdout)
 	rootCmd.SetArgs([]string{
 		"self-hosted", "install", "--control-plane",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
 	})
 	require.NoError(t, rootCmd.Execute())
 
-	assert.Contains(t, stdout.String(), "verb=apply")
+	assert.Contains(t, stdout.String(), "--sequential-helmfiles")
+	assert.Contains(t, stdout.String(), "apply")
+	assert.Contains(t, stdout.String(), "--skip-diff-on-install")
 	assert.Equal(t, 1, initCalls)
 }
 
-// TestSelfHostedInstall_ControlPlane_PostInstallMintNonFatalWithoutTTY covers
-// the case that motivated the BDD's old `--token DUMMY` workaround: under a
+// TestSelfHostedInstall_ControlPlane_PostInstallMintRunsWithoutTTY covers the
+// case that motivated the BDD's old `--token DUMMY` workaround: under a
 // non-TTY stdin (CI runs, `go test` invocations, the BDD suite), the
-// post-install admin-token mint cannot prompt for consent, but the install
-// itself does not consume the token. The install must still succeed and the
-// hint to run `nvcf-cli init` must be surfaced.
-func TestSelfHostedInstall_ControlPlane_PostInstallMintNonFatalWithoutTTY(t *testing.T) {
+// post-install admin-token mint should still be attempted because it calls the
+// API Keys admin route directly. The install itself does not consume the token,
+// so failures remain non-fatal.
+func TestSelfHostedInstall_ControlPlane_PostInstallMintRunsWithoutTTY(t *testing.T) {
 	resetInstallFlags(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("NVCF_BASE_HTTP_URL", "http://api.localhost:8080")
@@ -169,11 +180,9 @@ func TestSelfHostedInstall_ControlPlane_PostInstallMintNonFatalWithoutTTY(t *tes
 
 	prevAuthProbe := authProbe
 	prevInit := runSelfHostedInit
-	prevTTY := stdinIsTerminal
 	t.Cleanup(func() {
 		authProbe = prevAuthProbe
 		runSelfHostedInit = prevInit
-		stdinIsTerminal = prevTTY
 	})
 	authProbe = func(context.Context, string) (*auth.Fingerprint, error) {
 		return &auth.Fingerprint{
@@ -187,25 +196,18 @@ func TestSelfHostedInstall_ControlPlane_PostInstallMintNonFatalWithoutTTY(t *tes
 		initCalls++
 		return nil
 	}
-	// Simulate non-TTY environment (CI runs, BDD suite invocations).
-	stdinIsTerminal = func() bool { return false }
-
 	var stdout, stderr bytes.Buffer
 	rootCmd.SetOut(&stdout)
 	rootCmd.SetErr(&stderr)
 	rootCmd.SetArgs([]string{
 		"self-hosted", "install", "--control-plane",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
 	})
 	// Install must succeed: the post-install token mint is best-effort.
 	require.NoError(t, rootCmd.Execute())
 
-	// init must NOT have been called: the TTY check short-circuited before
-	// the prompt could fire.
-	assert.Equal(t, 0, initCalls)
-	// Hint must be surfaced so the operator knows to mint a token later.
-	assert.Contains(t, stderr.String(), "skipped post-install admin-token mint")
-	assert.Contains(t, stderr.String(), "nvcf-cli init")
+	assert.Equal(t, 1, initCalls)
+	assert.NotContains(t, stderr.String(), "skipped post-install admin-token mint")
 }
 
 func TestSelfHostedInstall_ControlPlane_WritesProfile(t *testing.T) {
@@ -228,7 +230,7 @@ func TestSelfHostedInstall_ControlPlane_WritesProfile(t *testing.T) {
 	rootCmd.SetErr(&stderr)
 	rootCmd.SetArgs([]string{
 		"self-hosted", "install", "--control-plane",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
 		"--cluster-name=nvcf-cp",
 		"--nca-id=nvcf-default",
 		"--region=us-west-1",
@@ -273,7 +275,7 @@ func TestSelfHostedInstall_ComputePlane_RegistersAndRenders(t *testing.T) {
 	rootCmd.SetOut(&stdout)
 	rootCmd.SetArgs([]string{
 		"self-hosted", "install", "--compute-plane", "--cluster-name=ncp-A",
-		"--stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--icms-url=http://sis.localhost:8080",
 		"--no-apply",
 	})
@@ -305,11 +307,11 @@ func TestSelfHostedInstall_ComputePlane_AppliesByDefault(t *testing.T) {
 
 	stackDir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(stackDir, "helmfile.d"), 0o755))
-	// Fake helmfile echoes the verb passed as its last arg so the test can assert
-	// that 'apply' (not 'template') ran when --no-apply is omitted.
+	// Fake helmfile echoes every argument so the test can assert that apply runs
+	// with the first-install diff guard when --no-apply is omitted.
 	fakeBin := filepath.Join(t.TempDir(), "helmfile")
 	require.NoError(t, os.WriteFile(fakeBin,
-		[]byte("#!/bin/sh\nlast=\nfor arg in \"$@\"; do last=\"$arg\"; done\nprintf 'verb=%s\\n' \"$last\"\n"),
+		[]byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"),
 		0o755))
 	t.Setenv("PATH", filepath.Dir(fakeBin)+":"+os.Getenv("PATH"))
 
@@ -317,14 +319,15 @@ func TestSelfHostedInstall_ComputePlane_AppliesByDefault(t *testing.T) {
 	rootCmd.SetOut(&stdout)
 	rootCmd.SetArgs([]string{
 		"self-hosted", "install", "--compute-plane", "--cluster-name=ncp-A",
-		"--stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--icms-url=http://sis.localhost:8080",
 		// no --no-apply
 	})
 	require.NoError(t, rootCmd.Execute())
 
 	assert.Equal(t, 1, fakeCC.registerCalls)
-	assert.Contains(t, stdout.String(), "verb=apply")
+	assert.Contains(t, stdout.String(), "apply")
+	assert.Contains(t, stdout.String(), "--skip-diff-on-install")
 }
 
 func TestSelfHostedInstall_ComputePlane_LocalSplitWritesExternalControlPlaneEndpoints(t *testing.T) {
@@ -355,7 +358,7 @@ func TestSelfHostedInstall_ComputePlane_LocalSplitWritesExternalControlPlaneEndp
 		"--control-plane-context=admin@cp",
 		"--compute-plane-context=admin@gpu1",
 		"install", "--compute-plane", "--cluster-name=ncp-A",
-		"--stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--icms-url=http://sis.localhost:8080",
 		"--no-apply",
 	})
@@ -389,25 +392,6 @@ func TestClusterIdentityConfigPreservesLoadedKubeconfigPath(t *testing.T) {
 	assert.Equal(t, "/tmp/custom-kubeconfig", cfg.KubeconfigPath)
 	assert.Equal(t, "admin@gpu1", cfg.KubeContext)
 	assert.Equal(t, "http://api.example", cfg.BaseHTTPURL)
-}
-
-func TestComputePlaneTarget_BundledStack(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "helmfile.d"), 0o755))
-
-	helmfileFile, selector := computePlaneTarget(dir)
-	assert.Equal(t, "", helmfileFile, "bundled layout should leave HelmfileFile empty")
-	assert.Equal(t, "release-group=workers", selector, "bundled layout should filter by release-group")
-}
-
-func TestComputePlaneTarget_MultiClusterSplit(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "helmfile.d"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "helmfile-nvca-operator.yaml.gotmpl"), []byte("releases: []\n"), 0o644))
-
-	helmfileFile, selector := computePlaneTarget(dir)
-	assert.Equal(t, "helmfile-nvca-operator.yaml.gotmpl", helmfileFile)
-	assert.Equal(t, "", selector, "split layout should not narrow with a selector")
 }
 
 // fakeClusterClient is a test double for selfhosted.ClusterClient.

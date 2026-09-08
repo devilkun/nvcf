@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-FROM golang:1.25-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS builder
 
 WORKDIR /app
 
@@ -23,30 +23,26 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . .
 
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOFLAGS=-mod=mod \
-    go build -o /out/llm-api-gateway ./cmd/llm-api-gateway
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOFLAGS=-mod=mod \
-    go build -o /out/llm-api-gateway-rate-limit-sync-worker ./cmd/llm-api-gateway-rate-limit-sync-worker
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOFLAGS=-mod=mod \
+    go build -o /out/$TARGETARCH/llm-api-gateway ./cmd/llm-api-gateway
 
-FROM debian:bookworm-slim
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOFLAGS=-mod=mod \
+    go build -o /out/$TARGETARCH/llm-api-gateway-rate-limit-sync-worker ./cmd/llm-api-gateway-rate-limit-sync-worker
 
-RUN apt-get update && apt-get install --no-install-recommends -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM nvcr.io/nvidia/distroless/go:v4.1.2
 
-RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin app
+ARG TARGETARCH
 
-USER 1000
-WORKDIR /home/app
-
-COPY --from=builder /out/llm-api-gateway ./llm-api-gateway
-COPY --from=builder /out/llm-api-gateway-rate-limit-sync-worker ./llm-api-gateway-rate-limit-sync-worker
+COPY --from=builder /out/${TARGETARCH}/llm-api-gateway /usr/bin/llm-api-gateway
+COPY --from=builder /out/${TARGETARCH}/llm-api-gateway-rate-limit-sync-worker /usr/bin/llm-api-gateway-rate-limit-sync-worker
 
 EXPOSE 8080 9464
 
-ENTRYPOINT ["./llm-api-gateway"]
+CMD ["/usr/bin/llm-api-gateway"]

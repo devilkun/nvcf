@@ -46,10 +46,139 @@ pub use webtransport_http::{
 pub const HTTP3_ALPN: &[u8] = b"h3";
 pub const WEBTRANSPORT_BIDI_STREAM_TYPE: u64 = 0x41;
 
+const EXPLICIT_HTTP_URI_ERROR: &str = "URI must be an explicit http:// or https:// authority";
+
+/// Parses an HTTP(S) dial URI without inventing a transport scheme.
+///
+/// gRPC control-plane endpoints are authorities, not HTTP resource paths. Keeping this
+/// validation shared prevents a scheme-less remote Watch address from silently becoming
+/// plaintext in one component while another component treats it as TLS.
+pub fn parse_explicit_http_uri(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let uri = value
+        .parse::<http::Uri>()
+        .map_err(|_| EXPLICIT_HTTP_URI_ERROR.to_string())?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(EXPLICIT_HTTP_URI_ERROR.to_string());
+    }
+    let authority = uri
+        .authority()
+        .filter(|authority| !authority.host().is_empty())
+        .ok_or_else(|| EXPLICIT_HTTP_URI_ERROR.to_string())?;
+    if authority.as_str().contains('@') {
+        return Err(EXPLICIT_HTTP_URI_ERROR.to_string());
+    }
+    let authority_value = authority.as_str();
+    let has_explicit_port = if authority_value.starts_with('[') {
+        authority_value
+            .split_once(']')
+            .is_some_and(|(_, suffix)| suffix.starts_with(':'))
+    } else {
+        authority_value.contains(':')
+    };
+    if has_explicit_port && authority.port_u16().filter(|port| *port > 0).is_none() {
+        return Err(EXPLICIT_HTTP_URI_ERROR.to_string());
+    }
+    if uri
+        .path_and_query()
+        .is_some_and(|path_and_query| path_and_query.as_str() != "/")
+    {
+        return Err(EXPLICIT_HTTP_URI_ERROR.to_string());
+    }
+    Ok(value.to_string())
+}
+
+#[cfg(test)]
+mod explicit_http_uri_tests {
+    use super::parse_explicit_http_uri;
+
+    #[test]
+    fn accepts_only_explicit_http_authority_uris() {
+        for valid in [
+            "https://region-b.example.test:50071",
+            "http://127.0.0.1:50071",
+            "https://[::1]",
+            "https://[::1]:50071/",
+        ] {
+            assert_eq!(parse_explicit_http_uri(valid).as_deref(), Ok(valid));
+        }
+
+        for invalid in [
+            "region-b.example.test:50071",
+            "ftp://region-b.example.test:50071",
+            "https://",
+            "https://user@region-b.example.test:50071",
+            "https://region-b.example.test:50071/watch",
+            "https://region-b.example.test:50071?region=b",
+            "https://region-b.example.test:0",
+            "https://[::1]:0",
+            "https://region-b.example.test:",
+            "https://region-b.example.test:65536",
+        ] {
+            assert!(
+                parse_explicit_http_uri(invalid).is_err(),
+                "unexpected valid URI: {invalid}"
+            );
+        }
+    }
+}
+
+/// Which side establishes the long-lived tunnel connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackendConnectivity {
+    /// Stargate connects to a QUIC listener advertised by pylon.
+    #[default]
+    Direct,
+    /// Pylon connects to a reverse-tunnel listener advertised by Stargate.
+    Reverse,
+}
+
+impl std::fmt::Display for BackendConnectivity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct => f.write_str("direct"),
+            Self::Reverse => f.write_str("reverse"),
+        }
+    }
+}
+
+impl Serialize for BackendConnectivity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendConnectivity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <&str>::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::str::FromStr for BackendConnectivity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "direct" => Ok(Self::Direct),
+            "reverse" => Ok(Self::Reverse),
+            other => Err(format!(
+                "unsupported backend connectivity '{other}', expected 'direct' or 'reverse'"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TunnelTransportProtocol {
     #[default]
-    Custom,
+    RawQuic,
     Http3,
     WebTransport,
 }
@@ -57,7 +186,7 @@ pub enum TunnelTransportProtocol {
 impl std::fmt::Display for TunnelTransportProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Custom => f.write_str("custom"),
+            Self::RawQuic => f.write_str("raw-quic"),
             Self::Http3 => f.write_str("http3"),
             Self::WebTransport => f.write_str("webtransport"),
         }
@@ -88,11 +217,11 @@ impl std::str::FromStr for TunnelTransportProtocol {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "custom" => Ok(Self::Custom),
+            "raw-quic" => Ok(Self::RawQuic),
             "http3" | "h3" => Ok(Self::Http3),
             "webtransport" | "web-transport" | "wt" => Ok(Self::WebTransport),
             other => Err(format!(
-                "unsupported tunnel protocol '{other}', expected 'custom', 'http3', or 'webtransport'"
+                "unsupported tunnel protocol '{other}', expected 'raw-quic', 'http3', or 'webtransport'"
             )),
         }
     }
@@ -101,7 +230,7 @@ impl std::str::FromStr for TunnelTransportProtocol {
 impl TunnelTransportProtocol {
     pub fn alpn_protocols(self) -> Vec<Vec<u8>> {
         match self {
-            Self::Custom => Vec::new(),
+            Self::RawQuic => Vec::new(),
             Self::Http3 | Self::WebTransport => vec![HTTP3_ALPN.to_vec()],
         }
     }
@@ -145,18 +274,12 @@ mod tests {
 
     #[test]
     fn tunnel_protocol_accepts_webtransport_aliases() {
-        assert_eq!(
-            "webtransport".parse::<TunnelTransportProtocol>().unwrap(),
-            TunnelTransportProtocol::WebTransport
-        );
-        assert_eq!(
-            "web-transport".parse::<TunnelTransportProtocol>().unwrap(),
-            TunnelTransportProtocol::WebTransport
-        );
-        assert_eq!(
-            "wt".parse::<TunnelTransportProtocol>().unwrap(),
-            TunnelTransportProtocol::WebTransport
-        );
+        for alias in ["webtransport", "web-transport", "wt"] {
+            assert_eq!(
+                alias.parse::<TunnelTransportProtocol>().unwrap(),
+                TunnelTransportProtocol::WebTransport
+            );
+        }
         assert_eq!(
             TunnelTransportProtocol::WebTransport.to_string(),
             "webtransport"
@@ -168,22 +291,64 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_protocol_uses_raw_quic_as_the_only_direct_transport_name() {
+        assert_eq!(
+            "raw-quic".parse::<TunnelTransportProtocol>().unwrap(),
+            TunnelTransportProtocol::RawQuic
+        );
+        assert_eq!(TunnelTransportProtocol::RawQuic.to_string(), "raw-quic");
+        assert_eq!(
+            TunnelTransportProtocol::RawQuic.alpn_protocols(),
+            Vec::<Vec<u8>>::new()
+        );
+    }
+
+    #[test]
     fn tunnel_protocol_serde_uses_canonical_display_strings() {
+        for (protocol, canonical) in [
+            (TunnelTransportProtocol::RawQuic, "\"raw-quic\""),
+            (TunnelTransportProtocol::Http3, "\"http3\""),
+            (TunnelTransportProtocol::WebTransport, "\"webtransport\""),
+        ] {
+            assert_eq!(serde_json::to_string(&protocol).unwrap(), canonical);
+        }
+        for (alias, protocol) in [
+            ("\"h3\"", TunnelTransportProtocol::Http3),
+            ("\"web-transport\"", TunnelTransportProtocol::WebTransport),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<TunnelTransportProtocol>(alias).unwrap(),
+                protocol
+            );
+        }
+    }
+
+    #[test]
+    fn backend_connectivity_uses_explicit_direct_and_reverse_values() {
+        assert_eq!(BackendConnectivity::default(), BackendConnectivity::Direct);
         assert_eq!(
-            serde_json::to_string(&TunnelTransportProtocol::Http3).unwrap(),
-            "\"http3\""
+            "direct".parse::<BackendConnectivity>().unwrap(),
+            BackendConnectivity::Direct
         );
         assert_eq!(
-            serde_json::to_string(&TunnelTransportProtocol::WebTransport).unwrap(),
-            "\"webtransport\""
+            "reverse".parse::<BackendConnectivity>().unwrap(),
+            BackendConnectivity::Reverse
+        );
+        assert_eq!(BackendConnectivity::Direct.to_string(), "direct");
+        assert_eq!(BackendConnectivity::Reverse.to_string(), "reverse");
+        assert!("edge".parse::<BackendConnectivity>().is_err());
+        assert!("cloud".parse::<BackendConnectivity>().is_err());
+    }
+
+    #[test]
+    fn backend_connectivity_serde_uses_canonical_values() {
+        assert_eq!(
+            serde_json::to_string(&BackendConnectivity::Direct).unwrap(),
+            "\"direct\""
         );
         assert_eq!(
-            serde_json::from_str::<TunnelTransportProtocol>("\"h3\"").unwrap(),
-            TunnelTransportProtocol::Http3
-        );
-        assert_eq!(
-            serde_json::from_str::<TunnelTransportProtocol>("\"web-transport\"").unwrap(),
-            TunnelTransportProtocol::WebTransport
+            serde_json::from_str::<BackendConnectivity>("\"reverse\"").unwrap(),
+            BackendConnectivity::Reverse
         );
     }
 }

@@ -23,16 +23,16 @@ gazelle(
 # rs-autoscaler.
 go_oci_image(
     name = "image",
-    base = "@distroless_cc",
-    binary = "//cmd/llm-api-gateway:llm-api-gateway",
+    base = "@distroless_go",
+    binary = "//src/invocation-plane-services/llm-api-gateway/cmd/llm-api-gateway:llm-api-gateway",
     entrypoint = ["/llm-api-gateway"],
     visibility = ["//visibility:public"],
 )
 
 go_oci_image(
     name = "rate_limit_sync_worker_image",
-    base = "@distroless_cc",
-    binary = "//cmd/llm-api-gateway-rate-limit-sync-worker:llm-api-gateway-rate-limit-sync-worker",
+    base = "@distroless_go",
+    binary = "//src/invocation-plane-services/llm-api-gateway/cmd/llm-api-gateway-rate-limit-sync-worker:llm-api-gateway-rate-limit-sync-worker",
     entrypoint = ["/llm-api-gateway-rate-limit-sync-worker"],
     visibility = ["//visibility:public"],
 )

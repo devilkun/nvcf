@@ -16,7 +16,7 @@
 use super::RequestQualityMonitorConfig;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TextQualityMetrics {
     pub compression_ratio: f64,
     pub repetition_1gram: f64,
@@ -38,9 +38,9 @@ pub fn evaluate_quality(
     config: &RequestQualityMonitorConfig,
 ) -> (TextQualityMetrics, QualityCheckResult) {
     let min_tokens = u64::from(config.collect_quality_metrics_min_tokens);
-    let has_text_output = approximate_output_token_count(output_text) > 0;
-    let computed_metrics = (output_tokens >= min_tokens && has_text_output)
-        .then(|| compute_text_quality_metrics(output_text));
+    let units = tokenize_quality_units(output_text);
+    let computed_metrics = (output_tokens >= min_tokens && !units.is_empty())
+        .then(|| compute_text_quality_metrics(&units));
     let metrics = computed_metrics.unwrap_or_default();
     let text_thresholds_enabled = config.output_compression_threshold_max.is_some()
         || config.output_repetition_1gram_threshold_min.is_some()
@@ -111,14 +111,11 @@ pub(crate) fn approximate_output_token_count(output_text: &str) -> u64 {
     tokenize_quality_units(output_text).len() as u64
 }
 
-fn compute_text_quality_metrics(output_text: &str) -> TextQualityMetrics {
+fn compute_text_quality_metrics(units: &[&str]) -> TextQualityMetrics {
     // These text-only heuristics treat the streamed response as a sequence of
     // token-like units. ASCII words stay grouped, while no-space scripts and
     // structured punctuation still contribute units we can reason about.
-    let units = tokenize_quality_units(output_text);
-    if units.is_empty() {
-        return TextQualityMetrics::default();
-    }
+    debug_assert!(!units.is_empty());
 
     // Compression ratio here is a simple lexical diversity score: lower values mean
     // fewer unique units relative to total output, which is often a gibberish signal.
@@ -127,10 +124,11 @@ fn compute_text_quality_metrics(output_text: &str) -> TextQualityMetrics {
 
     TextQualityMetrics {
         compression_ratio,
-        repetition_1gram: repetition_ngram(&units, 1),
-        repetition_2gram: repetition_ngram(&units, 2),
-        repetition_3gram: repetition_ngram(&units, 3),
-        degeneracy_score: degeneracy_score(&units),
+        // One-unit repetition is exactly the complement of lexical diversity.
+        repetition_1gram: 1.0 - compression_ratio,
+        repetition_2gram: repetition_ngram(units, 2),
+        repetition_3gram: repetition_ngram(units, 3),
+        degeneracy_score: degeneracy_score(units),
     }
 }
 
@@ -145,13 +143,10 @@ fn tokenize_quality_units(output_text: &str) -> Vec<&str> {
 
         let mut end = start + ch.len_utf8();
         if should_group_unit_char(ch) {
-            while let Some(&(next_start, next_ch)) = chars.peek() {
-                if should_group_unit_char(next_ch) {
-                    end = next_start + next_ch.len_utf8();
-                    chars.next();
-                } else {
-                    break;
-                }
+            while let Some((next_start, next_ch)) =
+                chars.next_if(|&(_, next_ch)| should_group_unit_char(next_ch))
+            {
+                end = next_start + next_ch.len_utf8();
             }
         }
 
@@ -162,16 +157,13 @@ fn tokenize_quality_units(output_text: &str) -> Vec<&str> {
 }
 
 fn should_group_unit_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric()
-        || ch == '_'
-        || ch.is_numeric()
-        || (ch.is_alphabetic() && (ch.is_uppercase() || ch.is_lowercase()))
+    ch == '_' || ch.is_numeric() || (ch.is_alphabetic() && (ch.is_uppercase() || ch.is_lowercase()))
 }
 
 fn repetition_ngram(units: &[&str], n: usize) -> f64 {
     // Measure how often n-unit windows repeat. A value near 1.0 means most windows
     // are duplicates, which catches outputs that keep reusing the same local pattern.
-    if n == 0 || units.len() < n {
+    if units.len() < n {
         return 0.0;
     }
     let total = units.len() - n + 1;
@@ -189,19 +181,16 @@ fn degeneracy_score(units: &[&str]) -> f64 {
 
     let mut max_ident = 1usize;
     let mut cur_ident = 1usize;
-    for index in 1..n {
-        if units[index] == units[index - 1] {
-            cur_ident += 1;
-        } else {
-            max_ident = max_ident.max(cur_ident);
-            cur_ident = 1;
-        }
-    }
-    max_ident = max_ident.max(cur_ident);
-
     let mut max_alt = 1usize;
     let mut alt_len = 1usize;
     for index in 1..n {
+        cur_ident = if units[index] == units[index - 1] {
+            cur_ident + 1
+        } else {
+            1
+        };
+        max_ident = max_ident.max(cur_ident);
+
         if index >= 2 && units[index] == units[index - 2] && units[index] != units[index - 1] {
             alt_len = if alt_len >= 2 { alt_len + 1 } else { 3 };
         } else {
@@ -225,6 +214,16 @@ mod tests {
         }
     }
 
+    fn assert_evaluated(result: QualityCheckResult, reason: Option<&'static str>) {
+        assert!(result.evaluated);
+        assert_eq!(result.threshold_match_reason, reason);
+    }
+
+    fn assert_skipped(result: QualityCheckResult) {
+        assert!(!result.evaluated);
+        assert_eq!(result.threshold_match_reason, None);
+    }
+
     #[test]
     fn repetition_and_degeneracy_are_high_for_repeated_output() {
         let config = metrics_config();
@@ -240,8 +239,7 @@ mod tests {
             "expected high degeneracy_score, got {}",
             metrics.degeneracy_score
         );
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, None);
+        assert_evaluated(result, None);
     }
 
     #[test]
@@ -252,8 +250,7 @@ mod tests {
         };
         let (_metrics, result) =
             evaluate_quality("word word word word word word", 6, None, &config);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("repetition_1gram"));
+        assert_evaluated(result, Some("repetition_1gram"));
     }
 
     #[test]
@@ -266,8 +263,7 @@ mod tests {
         let (metrics, result) = evaluate_quality("loop loop loop loop", 4, None, &config);
 
         assert!(metrics.compression_ratio < 0.5);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("compression_ratio"));
+        assert_evaluated(result, Some("compression_ratio"));
     }
 
     #[test]
@@ -280,8 +276,7 @@ mod tests {
         let (metrics, result) = evaluate_quality("a b a b a b", 6, None, &config);
 
         assert!(metrics.repetition_2gram > 0.5);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("repetition_2gram"));
+        assert_evaluated(result, Some("repetition_2gram"));
     }
 
     #[test]
@@ -294,8 +289,7 @@ mod tests {
         let (metrics, result) = evaluate_quality("a b c a b c a b c", 9, None, &config);
 
         assert!(metrics.repetition_3gram > 0.5);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("repetition_3gram"));
+        assert_evaluated(result, Some("repetition_3gram"));
     }
 
     #[test]
@@ -308,8 +302,7 @@ mod tests {
         let (metrics, result) = evaluate_quality("a b a b a b", 6, None, &config);
 
         assert!(metrics.degeneracy_score > 0.8);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("degeneracy_score"));
+        assert_evaluated(result, Some("degeneracy_score"));
     }
 
     #[test]
@@ -322,8 +315,7 @@ mod tests {
         let (metrics, result) = evaluate_quality("a b c", 3, None, &config);
 
         assert!(metrics.degeneracy_score < 0.5);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, None);
+        assert_evaluated(result, None);
     }
 
     #[test]
@@ -336,8 +328,7 @@ mod tests {
         let (metrics, result) = evaluate_quality("哈哈哈哈哈哈", 6, None, &config);
 
         assert!(metrics.degeneracy_score > 0.8);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("degeneracy_score"));
+        assert_evaluated(result, Some("degeneracy_score"));
     }
 
     #[test]
@@ -347,8 +338,7 @@ mod tests {
             ..RequestQualityMonitorConfig::default()
         };
         let (_metrics, result) = evaluate_quality("short output", 11, None, &config);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("output_tokens"));
+        assert_evaluated(result, Some("output_tokens"));
     }
 
     #[test]
@@ -363,13 +353,8 @@ mod tests {
         let (metrics, result) =
             evaluate_quality("alpha beta gamma delta epsilon", 5, None, &config);
 
-        assert_eq!(metrics.compression_ratio, 0.0);
-        assert_eq!(metrics.repetition_1gram, 0.0);
-        assert_eq!(metrics.repetition_2gram, 0.0);
-        assert_eq!(metrics.repetition_3gram, 0.0);
-        assert_eq!(metrics.degeneracy_score, 0.0);
-        assert!(!result.evaluated);
-        assert_eq!(result.threshold_match_reason, None);
+        assert_eq!(metrics, TextQualityMetrics::default());
+        assert_skipped(result);
     }
 
     #[test]
@@ -383,13 +368,8 @@ mod tests {
 
         let (metrics, result) = evaluate_quality("", 8, None, &config);
 
-        assert_eq!(metrics.compression_ratio, 0.0);
-        assert_eq!(metrics.repetition_1gram, 0.0);
-        assert_eq!(metrics.repetition_2gram, 0.0);
-        assert_eq!(metrics.repetition_3gram, 0.0);
-        assert_eq!(metrics.degeneracy_score, 0.0);
-        assert!(!result.evaluated);
-        assert_eq!(result.threshold_match_reason, None);
+        assert_eq!(metrics, TextQualityMetrics::default());
+        assert_skipped(result);
     }
 
     #[test]
@@ -401,8 +381,7 @@ mod tests {
 
         let (_metrics, result) = evaluate_quality("alpha beta gamma", 3, None, &config);
 
-        assert!(!result.evaluated);
-        assert_eq!(result.threshold_match_reason, None);
+        assert_skipped(result);
     }
 
     #[test]
@@ -418,8 +397,7 @@ mod tests {
             evaluate_quality("alpha beta gamma delta epsilon", 5, None, &config);
 
         assert_eq!(metrics.compression_ratio, 0.0);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("output_tokens"));
+        assert_evaluated(result, Some("output_tokens"));
     }
 
     #[test]
@@ -434,8 +412,7 @@ mod tests {
         let (metrics, result) = evaluate_quality("alpha", 1, Some(-8.0), &config);
 
         assert_eq!(metrics.compression_ratio, 0.0);
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("median_logprob"));
+        assert_evaluated(result, Some("median_logprob"));
     }
 
     #[test]
@@ -452,8 +429,7 @@ mod tests {
         let (_metrics, result) =
             evaluate_quality("loop loop loop loop loop", 5, Some(-10.0), &config);
 
-        assert!(result.evaluated);
-        assert_eq!(result.threshold_match_reason, Some("output_tokens"));
+        assert_evaluated(result, Some("output_tokens"));
     }
 
     #[test]
@@ -467,7 +443,6 @@ mod tests {
 
         let (_metrics, result) = evaluate_quality("alpha beta gamma", 3, None, &config);
 
-        assert!(!result.evaluated);
-        assert_eq!(result.threshold_match_reason, None);
+        assert_skipped(result);
     }
 }

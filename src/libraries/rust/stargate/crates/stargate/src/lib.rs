@@ -19,14 +19,67 @@ pub mod discovery;
 pub(crate) mod http_proxy;
 pub mod load_balancer;
 pub mod metrics;
-pub(crate) mod queue_estimate;
 pub(crate) mod routing_state;
 pub mod runtime;
-pub mod telemetry;
 pub(crate) mod tunnel;
+
+pub(crate) mod queue_estimate {
+    use stargate_proto::pb::ModelStats;
+    use stargate_protocol::common::queue_time_delta_ms;
+
+    pub(crate) fn queue_time_estimate_ms_for_priority(
+        stats: &ModelStats,
+        priority: u32,
+    ) -> Option<u64> {
+        if !stats.queue_time_estimate_ms_by_priority.is_empty() {
+            return priority_map_estimate_ms_for_priority(stats, priority).or(Some(0));
+        }
+        aggregate_queue_time_estimate_ms(stats)
+    }
+
+    pub(crate) fn priority_map_estimate_ms_for_priority(
+        stats: &ModelStats,
+        priority: u32,
+    ) -> Option<u64> {
+        let mut best = None;
+        for (&candidate_priority, &queue_time_ms) in &stats.queue_time_estimate_ms_by_priority {
+            if candidate_priority <= priority
+                && best.is_none_or(|(best_priority, _)| candidate_priority > best_priority)
+            {
+                best = Some((candidate_priority, queue_time_ms));
+            }
+        }
+        best.map(|(_, queue_time_ms)| queue_time_ms)
+    }
+
+    pub(crate) fn aggregate_queue_time_estimate_ms(stats: &ModelStats) -> Option<u64> {
+        queue_time_delta_ms(stats.queued_input_size, stats.last_mean_input_tps)
+    }
+}
+
+pub mod telemetry {
+    pub const DEFAULT_SERVICE_NAME: &str = "stargate";
+    pub use stargate_telemetry::{
+        TelemetryGuard, inject_trace_context, parent_context_from_headers, traceparent_from_headers,
+    };
+
+    pub fn init_telemetry(
+        endpoint: Option<&str>,
+        service_name: &str,
+        access_token: Option<&str>,
+    ) -> anyhow::Result<TelemetryGuard> {
+        stargate_telemetry::init_telemetry(
+            endpoint,
+            service_name,
+            "proxy_openai_request",
+            access_token,
+        )
+    }
+}
 
 pub mod proxy {
     pub use crate::http_proxy::{ProxyRetryConfig, ProxyTransportConfig};
+    pub use crate::tunnel::QuicTunnelConfig;
 }
 
 pub mod registration {

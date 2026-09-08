@@ -45,7 +45,8 @@ func main() {
 	telemetry.SetServiceName(cfg.Telemetry.ServiceName)
 
 	observability, err := telemetry.Init(context.Background(), telemetry.RuntimeConfig{
-		MetricsPort: cfg.Telemetry.MetricsPort,
+		MetricsPort:        cfg.Telemetry.MetricsPort,
+		TracingAccessToken: cfg.Telemetry.TracingAccessToken,
 	})
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to initialize open telemetry")
@@ -61,9 +62,9 @@ func main() {
 		zlog.Fatal().Err(err).Msg("failed to initialize inference provider")
 	}
 
-	var authClient *nvcf.GRPCClient
+	var authClient nvcf.Client
 	if cfg.NVCF.GRPCAddr != "" {
-		authClient, err = nvcf.NewClient(nvcf.Config{
+		grpcAuthClient, err := nvcf.NewClient(nvcf.Config{
 			Addr:               cfg.NVCF.GRPCAddr,
 			SecretsPath:        cfg.NVCF.SecretsPath,
 			OAuth2ProviderHost: cfg.NVCF.OAuth2ProviderHost,
@@ -73,6 +74,7 @@ func main() {
 		if err != nil {
 			zlog.Fatal().Err(err).Msg("failed to initialize nvcf grpc auth client")
 		}
+		authClient = nvcf.NewCachedClient(grpcAuthClient)
 	}
 
 	e, err := server.New(cfg, inferenceProvider, authClient)

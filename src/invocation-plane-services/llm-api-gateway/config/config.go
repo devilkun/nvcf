@@ -42,6 +42,11 @@ type Config struct {
 	DefaultTPM         int64
 	DefaultRPM         int64
 	ModelCapabilities  map[string]ModelCapabilities
+	// ModelURIAllowlistEnabled refuses requests to endpoints a model does
+	// not declare in its uris allowlist. When false, undeclared endpoints
+	// are only counted and logged so enforcement can roll out per
+	// environment.
+	ModelURIAllowlistEnabled bool
 }
 
 type ServerConfig struct {
@@ -54,8 +59,9 @@ type ServerConfig struct {
 }
 
 type TelemetryConfig struct {
-	ServiceName string
-	MetricsPort int
+	ServiceName        string
+	MetricsPort        int
+	TracingAccessToken string
 }
 
 type StargateConfig struct {
@@ -240,10 +246,37 @@ func LoadFromEnv() (*Config, error) {
 	applyRateLimitEnv(cfg, &errs)
 	applyDefaultModelEnv(cfg, &errs)
 
+	if v, ok := errs.boolean("MODEL_URI_ALLOWLIST_ENABLED"); ok {
+		cfg.ModelURIAllowlistEnabled = v
+	}
+
+	// SecretsPath is populated by applyStargateNVCFEnv above.
+	cfg.Telemetry.TracingAccessToken = loadTracingAccessToken(cfg.NVCF.SecretsPath)
+
 	if err := errs.err(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// loadTracingAccessToken reads the Lightstep access token for the OTLP
+// exporters. Best-effort: a missing file or key leaves the token empty rather
+// than failing startup.
+func loadTracingAccessToken(secretsPath string) string {
+	if secretsPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(secretsPath)
+	if err != nil {
+		return ""
+	}
+	var secrets struct {
+		TracingAccessToken string `json:"tracingAccessToken"`
+	}
+	if err := json.Unmarshal(data, &secrets); err != nil {
+		return ""
+	}
+	return secrets.TracingAccessToken
 }
 
 func applyServerTelemetryEnv(cfg *Config, errs *envErrs) {

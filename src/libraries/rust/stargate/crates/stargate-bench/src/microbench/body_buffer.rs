@@ -14,18 +14,23 @@
 // limitations under the License.
 
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use bytes::{Buf, Bytes};
+use clap::Args;
 
 const MAX_SPECULATIVE_BODY_PREALLOC_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Args, Debug, Clone)]
 pub(crate) struct BodyBufferMicrobenchConfig {
+    #[arg(long, default_value_t = 20_000, value_name = "N")]
     pub iterations: usize,
+    #[arg(long, default_value_t = 2_000, value_name = "N")]
     pub warmup_iterations: usize,
+    #[arg(long, default_value_t = 65_536, value_name = "BYTES")]
     pub body_bytes: usize,
+    #[arg(long, default_value_t = 1_024, value_name = "BYTES")]
     pub chunk_bytes: usize,
 }
 
@@ -35,54 +40,53 @@ pub(crate) fn run_body_buffer_microbench(
     config.validate()?;
 
     let chunks = body_chunks(config.body_bytes, config.chunk_bytes);
-    let mut rows = Vec::new();
-    for scenario in BodyBufferScenario::ALL {
+    let measurements = BODY_BUFFER_SCENARIOS.map(|scenario| {
         warm_up(
             &chunks,
             config.body_bytes,
             config.warmup_iterations,
             scenario,
         );
-        let baseline = measure(
-            &chunks,
-            config.body_bytes,
-            config.iterations,
-            scenario.baseline(),
-        )?;
-        let optimized = measure(
-            &chunks,
-            config.body_bytes,
-            config.iterations,
-            scenario.optimized(),
-        )?;
-        rows.push(BodyBufferMicrobenchRow {
-            scenario,
-            baseline,
-            optimized,
-        });
-    }
+        BodyBufferMeasurement {
+            baseline_ns_per_body: measure(
+                &chunks,
+                config.body_bytes,
+                config.iterations,
+                scenario.baseline,
+            ),
+            optimized_ns_per_body: measure(
+                &chunks,
+                config.body_bytes,
+                config.iterations,
+                scenario.optimized,
+            ),
+        }
+    });
 
-    Ok(BodyBufferMicrobenchOutcome { rows })
+    Ok(BodyBufferMicrobenchOutcome {
+        body_bytes: config.body_bytes,
+        chunk_count: chunks.len(),
+        measurements,
+    })
 }
 
 pub(crate) fn render_body_buffer_microbench_report(
     outcome: &BodyBufferMicrobenchOutcome,
 ) -> String {
-    let mut report = String::new();
-    report.push_str("# Body Buffer Microbench\n\n");
-    report.push_str(
+    let mut report = String::from(concat!(
+        "# Body Buffer Microbench\n\n",
         "| Scenario | Body Bytes | Chunks | Baseline ns/body | Optimized ns/body | Improvement |\n",
-    );
-    report.push_str("| --- | ---: | ---: | ---: | ---: | ---: |\n");
-    for row in &outcome.rows {
+        "| --- | ---: | ---: | ---: | ---: | ---: |\n",
+    ));
+    for (scenario, measurement) in BODY_BUFFER_SCENARIOS.iter().zip(&outcome.measurements) {
         report.push_str(&format!(
             "| {} | {} | {} | {:.2} | {:.2} | {:.2}% |\n",
-            row.scenario.label(),
-            row.baseline.body_bytes,
-            row.baseline.chunk_count,
-            row.baseline.ns_per_body,
-            row.optimized.ns_per_body,
-            row.improvement_percent()
+            scenario.label,
+            outcome.body_bytes,
+            outcome.chunk_count,
+            measurement.baseline_ns_per_body,
+            measurement.optimized_ns_per_body,
+            measurement.improvement_percent()
         ));
     }
     report
@@ -90,31 +94,25 @@ pub(crate) fn render_body_buffer_microbench_report(
 
 #[derive(Debug)]
 pub(crate) struct BodyBufferMicrobenchOutcome {
-    rows: Vec<BodyBufferMicrobenchRow>,
-}
-
-#[derive(Debug)]
-struct BodyBufferMicrobenchRow {
-    scenario: BodyBufferScenario,
-    baseline: BodyBufferMeasurement,
-    optimized: BodyBufferMeasurement,
-}
-
-impl BodyBufferMicrobenchRow {
-    fn improvement_percent(&self) -> f64 {
-        if self.baseline.ns_per_body == 0.0 {
-            return 0.0;
-        }
-        ((self.baseline.ns_per_body - self.optimized.ns_per_body) / self.baseline.ns_per_body)
-            * 100.0
-    }
+    body_bytes: usize,
+    chunk_count: usize,
+    measurements: [BodyBufferMeasurement; BODY_BUFFER_SCENARIOS.len()],
 }
 
 #[derive(Debug)]
 struct BodyBufferMeasurement {
-    body_bytes: usize,
-    chunk_count: usize,
-    ns_per_body: f64,
+    baseline_ns_per_body: f64,
+    optimized_ns_per_body: f64,
+}
+
+impl BodyBufferMeasurement {
+    fn improvement_percent(&self) -> f64 {
+        if self.baseline_ns_per_body == 0.0 {
+            return 0.0;
+        }
+        ((self.baseline_ns_per_body - self.optimized_ns_per_body) / self.baseline_ns_per_body)
+            * 100.0
+    }
 }
 
 type BodyBufferFn = fn(&[Bytes], usize) -> usize;
@@ -124,70 +122,42 @@ impl BodyBufferMicrobenchConfig {
         ensure!(self.iterations > 0, "iterations must be > 0");
         ensure!(self.body_bytes > 0, "body-bytes must be > 0");
         ensure!(self.chunk_bytes > 0, "chunk-bytes must be > 0");
-        self.iterations
-            .checked_mul(self.body_bytes)
-            .ok_or_else(|| anyhow::anyhow!("iterations * body_bytes is too large"))?;
+        ensure!(
+            self.iterations.checked_mul(self.body_bytes).is_some(),
+            "iterations * body_bytes is too large"
+        );
         Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum BodyBufferScenario {
-    BytesExtend,
-    H3BufExtend,
+#[derive(Clone, Copy)]
+struct BodyBufferScenario {
+    label: &'static str,
+    baseline: BodyBufferFn,
+    optimized: BodyBufferFn,
 }
 
-impl BodyBufferScenario {
-    const ALL: [Self; 2] = [Self::BytesExtend, Self::H3BufExtend];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::BytesExtend => "bytes-extend-prealloc",
-            Self::H3BufExtend => "h3-buf-copy-prealloc",
-        }
-    }
-
-    fn baseline(self) -> BodyBufferFn {
-        match self {
-            Self::BytesExtend => collect_bytes_no_prealloc,
-            Self::H3BufExtend => collect_h3_copy_to_bytes_no_prealloc,
-        }
-    }
-
-    fn optimized(self) -> BodyBufferFn {
-        match self {
-            Self::BytesExtend => collect_bytes_preallocated,
-            Self::H3BufExtend => collect_h3_buf_chunk_preallocated,
-        }
-    }
-}
+#[rustfmt::skip]
+const BODY_BUFFER_SCENARIOS: [BodyBufferScenario; 2] = [
+    BodyBufferScenario { label: "bytes-extend-prealloc", baseline: collect_bytes_no_prealloc, optimized: collect_bytes_preallocated },
+    BodyBufferScenario { label: "h3-buf-copy-prealloc", baseline: collect_h3_copy_to_bytes_no_prealloc, optimized: collect_h3_buf_chunk_preallocated },
+];
 
 fn warm_up(chunks: &[Bytes], body_bytes: usize, iterations: usize, scenario: BodyBufferScenario) {
-    black_box((scenario.baseline())(chunks, body_bytes));
-    black_box((scenario.optimized())(chunks, body_bytes));
-    for _ in 0..iterations {
-        black_box((scenario.baseline())(chunks, body_bytes));
-        black_box((scenario.optimized())(chunks, body_bytes));
+    for _ in 0..=iterations {
+        black_box((scenario.baseline)(chunks, body_bytes));
+        black_box((scenario.optimized)(chunks, body_bytes));
     }
 }
 
-fn measure(
-    chunks: &[Bytes],
-    body_bytes: usize,
-    iterations: usize,
-    buffer: BodyBufferFn,
-) -> Result<BodyBufferMeasurement> {
+fn measure(chunks: &[Bytes], body_bytes: usize, iterations: usize, buffer: BodyBufferFn) -> f64 {
     let started_at = Instant::now();
     let mut checksum = 0usize;
     for _ in 0..iterations {
         checksum ^= buffer(chunks, body_bytes);
     }
     black_box(checksum);
-    Ok(BodyBufferMeasurement {
-        body_bytes,
-        chunk_count: chunks.len(),
-        ns_per_body: ns_per_body(started_at.elapsed(), iterations),
-    })
+    started_at.elapsed().as_nanos() as f64 / iterations as f64
 }
 
 fn body_chunks(total_bytes: usize, chunk_bytes: usize) -> Vec<Bytes> {
@@ -250,27 +220,23 @@ fn prealloc_capacity(body_bytes: usize) -> usize {
     body_bytes.min(MAX_SPECULATIVE_BODY_PREALLOC_BYTES)
 }
 
-fn ns_per_body(elapsed: Duration, iterations: usize) -> f64 {
-    elapsed.as_nanos() as f64 / iterations as f64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn report_includes_every_body_buffer_scenario() -> Result<()> {
-        let outcome = run_body_buffer_microbench(BodyBufferMicrobenchConfig {
-            iterations: 1,
-            warmup_iterations: 0,
-            body_bytes: 1024,
-            chunk_bytes: 128,
-        })?;
+        let report = render_body_buffer_microbench_report(&run_body_buffer_microbench(
+            BodyBufferMicrobenchConfig {
+                iterations: 1,
+                warmup_iterations: 0,
+                body_bytes: 1024,
+                chunk_bytes: 128,
+            },
+        )?);
 
-        let report = render_body_buffer_microbench_report(&outcome);
-
-        for scenario in BodyBufferScenario::ALL {
-            assert!(report.contains(scenario.label()));
+        for scenario in BODY_BUFFER_SCENARIOS {
+            assert!(report.contains(scenario.label));
         }
         Ok(())
     }
@@ -279,26 +245,25 @@ mod tests {
     fn optimized_body_buffers_match_baseline_lengths() {
         let chunks = body_chunks(4097, 333);
 
-        for scenario in BodyBufferScenario::ALL {
+        for scenario in BODY_BUFFER_SCENARIOS {
             assert_eq!(
-                (scenario.baseline())(&chunks, 4097),
-                (scenario.optimized())(&chunks, 4097),
+                (scenario.baseline)(&chunks, 4097),
+                (scenario.optimized)(&chunks, 4097),
                 "scenario={}",
-                scenario.label()
+                scenario.label
             );
         }
     }
 
     #[test]
     fn body_buffer_microbench_rejects_zero_chunk_size() {
-        let Err(error) = run_body_buffer_microbench(BodyBufferMicrobenchConfig {
+        let error = run_body_buffer_microbench(BodyBufferMicrobenchConfig {
             iterations: 1,
             warmup_iterations: 0,
             body_bytes: 1024,
             chunk_bytes: 0,
-        }) else {
-            panic!("zero chunk bytes should fail");
-        };
+        })
+        .unwrap_err();
 
         assert!(error.to_string().contains("chunk-bytes must be > 0"));
     }

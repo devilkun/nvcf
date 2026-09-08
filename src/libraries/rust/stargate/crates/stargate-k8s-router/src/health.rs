@@ -65,7 +65,10 @@ async fn livez() -> StatusCode {
 
 async fn readyz(State(state): State<HealthState>) -> StatusCode {
     let snapshot = state.targets.borrow();
-    if snapshot.initialized && snapshot.ready_count() > 0 {
+    if snapshot.is_initialized()
+        && snapshot.ready_count() > 0
+        && state.metrics.tls_identity_is_ready()
+    {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -82,9 +85,74 @@ async fn metrics_handler(State(state): State<HealthState>) -> (StatusCode, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endpoints::PodTarget;
     use axum::body::Body;
     use http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn readyz_requires_initialized_nonempty_snapshot() {
+        let metrics = Arc::new(RouterMetrics::new().expect("metrics should initialize"));
+        let (tx, rx) = watch::channel(TargetSnapshot::default());
+        let router = health_router(rx, metrics.clone());
+        let ready_request = || {
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .expect("request should build")
+        };
+
+        let response = router
+            .clone()
+            .oneshot(ready_request())
+            .await
+            .expect("readiness request should succeed");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        tx.send(TargetSnapshot::initialized([]))
+            .expect("initialized empty snapshot should publish");
+        let response = router
+            .clone()
+            .oneshot(ready_request())
+            .await
+            .expect("readiness request should succeed");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        tx.send(TargetSnapshot::initialized([PodTarget {
+            pod_name: "stargate-0".to_string(),
+            grpc_addr: "10.0.0.10:50071".to_string(),
+            quic_addr: "10.0.0.10:50072".to_string(),
+        }]))
+        .expect("ready snapshot should publish");
+        let response = router
+            .clone()
+            .oneshot(ready_request())
+            .await
+            .expect("readiness request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_secs()
+            .try_into()
+            .expect("current time should fit in i64");
+        metrics
+            .tls_identity()
+            .set_validity(Some(stargate_tls::CertificateValidity {
+                not_before_unix_seconds: now.saturating_sub(120),
+                not_after_unix_seconds: now.saturating_sub(60),
+            }));
+        let response = router
+            .oneshot(ready_request())
+            .await
+            .expect("readiness request should succeed");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an expired server identity must remove the router from Service endpoints"
+        );
+    }
 
     #[tokio::test]
     async fn metrics_endpoint_exports_router_metrics() {

@@ -14,9 +14,10 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hint::black_box;
 use std::io::Write;
-use std::sync::{Arc, Barrier};
+use std::sync::Barrier;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,122 +25,98 @@ use anyhow::Context;
 use clap::ValueEnum;
 use stargate::load_balancer::{
     LoadBalancerAlgorithm, LoadBalancerAlgorithmConfig, LoadBalancerConfig,
-    LoadBalancerModelConfig, LoadBalancerRequest, LoadBalancerRouter,
+    LoadBalancerModelConfig, LoadBalancerRequest, LoadBalancerRouter, LoadBalancerTargetState,
+    MAX_POWER_OF_N_SAMPLE_COUNT,
 };
 use stargate::routing::{RoutedClusterSnapshot, RoutingTargetKey};
 use stargate_proto::pb::{InferenceServerStatus, ModelStats};
 
-const MULTIREGION_MODEL_ID: &str = "lb-bench-multiregion";
-const MULTIREGION_ONE_EXCLUDED_MODEL_ID: &str = "lb-bench-multiregion-one-excluded";
-const MULTIREGION_IGNORE_QUEUE_MODEL_ID: &str = "lb-bench-multiregion-ignore-queue";
-const MULTIREGION_IGNORE_QUEUE_ONE_EXCLUDED_MODEL_ID: &str =
-    "lb-bench-multiregion-ignore-queue-one-excluded";
-const MULTIREGION_IGNORE_QUEUE_MULTI_EXCLUDED_MODEL_ID: &str =
-    "lb-bench-multiregion-ignore-queue-multi-excluded";
-const MULTIREGION_RTT_ONLY_MODEL_ID: &str = "lb-bench-multiregion-rtt-only";
-const MULTIREGION_RTT_ONLY_ONE_EXCLUDED_MODEL_ID: &str =
-    "lb-bench-multiregion-rtt-only-one-excluded";
-const MULTIREGION_RTT_ONLY_MULTI_EXCLUDED_MODEL_ID: &str =
-    "lb-bench-multiregion-rtt-only-multi-excluded";
-const MULTIREGION_AFFINITY_MODEL_ID: &str = "lb-bench-multiregion-affinity";
-const MULTIREGION_AFFINITY_ONE_EXCLUDED_MODEL_ID: &str =
-    "lb-bench-multiregion-affinity-one-excluded";
-const MULTIREGION_AFFINITY_MULTI_EXCLUDED_MODEL_ID: &str =
-    "lb-bench-multiregion-affinity-multi-excluded";
-const POWER_OF_TWO_MODEL_ID: &str = "lb-bench-power-of-two";
-const POWER_OF_TWO_ONE_EXCLUDED_MODEL_ID: &str = "lb-bench-power-of-two-one-excluded";
-const PULSAR_MODEL_ID: &str = "lb-bench-pulsar";
-const PULSAR_ONE_EXCLUDED_MODEL_ID: &str = "lb-bench-pulsar-one-excluded";
-const RANDOM_MODEL_ID: &str = "lb-bench-random";
-const RANDOM_ONE_EXCLUDED_MODEL_ID: &str = "lb-bench-random-one-excluded";
-const ROUND_ROBIN_ONE_EXCLUDED_MODEL_ID: &str = "lb-bench-round-robin-one-excluded";
-const ROUND_ROBIN_MULTI_EXCLUDED_MODEL_ID: &str = "lb-bench-round-robin-multi-excluded";
+#[derive(Clone, Copy, PartialEq)]
+enum WaitAndWidenTuning {
+    IgnoreQueue,
+    RttOnly,
+    Affinity,
+}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "kebab-case")]
-pub enum LbMicrobenchScenario {
-    PowerOfTwo,
-    PowerOfTwoOneExcluded,
-    GroqMultiregion,
-    GroqMultiregionOneExcluded,
-    GroqMultiregionIgnoreQueue,
-    GroqMultiregionIgnoreQueueOneExcluded,
-    GroqMultiregionIgnoreQueueMultiExcluded,
-    GroqMultiregionRttOnly,
-    GroqMultiregionRttOnlyOneExcluded,
-    GroqMultiregionRttOnlyMultiExcluded,
-    GroqMultiregionAffinity,
-    GroqMultiregionAffinityOneExcluded,
-    GroqMultiregionAffinityMultiExcluded,
-    Pulsar,
-    PulsarOneExcluded,
-    Random,
-    RandomOneExcluded,
-    RoundRobinOneExcluded,
-    RoundRobinMultiExcluded,
+struct LbMicrobenchScenarioMetadata {
+    model_id: &'static str,
+    algorithm: LoadBalancerAlgorithm,
+    tuning: Option<WaitAndWidenTuning>,
+    excluded_clusters: usize,
+}
+
+use WaitAndWidenTuning::{Affinity, IgnoreQueue, RttOnly};
+
+macro_rules! scenarios {
+    ($($scenario:ident, $model_id:literal, $algorithm:ident, $tuning:expr, $excluded:literal;)+) => {
+        #[repr(usize)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+        #[value(rename_all = "kebab-case")]
+        pub enum LbMicrobenchScenario { $($scenario,)+ }
+
+        const LB_MICROBENCH_SCENARIOS: [LbMicrobenchScenarioMetadata; 23] = [$(
+            LbMicrobenchScenarioMetadata {
+                model_id: $model_id,
+                algorithm: LoadBalancerAlgorithm::$algorithm,
+                tuning: $tuning,
+                excluded_clusters: $excluded,
+            },
+        )+];
+    };
+}
+
+// Keep the scenario matrix row-oriented so differences remain directly comparable.
+#[rustfmt::skip]
+scenarios! {
+    PowerOfN, "lb-bench-power-of-n", PowerOfN, None, 0;
+    PowerOfNSample1, "lb-bench-power-of-n-sample-1", PowerOfN, None, 0;
+    PowerOfNSample4, "lb-bench-power-of-n-sample-4", PowerOfN, None, 0;
+    PowerOfNSample8, "lb-bench-power-of-n-sample-8", PowerOfN, None, 0;
+    PowerOfNFullPool, "lb-bench-power-of-n-full-pool", PowerOfN, None, 0;
+    PowerOfNOneExcluded, "lb-bench-power-of-n-one-excluded", PowerOfN, None, 1;
+    WaitAndWiden, "lb-bench-wait-and-widen", WaitAndWiden, None, 0;
+    WaitAndWidenOneExcluded, "lb-bench-wait-and-widen-one-excluded", WaitAndWiden, None, 1;
+    WaitAndWidenIgnoreQueue, "lb-bench-wait-and-widen-ignore-queue", WaitAndWiden, Some(IgnoreQueue), 0;
+    WaitAndWidenIgnoreQueueOneExcluded, "lb-bench-wait-and-widen-ignore-queue-one-excluded", WaitAndWiden, Some(IgnoreQueue), 1;
+    WaitAndWidenIgnoreQueueMultiExcluded, "lb-bench-wait-and-widen-ignore-queue-multi-excluded", WaitAndWiden, Some(IgnoreQueue), 2;
+    WaitAndWidenRttOnly, "lb-bench-wait-and-widen-rtt-only", WaitAndWiden, Some(RttOnly), 0;
+    WaitAndWidenRttOnlyOneExcluded, "lb-bench-wait-and-widen-rtt-only-one-excluded", WaitAndWiden, Some(RttOnly), 1;
+    WaitAndWidenRttOnlyMultiExcluded, "lb-bench-wait-and-widen-rtt-only-multi-excluded", WaitAndWiden, Some(RttOnly), 2;
+    WaitAndWidenAffinity, "lb-bench-wait-and-widen-affinity", WaitAndWiden, Some(Affinity), 0;
+    WaitAndWidenAffinityOneExcluded, "lb-bench-wait-and-widen-affinity-one-excluded", WaitAndWiden, Some(Affinity), 1;
+    WaitAndWidenAffinityMultiExcluded, "lb-bench-wait-and-widen-affinity-multi-excluded", WaitAndWiden, Some(Affinity), 2;
+    Pulsar, "lb-bench-pulsar", Pulsar, None, 0;
+    PulsarOneExcluded, "lb-bench-pulsar-one-excluded", Pulsar, None, 1;
+    Random, "lb-bench-random", Random, None, 0;
+    RandomOneExcluded, "lb-bench-random-one-excluded", Random, None, 1;
+    RoundRobinOneExcluded, "lb-bench-round-robin-one-excluded", RoundRobin, None, 1;
+    RoundRobinMultiExcluded, "lb-bench-round-robin-multi-excluded", RoundRobin, None, 2;
 }
 
 impl LbMicrobenchScenario {
-    fn label(self) -> &'static str {
-        match self {
-            Self::PowerOfTwo => "power-of-two",
-            Self::PowerOfTwoOneExcluded => "power-of-two-one-excluded",
-            Self::GroqMultiregion => "groq-multiregion",
-            Self::GroqMultiregionOneExcluded => "groq-multiregion-one-excluded",
-            Self::GroqMultiregionIgnoreQueue => "groq-multiregion-ignore-queue",
-            Self::GroqMultiregionIgnoreQueueOneExcluded => {
-                "groq-multiregion-ignore-queue-one-excluded"
-            }
-            Self::GroqMultiregionIgnoreQueueMultiExcluded => {
-                "groq-multiregion-ignore-queue-multi-excluded"
-            }
-            Self::GroqMultiregionRttOnly => "groq-multiregion-rtt-only",
-            Self::GroqMultiregionRttOnlyOneExcluded => "groq-multiregion-rtt-only-one-excluded",
-            Self::GroqMultiregionRttOnlyMultiExcluded => "groq-multiregion-rtt-only-multi-excluded",
-            Self::GroqMultiregionAffinity => "groq-multiregion-affinity",
-            Self::GroqMultiregionAffinityOneExcluded => "groq-multiregion-affinity-one-excluded",
-            Self::GroqMultiregionAffinityMultiExcluded => {
-                "groq-multiregion-affinity-multi-excluded"
-            }
-            Self::Pulsar => "pulsar",
-            Self::PulsarOneExcluded => "pulsar-one-excluded",
-            Self::Random => "random",
-            Self::RandomOneExcluded => "random-one-excluded",
-            Self::RoundRobinOneExcluded => "round-robin-one-excluded",
-            Self::RoundRobinMultiExcluded => "round-robin-multi-excluded",
-        }
+    fn metadata(self) -> &'static LbMicrobenchScenarioMetadata {
+        &LB_MICROBENCH_SCENARIOS[self as usize]
     }
 
-    fn model_id(self) -> &'static str {
+    fn configured_sample_count(self, candidate_count: usize) -> Option<usize> {
         match self {
-            Self::PowerOfTwo => POWER_OF_TWO_MODEL_ID,
-            Self::PowerOfTwoOneExcluded => POWER_OF_TWO_ONE_EXCLUDED_MODEL_ID,
-            Self::GroqMultiregion => MULTIREGION_MODEL_ID,
-            Self::GroqMultiregionOneExcluded => MULTIREGION_ONE_EXCLUDED_MODEL_ID,
-            Self::GroqMultiregionIgnoreQueue => MULTIREGION_IGNORE_QUEUE_MODEL_ID,
-            Self::GroqMultiregionIgnoreQueueOneExcluded => {
-                MULTIREGION_IGNORE_QUEUE_ONE_EXCLUDED_MODEL_ID
-            }
-            Self::GroqMultiregionIgnoreQueueMultiExcluded => {
-                MULTIREGION_IGNORE_QUEUE_MULTI_EXCLUDED_MODEL_ID
-            }
-            Self::GroqMultiregionRttOnly => MULTIREGION_RTT_ONLY_MODEL_ID,
-            Self::GroqMultiregionRttOnlyOneExcluded => MULTIREGION_RTT_ONLY_ONE_EXCLUDED_MODEL_ID,
-            Self::GroqMultiregionRttOnlyMultiExcluded => {
-                MULTIREGION_RTT_ONLY_MULTI_EXCLUDED_MODEL_ID
-            }
-            Self::GroqMultiregionAffinity => MULTIREGION_AFFINITY_MODEL_ID,
-            Self::GroqMultiregionAffinityOneExcluded => MULTIREGION_AFFINITY_ONE_EXCLUDED_MODEL_ID,
-            Self::GroqMultiregionAffinityMultiExcluded => {
-                MULTIREGION_AFFINITY_MULTI_EXCLUDED_MODEL_ID
-            }
-            Self::Pulsar => PULSAR_MODEL_ID,
-            Self::PulsarOneExcluded => PULSAR_ONE_EXCLUDED_MODEL_ID,
-            Self::Random => RANDOM_MODEL_ID,
-            Self::RandomOneExcluded => RANDOM_ONE_EXCLUDED_MODEL_ID,
-            Self::RoundRobinOneExcluded => ROUND_ROBIN_ONE_EXCLUDED_MODEL_ID,
-            Self::RoundRobinMultiExcluded => ROUND_ROBIN_MULTI_EXCLUDED_MODEL_ID,
+            Self::PowerOfN | Self::PowerOfNOneExcluded => Some(2),
+            Self::PowerOfNSample1 => Some(1),
+            Self::PowerOfNSample4 => Some(4),
+            Self::PowerOfNSample8 => Some(8),
+            Self::PowerOfNFullPool => Some(candidate_count),
+            _ => None,
         }
+    }
+}
+
+impl fmt::Display for LbMicrobenchScenario {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            self.to_possible_value()
+                .expect("scenario should have a CLI value")
+                .get_name(),
+        )
     }
 }
 
@@ -171,41 +148,19 @@ pub struct LbMicrobenchRow {
     pub checksum: u64,
 }
 
-pub fn default_lb_microbench_scenarios() -> Vec<LbMicrobenchScenario> {
-    vec![
-        LbMicrobenchScenario::PowerOfTwo,
-        LbMicrobenchScenario::PowerOfTwoOneExcluded,
-        LbMicrobenchScenario::GroqMultiregion,
-        LbMicrobenchScenario::GroqMultiregionOneExcluded,
-        LbMicrobenchScenario::GroqMultiregionIgnoreQueue,
-        LbMicrobenchScenario::GroqMultiregionIgnoreQueueOneExcluded,
-        LbMicrobenchScenario::GroqMultiregionIgnoreQueueMultiExcluded,
-        LbMicrobenchScenario::GroqMultiregionRttOnly,
-        LbMicrobenchScenario::GroqMultiregionRttOnlyOneExcluded,
-        LbMicrobenchScenario::GroqMultiregionRttOnlyMultiExcluded,
-        LbMicrobenchScenario::GroqMultiregionAffinity,
-        LbMicrobenchScenario::GroqMultiregionAffinityOneExcluded,
-        LbMicrobenchScenario::GroqMultiregionAffinityMultiExcluded,
-        LbMicrobenchScenario::Pulsar,
-        LbMicrobenchScenario::PulsarOneExcluded,
-        LbMicrobenchScenario::Random,
-        LbMicrobenchScenario::RandomOneExcluded,
-        LbMicrobenchScenario::RoundRobinOneExcluded,
-        LbMicrobenchScenario::RoundRobinMultiExcluded,
-    ]
-}
-
 pub fn run_lb_microbench(config: &LbMicrobenchConfig) -> anyhow::Result<Vec<LbMicrobenchRow>> {
     validate_config(config)?;
     let scenarios = if config.scenarios.is_empty() {
-        default_lb_microbench_scenarios()
+        LbMicrobenchScenario::value_variants()
     } else {
-        config.scenarios.clone()
+        &config.scenarios
     };
     let candidates = build_candidates(config.candidates);
-    let cache_keys = build_cache_keys(config.cache_key_count);
+    let cache_keys = (0..config.cache_key_count)
+        .map(|index| format!("cache-prefix-{index:06}"))
+        .collect::<Vec<_>>();
     let mut rows = Vec::with_capacity(scenarios.len());
-    for scenario in scenarios {
+    for &scenario in scenarios {
         rows.push(run_scenario(config, scenario, &candidates, &cache_keys)?);
     }
     Ok(rows)
@@ -217,13 +172,16 @@ pub fn write_lb_microbench_csv<W: Write>(
 ) -> std::io::Result<()> {
     writeln!(
         writer,
-        "scenario,candidates,iterations,warmup_iterations,concurrency,total_ns,ns_per_choose,choices,avg_rank_depth,selected_backend_count,top_backend,top_backend_choices,backend_counts,checksum"
+        "methodology,scenario,configured_sample_count,candidates,iterations,warmup_iterations,concurrency,total_ns,ns_per_choose,choices,avg_rank_depth,selected_backend_count,top_backend,top_backend_choices,backend_counts,checksum"
     )?;
     for row in rows {
         writeln!(
             writer,
-            "{},{},{},{},{},{},{:.1},{},{:.3},{},{},{},{},{}",
-            row.scenario.label(),
+            "choose-only-v3,{},{},{},{},{},{},{},{:.1},{},{:.3},{},{},{},{},{}",
+            row.scenario,
+            row.scenario
+                .configured_sample_count(row.candidates)
+                .map_or_else(String::new, |count| count.to_string()),
             row.candidates,
             row.iterations,
             row.warmup_iterations,
@@ -243,17 +201,25 @@ pub fn write_lb_microbench_csv<W: Write>(
 }
 
 fn validate_config(config: &LbMicrobenchConfig) -> anyhow::Result<()> {
-    if config.iterations == 0 {
-        anyhow::bail!("--iterations must be greater than 0");
+    for (flag, value) in [
+        ("--iterations", config.iterations),
+        ("--concurrency", config.concurrency),
+        ("--candidates", config.candidates),
+        ("--cache-key-count", config.cache_key_count),
+    ] {
+        if value == 0 {
+            anyhow::bail!("{flag} must be greater than 0");
+        }
     }
-    if config.concurrency == 0 {
-        anyhow::bail!("--concurrency must be greater than 0");
-    }
-    if config.candidates == 0 {
-        anyhow::bail!("--candidates must be greater than 0");
-    }
-    if config.cache_key_count == 0 {
-        anyhow::bail!("--cache-key-count must be greater than 0");
+    if config.candidates > MAX_POWER_OF_N_SAMPLE_COUNT
+        && (config.scenarios.is_empty()
+            || config
+                .scenarios
+                .contains(&LbMicrobenchScenario::PowerOfNFullPool))
+    {
+        anyhow::bail!(
+            "power-of-n-full-pool requires --candidates to be at most {MAX_POWER_OF_N_SAMPLE_COUNT}"
+        );
     }
     Ok(())
 }
@@ -264,11 +230,21 @@ fn run_scenario(
     candidates: &[RoutedClusterSnapshot],
     cache_keys: &[String],
 ) -> anyhow::Result<LbMicrobenchRow> {
-    let router = Arc::new(router_for_scenario(scenario)?);
+    let algorithm_config = config_for_scenario(scenario, config.candidates);
+    let router = LoadBalancerRouter::from_config(&LoadBalancerConfig {
+        default: LoadBalancerAlgorithm::PowerOfN,
+        request_algorithms: HashMap::new(),
+        models: HashMap::from([(
+            scenario.metadata().model_id.to_string(),
+            LoadBalancerModelConfig::Detailed(Box::new(algorithm_config)),
+        )]),
+    })
+    .with_context(|| format!("failed to build {scenario} load balancer"))?;
+    let target_state = LoadBalancerTargetState::default();
     let excluded_cluster_ids = excluded_cluster_ids_for_scenario(scenario);
     let target = RoutingTargetKey {
         routing_key: Some("tenant-a".to_string()),
-        model_id: scenario.model_id().to_string(),
+        model_id: scenario.metadata().model_id.to_string(),
     };
     let received_at = Instant::now();
     for iteration in 0..config.warmup_iterations {
@@ -279,28 +255,35 @@ fn run_scenario(
             received_at,
             excluded_cluster_ids.as_ref(),
         );
-        let _ = black_box(router.choose_candidate(&request, candidates));
+        let _ = black_box(router.choose_candidate(&target_state, &request, candidates));
     }
 
     let worker_count = config.concurrency.min(config.iterations);
     let (stats, total_ns) = run_concurrent_measured_iterations(
-        router,
+        &router,
         LbMicrobenchRun {
             target: &target,
+            target_state: &target_state,
             candidates,
             cache_keys,
             config,
-            worker_count,
             received_at,
             excluded_cluster_ids: excluded_cluster_ids.as_ref(),
         },
     );
-    let avg_rank_depth = if stats.choices == 0 {
+    let choices = stats.candidate_counts.iter().sum::<usize>();
+    let avg_rank_depth = if choices == 0 {
         0.0
     } else {
-        stats.rank_depth_sum as f64 / stats.choices as f64
+        stats.rank_depth_sum as f64 / choices as f64
     };
-    let mut backend_counts = stats.backend_counts.into_iter().collect::<Vec<_>>();
+    let mut backend_counts = stats
+        .candidate_counts
+        .into_iter()
+        .enumerate()
+        .filter(|(_, count)| *count > 0)
+        .map(|(index, count)| (candidates[index].cluster_id.clone(), count))
+        .collect::<Vec<_>>();
     backend_counts.sort_unstable_by(|(id_a, _), (id_b, _)| id_a.cmp(id_b));
     let (top_backend, top_backend_choices) = top_backend(&backend_counts);
     Ok(LbMicrobenchRow {
@@ -311,7 +294,7 @@ fn run_scenario(
         concurrency: worker_count,
         total_ns,
         ns_per_choose: total_ns as f64 / config.iterations as f64,
-        choices: stats.choices,
+        choices,
         avg_rank_depth,
         selected_backend_count: backend_counts.len(),
         top_backend,
@@ -321,193 +304,143 @@ fn run_scenario(
     })
 }
 
-#[derive(Default)]
 struct LbMicrobenchStats {
-    choices: usize,
     rank_depth_sum: usize,
-    backend_counts: HashMap<String, usize>,
+    candidate_counts: Vec<usize>,
     checksum: u64,
 }
 
-impl LbMicrobenchStats {
-    fn record(
-        &mut self,
-        choice: stargate::load_balancer::LoadBalancerCandidateChoice,
-        candidates: &[RoutedClusterSnapshot],
-    ) {
-        self.choices += 1;
-        self.rank_depth_sum += choice.rank_depth;
-        let cluster_id = candidates[choice.candidate_index].cluster_id.clone();
-        self.checksum = update_checksum(self.checksum, &cluster_id);
-        *self.backend_counts.entry(cluster_id).or_insert(0) += 1;
+struct LbMicrobenchMeasurements {
+    rank_depth_sum: usize,
+    candidate_counts: Vec<usize>,
+    selected_candidate_indices: Vec<usize>,
+}
+
+impl LbMicrobenchMeasurements {
+    fn new(candidate_count: usize, max_choices: usize) -> Self {
+        Self {
+            rank_depth_sum: 0,
+            candidate_counts: vec![0; candidate_count],
+            selected_candidate_indices: Vec::with_capacity(max_choices),
+        }
     }
 
-    fn merge(&mut self, other: Self) {
-        self.choices += other.choices;
-        self.rank_depth_sum += other.rank_depth_sum;
-        self.checksum = self.checksum.wrapping_add(other.checksum);
-        for (cluster_id, count) in other.backend_counts {
-            *self.backend_counts.entry(cluster_id).or_insert(0) += count;
-        }
+    fn record(&mut self, choice: stargate::load_balancer::LoadBalancerCandidateChoice) {
+        self.rank_depth_sum += choice.rank_depth;
+        self.candidate_counts[choice.candidate_index] += 1;
+        self.selected_candidate_indices.push(choice.candidate_index);
     }
 }
 
+#[derive(Clone, Copy)]
 struct LbMicrobenchRun<'a> {
     target: &'a RoutingTargetKey,
+    target_state: &'a LoadBalancerTargetState,
     candidates: &'a [RoutedClusterSnapshot],
     cache_keys: &'a [String],
     config: &'a LbMicrobenchConfig,
-    worker_count: usize,
     received_at: Instant,
     excluded_cluster_ids: Option<&'a HashSet<String>>,
 }
 
 fn run_concurrent_measured_iterations(
-    router: Arc<LoadBalancerRouter>,
+    router: &LoadBalancerRouter,
     run: LbMicrobenchRun<'_>,
 ) -> (LbMicrobenchStats, u128) {
+    let worker_count = run.config.concurrency.min(run.config.iterations);
+    let ready_barrier = Barrier::new(worker_count + 1);
+    let release_barrier = Barrier::new(worker_count + 1);
     thread::scope(|scope| {
-        let ready_barrier = Arc::new(Barrier::new(run.worker_count + 1));
-        let release_barrier = Arc::new(Barrier::new(run.worker_count + 1));
-        let mut handles = Vec::with_capacity(run.worker_count);
-        for worker_index in 0..run.worker_count {
-            let router = Arc::clone(&router);
-            let ready_barrier = Arc::clone(&ready_barrier);
-            let release_barrier = Arc::clone(&release_barrier);
-            let (start_iteration, iteration_count) =
-                worker_iteration_range(run.config.iterations, run.worker_count, worker_index);
-            let target_ref = run.target;
-            let candidates_ref = run.candidates;
-            let cache_keys_ref = run.cache_keys;
-            let warmup_iterations = run.config.warmup_iterations;
-            let received_at = run.received_at;
-            let excluded_cluster_ids = run.excluded_cluster_ids;
+        let mut handles = Vec::with_capacity(worker_count);
+        let mut worker_results = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let ready_barrier = &ready_barrier;
+            let release_barrier = &release_barrier;
+            let iterations = worker_iterations(run.config.iterations, worker_count, worker_index);
             handles.push(scope.spawn(move || {
+                let measurements =
+                    LbMicrobenchMeasurements::new(run.candidates.len(), iterations.len());
                 ready_barrier.wait();
                 release_barrier.wait();
-                let stats = run_worker_measured_iterations(LbMicrobenchWorker {
-                    router: router.as_ref(),
-                    target: target_ref,
-                    candidates: candidates_ref,
-                    cache_keys: cache_keys_ref,
-                    warmup_iterations,
-                    start_iteration,
-                    iteration_count,
-                    received_at,
-                    excluded_cluster_ids,
-                });
-                LbMicrobenchWorkerResult {
-                    stats,
-                    finished_at: Instant::now(),
+                let mut measurements = measurements;
+                for measured_iteration in iterations {
+                    let request = request_for_iteration(
+                        run.target,
+                        run.cache_keys,
+                        run.config.warmup_iterations + measured_iteration,
+                        run.received_at,
+                        run.excluded_cluster_ids,
+                    );
+                    if let Some(choice) = black_box(router.choose_candidate(
+                        run.target_state,
+                        &request,
+                        run.candidates,
+                    )) {
+                        measurements.record(choice);
+                    }
                 }
+                (measurements, Instant::now())
             }));
         }
 
         let start = release_workers_after_ready(&ready_barrier, &release_barrier);
-        merge_worker_results(
-            start,
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("lb microbench worker panicked")),
-        )
+        for handle in handles {
+            worker_results.push(handle.join().expect("lb microbench worker panicked"));
+        }
+        merge_worker_results(start, run.candidates, worker_results)
     })
-}
-
-struct LbMicrobenchWorkerResult {
-    stats: LbMicrobenchStats,
-    finished_at: Instant,
 }
 
 fn merge_worker_results(
     start: Instant,
-    results: impl IntoIterator<Item = LbMicrobenchWorkerResult>,
+    candidates: &[RoutedClusterSnapshot],
+    results: impl IntoIterator<Item = (LbMicrobenchMeasurements, Instant)>,
 ) -> (LbMicrobenchStats, u128) {
-    let mut stats = LbMicrobenchStats::default();
+    let mut stats = LbMicrobenchStats {
+        rank_depth_sum: 0,
+        candidate_counts: vec![0; candidates.len()],
+        checksum: 0,
+    };
     let mut total_ns = 0;
-    for result in results {
-        total_ns = total_ns.max(result.finished_at.duration_since(start).as_nanos());
-        stats.merge(result.stats);
+    for (measurements, finished_at) in results {
+        total_ns = total_ns.max(finished_at.duration_since(start).as_nanos());
+        stats.rank_depth_sum += measurements.rank_depth_sum;
+        stats.checksum = stats.checksum.wrapping_add(
+            measurements
+                .selected_candidate_indices
+                .iter()
+                .fold(0, |checksum, &index| {
+                    update_checksum(checksum, &candidates[index].cluster_id)
+                }),
+        );
+        for (count, worker_count) in stats
+            .candidate_counts
+            .iter_mut()
+            .zip(measurements.candidate_counts)
+        {
+            *count += worker_count;
+        }
     }
     (stats, total_ns)
 }
 
 fn release_workers_after_ready(ready_barrier: &Barrier, release_barrier: &Barrier) -> Instant {
-    release_workers_after_ready_with_hook(ready_barrier, release_barrier, || {})
-}
-
-fn release_workers_after_ready_with_hook<F>(
-    ready_barrier: &Barrier,
-    release_barrier: &Barrier,
-    before_ready_wait: F,
-) -> Instant
-where
-    F: FnOnce(),
-{
-    before_ready_wait();
     ready_barrier.wait();
     let start = Instant::now();
     release_barrier.wait();
     start
 }
 
-struct LbMicrobenchWorker<'a> {
-    router: &'a LoadBalancerRouter,
-    target: &'a RoutingTargetKey,
-    candidates: &'a [RoutedClusterSnapshot],
-    cache_keys: &'a [String],
-    warmup_iterations: usize,
-    start_iteration: usize,
-    iteration_count: usize,
-    received_at: Instant,
-    excluded_cluster_ids: Option<&'a HashSet<String>>,
-}
-
-fn run_worker_measured_iterations(worker: LbMicrobenchWorker<'_>) -> LbMicrobenchStats {
-    let mut stats = LbMicrobenchStats::default();
-    for local_iteration in 0..worker.iteration_count {
-        let request = request_for_measured_iteration(
-            worker.target,
-            worker.cache_keys,
-            worker.warmup_iterations,
-            worker.start_iteration + local_iteration,
-            worker.received_at,
-            worker.excluded_cluster_ids,
-        );
-        if let Some(choice) = black_box(worker.router.choose_candidate(&request, worker.candidates))
-        {
-            stats.record(choice, worker.candidates);
-        }
-    }
-    stats
-}
-
-fn worker_iteration_range(
+fn worker_iterations(
     total_iterations: usize,
     worker_count: usize,
     worker_index: usize,
-) -> (usize, usize) {
+) -> std::ops::Range<usize> {
     let base = total_iterations / worker_count;
     let remainder = total_iterations % worker_count;
     let iteration_count = base + usize::from(worker_index < remainder);
     let start_iteration = worker_index * base + worker_index.min(remainder);
-    (start_iteration, iteration_count)
-}
-
-fn request_for_measured_iteration<'a>(
-    target: &'a RoutingTargetKey,
-    cache_keys: &'a [String],
-    warmup_iterations: usize,
-    measured_iteration: usize,
-    received_at: Instant,
-    excluded_cluster_ids: Option<&'a HashSet<String>>,
-) -> LoadBalancerRequest<'a> {
-    request_for_iteration(
-        target,
-        cache_keys,
-        warmup_iterations + measured_iteration,
-        received_at,
-        excluded_cluster_ids,
-    )
+    start_iteration..start_iteration + iteration_count
 }
 
 fn request_for_iteration<'a>(
@@ -553,167 +486,82 @@ fn format_backend_counts(backend_counts: &[(String, usize)]) -> String {
         .join(";")
 }
 
-fn router_for_scenario(scenario: LbMicrobenchScenario) -> anyhow::Result<LoadBalancerRouter> {
-    let mut models = HashMap::new();
-    models.insert(
-        scenario.model_id().to_string(),
-        LoadBalancerModelConfig::Detailed(Box::new(config_for_scenario(scenario))),
-    );
-    LoadBalancerRouter::from_config(&LoadBalancerConfig {
-        default: LoadBalancerAlgorithm::PowerOfTwo,
-        request_algorithms: HashMap::new(),
-        models,
-    })
-    .with_context(|| format!("failed to build {} load balancer", scenario.label()))
-}
-
-fn config_for_scenario(scenario: LbMicrobenchScenario) -> LoadBalancerAlgorithmConfig {
-    let mut config = match scenario {
-        LbMicrobenchScenario::PowerOfTwo | LbMicrobenchScenario::PowerOfTwoOneExcluded => {
-            LoadBalancerAlgorithmConfig::from(LoadBalancerAlgorithm::PowerOfTwo)
-        }
-        LbMicrobenchScenario::Pulsar | LbMicrobenchScenario::PulsarOneExcluded => {
-            LoadBalancerAlgorithmConfig::from(LoadBalancerAlgorithm::Pulsar)
-        }
-        LbMicrobenchScenario::Random | LbMicrobenchScenario::RandomOneExcluded => {
-            LoadBalancerAlgorithmConfig::from(LoadBalancerAlgorithm::Random)
-        }
-        LbMicrobenchScenario::RoundRobinOneExcluded
-        | LbMicrobenchScenario::RoundRobinMultiExcluded => {
-            LoadBalancerAlgorithmConfig::from(LoadBalancerAlgorithm::RoundRobin)
-        }
-        LbMicrobenchScenario::GroqMultiregion
-        | LbMicrobenchScenario::GroqMultiregionOneExcluded
-        | LbMicrobenchScenario::GroqMultiregionIgnoreQueue
-        | LbMicrobenchScenario::GroqMultiregionIgnoreQueueOneExcluded
-        | LbMicrobenchScenario::GroqMultiregionIgnoreQueueMultiExcluded
-        | LbMicrobenchScenario::GroqMultiregionRttOnly
-        | LbMicrobenchScenario::GroqMultiregionRttOnlyOneExcluded
-        | LbMicrobenchScenario::GroqMultiregionRttOnlyMultiExcluded
-        | LbMicrobenchScenario::GroqMultiregionAffinity
-        | LbMicrobenchScenario::GroqMultiregionAffinityOneExcluded
-        | LbMicrobenchScenario::GroqMultiregionAffinityMultiExcluded => {
-            LoadBalancerAlgorithmConfig::from(LoadBalancerAlgorithm::GroqMultiregion)
-        }
-    };
-    let is_pulsar = matches!(
-        scenario,
-        LbMicrobenchScenario::Pulsar | LbMicrobenchScenario::PulsarOneExcluded
-    );
+fn config_for_scenario(
+    scenario: LbMicrobenchScenario,
+    candidate_count: usize,
+) -> LoadBalancerAlgorithmConfig {
+    let metadata = scenario.metadata();
+    let mut config = LoadBalancerAlgorithmConfig::from(metadata.algorithm);
+    let is_pulsar = metadata.algorithm == LoadBalancerAlgorithm::Pulsar;
     config.request_policy_mut().require_cache_affinity_key = is_pulsar;
     config.request_policy_mut().require_input_tokens = is_pulsar;
+    if let Some(sample_count) = scenario.configured_sample_count(candidate_count) {
+        config
+            .power_of_n_settings_mut()
+            .expect("power-of-n scenario should expose power-of-n settings")
+            .sample_count = sample_count;
+    }
     if is_pulsar {
         config
             .set_seed(Some("lb-microbench-seed".to_string()))
             .expect("pulsar supports deterministic seeding");
     }
-    if let Some(multiregion) = config.multiregion_settings_mut() {
-        multiregion.seed = Some("lb-microbench-seed".to_string());
-        multiregion.ttft_bucket_size_ms = Some(1_000_000);
-        multiregion.n = Some(2);
-        multiregion.max_queued = Some(64);
-        if matches!(
-            scenario,
-            LbMicrobenchScenario::GroqMultiregionAffinity
-                | LbMicrobenchScenario::GroqMultiregionAffinityOneExcluded
-                | LbMicrobenchScenario::GroqMultiregionAffinityMultiExcluded
-        ) {
-            multiregion.cache_affinity_virtual_nodes = Some(150);
-            multiregion.cache_affinity_backend_selection_count = Some(2);
+    if let Some(wait_and_widen) = config.wait_and_widen_settings_mut() {
+        wait_and_widen.seed = Some("lb-microbench-seed".to_string());
+        wait_and_widen.ttft_bucket_size_ms = Some(1_000_000);
+        wait_and_widen.n = Some(2);
+        wait_and_widen.max_queued = Some(64);
+        if metadata.tuning == Some(Affinity) {
+            wait_and_widen.cache_affinity_virtual_nodes = Some(150);
+            wait_and_widen.cache_affinity_backend_selection_count = Some(2);
         }
-        if matches!(
-            scenario,
-            LbMicrobenchScenario::GroqMultiregionIgnoreQueue
-                | LbMicrobenchScenario::GroqMultiregionIgnoreQueueOneExcluded
-                | LbMicrobenchScenario::GroqMultiregionIgnoreQueueMultiExcluded
-                | LbMicrobenchScenario::GroqMultiregionRttOnly
-                | LbMicrobenchScenario::GroqMultiregionRttOnlyOneExcluded
-                | LbMicrobenchScenario::GroqMultiregionRttOnlyMultiExcluded
-        ) {
-            multiregion.ignore_queue_time = Some(true);
+        if matches!(metadata.tuning, Some(IgnoreQueue | RttOnly)) {
+            wait_and_widen.ignore_queue_time = Some(true);
         }
-        if matches!(
-            scenario,
-            LbMicrobenchScenario::GroqMultiregionRttOnly
-                | LbMicrobenchScenario::GroqMultiregionRttOnlyOneExcluded
-                | LbMicrobenchScenario::GroqMultiregionRttOnlyMultiExcluded
-        ) {
-            multiregion.ignore_input_processing_time = Some(true);
+        if metadata.tuning == Some(RttOnly) {
+            wait_and_widen.ignore_input_processing_time = Some(true);
         }
     }
     config
 }
 
 fn excluded_cluster_ids_for_scenario(scenario: LbMicrobenchScenario) -> Option<HashSet<String>> {
-    if matches!(
-        scenario,
-        LbMicrobenchScenario::GroqMultiregionIgnoreQueueMultiExcluded
-            | LbMicrobenchScenario::GroqMultiregionAffinityMultiExcluded
-            | LbMicrobenchScenario::GroqMultiregionRttOnlyMultiExcluded
-            | LbMicrobenchScenario::RoundRobinMultiExcluded
-    ) {
-        return Some(HashSet::from([
-            "cluster-0000".to_string(),
-            "cluster-0001".to_string(),
-        ]));
-    }
-
-    matches!(
-        scenario,
-        LbMicrobenchScenario::PowerOfTwoOneExcluded
-            | LbMicrobenchScenario::GroqMultiregionOneExcluded
-            | LbMicrobenchScenario::GroqMultiregionIgnoreQueueOneExcluded
-            | LbMicrobenchScenario::GroqMultiregionRttOnlyOneExcluded
-            | LbMicrobenchScenario::GroqMultiregionAffinityOneExcluded
-            | LbMicrobenchScenario::PulsarOneExcluded
-            | LbMicrobenchScenario::RandomOneExcluded
-            | LbMicrobenchScenario::RoundRobinOneExcluded
-    )
-    .then(|| HashSet::from(["cluster-0000".to_string()]))
+    let count = scenario.metadata().excluded_clusters;
+    (count > 0).then(|| {
+        (0..count)
+            .map(|index| format!("cluster-{index:04}"))
+            .collect()
+    })
 }
 
 fn build_candidates(count: usize) -> Vec<RoutedClusterSnapshot> {
     (0..count)
-        .map(|index| {
-            let running = (index % 9) as u64;
-            let max_concurrency = 16;
-            RoutedClusterSnapshot {
-                cluster_id: format!("cluster-{index:04}"),
-                stats: ModelStats {
-                    output_tps: 120.0 + (index % 11) as f64,
-                    last_mean_input_tps: 1_200.0 + (index % 13) as f64 * 31.0,
-                    max_output_tps: 500.0,
-                    queue_size: (index % 7) as u64,
-                    queued_input_size: (index % 5) as u64 * 256,
-                    kv_cache_capacity_tokens: 131_072,
-                    kv_cache_used_tokens: 8_192 + (index % 23) as u64 * 64,
-                    kv_cache_free_tokens: 122_880 - (index % 23) as u64 * 64,
-                    num_running_queries: running,
-                    max_engine_concurrency: max_concurrency,
-                    total_query_input_size: (index % 6) as u64 * 384,
-                    queue_time_estimate_ms_by_priority: queue_time_estimates(index),
-                    ..ModelStats::default()
-                },
-                rtt: Duration::from_micros(500 + (index % 19) as u64 * 75),
-                snapshot_updated_at: Instant::now(),
-                status: InferenceServerStatus::Active,
-                active_backend_count: 1,
-            }
+        .map(|index| RoutedClusterSnapshot {
+            cluster_id: format!("cluster-{index:04}"),
+            stats: ModelStats {
+                output_tps: 120.0 + (index % 11) as f64,
+                last_mean_input_tps: 1_200.0 + (index % 13) as f64 * 31.0,
+                max_output_tps: 500.0,
+                queue_size: (index % 7) as u64,
+                queued_input_size: (index % 5) as u64 * 256,
+                kv_cache_capacity_tokens: 131_072,
+                kv_cache_used_tokens: 8_192 + (index % 23) as u64 * 64,
+                kv_cache_free_tokens: 122_880 - (index % 23) as u64 * 64,
+                num_running_queries: (index % 9) as u64,
+                max_engine_concurrency: 16,
+                total_query_input_size: (index % 6) as u64 * 384,
+                queue_time_estimate_ms_by_priority: HashMap::from([
+                    (0, (index % 5) as u64),
+                    (2, 2 + (index % 11) as u64),
+                    (4, 4 + (index % 17) as u64),
+                ]),
+                ..ModelStats::default()
+            },
+            rtt: Duration::from_micros(500 + (index % 19) as u64 * 75),
+            snapshot_updated_at: Instant::now(),
+            status: InferenceServerStatus::Active,
+            active_backend_count: 1,
         })
-        .collect()
-}
-
-fn queue_time_estimates(index: usize) -> HashMap<u32, u64> {
-    let mut estimates = HashMap::new();
-    estimates.insert(0, (index % 5) as u64);
-    estimates.insert(2, 2 + (index % 11) as u64);
-    estimates.insert(4, 4 + (index % 17) as u64);
-    estimates
-}
-
-fn build_cache_keys(count: usize) -> Vec<String> {
-    (0..count)
-        .map(|index| format!("cache-prefix-{index:06}"))
         .collect()
 }
 
@@ -721,265 +569,149 @@ fn build_cache_keys(count: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lb_microbench_runs_default_scenarios() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 8,
-            warmup_iterations: 2,
+    fn config(scenario: LbMicrobenchScenario) -> LbMicrobenchConfig {
+        LbMicrobenchConfig {
+            iterations: 32,
+            warmup_iterations: 4,
             concurrency: 2,
-            candidates: 4,
+            candidates: 8,
             cache_key_count: 4,
-            scenarios: Vec::new(),
-        })
-        .expect("microbench should run");
+            scenarios: vec![scenario],
+        }
+    }
 
-        assert_eq!(rows.len(), 19);
+    fn assert_scenario_excludes(scenario: LbMicrobenchScenario, excluded: &[&str]) {
+        let rows = run_lb_microbench(&config(scenario)).expect("microbench should run");
+        let [row] = rows.as_slice() else {
+            panic!("one scenario should emit one row");
+        };
+        assert_eq!(row.choices, row.iterations);
         assert!(
-            rows.iter()
-                .any(|row| row.scenario.label() == "power-of-two")
-        );
-        assert!(rows.iter().all(|row| row.choices == row.iterations));
-        assert!(rows.iter().all(|row| row.concurrency == 2));
-        assert!(rows.iter().all(|row| row.ns_per_choose > 0.0));
-        assert!(rows.iter().all(|row| row.selected_backend_count > 0));
-        assert!(rows.iter().all(|row| {
             row.backend_counts
                 .iter()
-                .map(|(_, count)| count)
-                .sum::<usize>()
-                == row.choices
-        }));
+                .all(|(cluster_id, _)| !excluded.contains(&cluster_id.as_str())),
+            "{scenario} selected an excluded backend: {:?}",
+            row.backend_counts
+        );
+    }
+
+    #[test]
+    fn lb_microbench_runs_default_scenarios() {
+        let mut config = config(LbMicrobenchScenario::PowerOfN);
+        config.iterations = 8;
+        config.warmup_iterations = 2;
+        config.candidates = 4;
+        config.scenarios.clear();
+        let rows = run_lb_microbench(&config).expect("microbench should run");
+
+        assert_eq!(rows.len(), 23);
+        assert_eq!(rows[0].scenario, LbMicrobenchScenario::PowerOfN);
+        for row in rows {
+            assert_eq!(row.choices, row.iterations);
+            assert_eq!(row.concurrency, 2);
+            assert!(row.ns_per_choose > 0.0);
+            assert!(row.selected_backend_count > 0);
+            assert_eq!(
+                row.backend_counts
+                    .iter()
+                    .map(|(_, count)| count)
+                    .sum::<usize>(),
+                row.choices
+            );
+        }
+    }
+
+    #[test]
+    fn lb_microbench_scenario_display_matches_cli_value_names() {
+        for scenario in LbMicrobenchScenario::value_variants() {
+            assert_eq!(
+                scenario.to_string(),
+                scenario
+                    .to_possible_value()
+                    .expect("scenario should have a CLI value name")
+                    .get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn lb_microbench_scenario_metadata_covers_cli_inventory() {
+        let cli_scenarios = LbMicrobenchScenario::value_variants();
+        assert_eq!(LB_MICROBENCH_SCENARIOS.len(), cli_scenarios.len());
+
+        let mut model_ids = HashSet::new();
+        for scenario in cli_scenarios {
+            assert!(
+                model_ids.insert(scenario.metadata().model_id),
+                "duplicate model ID for {scenario:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_n_microbench_scenarios_cover_requested_sample_counts() {
+        for (scenario, expected_sample_count) in [
+            (LbMicrobenchScenario::PowerOfNSample1, 1),
+            (LbMicrobenchScenario::PowerOfN, 2),
+            (LbMicrobenchScenario::PowerOfNSample4, 4),
+            (LbMicrobenchScenario::PowerOfNSample8, 8),
+            (LbMicrobenchScenario::PowerOfNFullPool, 8),
+        ] {
+            let rows = run_lb_microbench(&config(scenario)).expect("microbench should run");
+            assert_eq!(
+                rows[0].scenario.configured_sample_count(rows[0].candidates),
+                Some(expected_sample_count)
+            );
+        }
+    }
+
+    #[test]
+    fn full_pool_microbench_rejects_candidate_count_above_sample_limit() {
+        let mut config = config(LbMicrobenchScenario::PowerOfNFullPool);
+        config.candidates = MAX_POWER_OF_N_SAMPLE_COUNT + 1;
+
+        let error = run_lb_microbench(&config).expect_err("oversized full pool should fail");
+        assert!(error.to_string().contains("power-of-n-full-pool"));
     }
 
     #[test]
     fn lb_microbench_rejects_zero_iterations() {
-        let error = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 0,
-            warmup_iterations: 0,
-            concurrency: 1,
-            candidates: 4,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::Pulsar],
-        })
-        .expect_err("zero iterations should fail");
+        let mut config = config(LbMicrobenchScenario::Pulsar);
+        config.iterations = 0;
+        let error = run_lb_microbench(&config).expect_err("zero iterations should fail");
 
         assert!(error.to_string().contains("--iterations"));
     }
 
     #[test]
     fn lb_microbench_rejects_zero_concurrency() {
-        let error = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 1,
-            warmup_iterations: 0,
-            concurrency: 0,
-            candidates: 4,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::Pulsar],
-        })
-        .expect_err("zero concurrency should fail");
+        let mut config = config(LbMicrobenchScenario::Pulsar);
+        config.concurrency = 0;
+        let error = run_lb_microbench(&config).expect_err("zero concurrency should fail");
 
         assert!(error.to_string().contains("--concurrency"));
     }
 
-    #[test]
-    fn random_one_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::RandomOneExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("random-one-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(
-            row.backend_counts
-                .iter()
-                .all(|(cluster_id, _)| cluster_id != "cluster-0000")
-        );
+    macro_rules! exclusion_tests {
+        ($($name:ident: $scenario:ident => [$($excluded:literal),+];)+) => {$(
+            #[test]
+            fn $name() {
+                assert_scenario_excludes(LbMicrobenchScenario::$scenario, &[$($excluded),+]);
+            }
+        )+};
     }
 
-    #[test]
-    fn power_of_two_one_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::PowerOfTwoOneExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("power-of-two-one-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(
-            row.backend_counts
-                .iter()
-                .all(|(cluster_id, _)| cluster_id != "cluster-0000")
-        );
-    }
-
-    #[test]
-    fn groq_multiregion_one_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::GroqMultiregionOneExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("groq-multiregion-one-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(
-            row.backend_counts
-                .iter()
-                .all(|(cluster_id, _)| cluster_id != "cluster-0000")
-        );
-    }
-
-    #[test]
-    fn groq_multiregion_affinity_one_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::GroqMultiregionAffinityOneExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("groq-multiregion-affinity-one-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(
-            row.backend_counts
-                .iter()
-                .all(|(cluster_id, _)| cluster_id != "cluster-0000")
-        );
-    }
-
-    #[test]
-    fn groq_multiregion_affinity_multi_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::GroqMultiregionAffinityMultiExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("groq-multiregion-affinity-multi-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(row.backend_counts.iter().all(|(cluster_id, _)| {
-            cluster_id != "cluster-0000" && cluster_id != "cluster-0001"
-        }));
-    }
-
-    #[test]
-    fn groq_multiregion_ignore_queue_multi_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::GroqMultiregionIgnoreQueueMultiExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("groq-multiregion-ignore-queue-multi-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(row.backend_counts.iter().all(|(cluster_id, _)| {
-            cluster_id != "cluster-0000" && cluster_id != "cluster-0001"
-        }));
-    }
-
-    #[test]
-    fn pulsar_one_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::PulsarOneExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("pulsar-one-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(
-            row.backend_counts
-                .iter()
-                .all(|(cluster_id, _)| cluster_id != "cluster-0000")
-        );
-    }
-
-    #[test]
-    fn round_robin_one_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::RoundRobinOneExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("round-robin-one-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(
-            row.backend_counts
-                .iter()
-                .all(|(cluster_id, _)| cluster_id != "cluster-0000")
-        );
-    }
-
-    #[test]
-    fn round_robin_multi_excluded_scenario_never_selects_excluded_backend() {
-        let rows = run_lb_microbench(&LbMicrobenchConfig {
-            iterations: 32,
-            warmup_iterations: 4,
-            concurrency: 2,
-            candidates: 8,
-            cache_key_count: 4,
-            scenarios: vec![LbMicrobenchScenario::RoundRobinMultiExcluded],
-        })
-        .expect("microbench should run");
-
-        let row = rows
-            .first()
-            .expect("round-robin-multi-excluded scenario should emit a row");
-        assert_eq!(row.choices, row.iterations);
-        assert!(row.backend_counts.iter().all(|(cluster_id, _)| {
-            cluster_id != "cluster-0000" && cluster_id != "cluster-0001"
-        }));
+    #[rustfmt::skip]
+    exclusion_tests! {
+        random_one_excluded_scenario_never_selects_excluded_backend: RandomOneExcluded => ["cluster-0000"];
+        power_of_n_one_excluded_scenario_never_selects_excluded_backend: PowerOfNOneExcluded => ["cluster-0000"];
+        wait_and_widen_one_excluded_scenario_never_selects_excluded_backend: WaitAndWidenOneExcluded => ["cluster-0000"];
+        wait_and_widen_affinity_one_excluded_scenario_never_selects_excluded_backend: WaitAndWidenAffinityOneExcluded => ["cluster-0000"];
+        wait_and_widen_affinity_multi_excluded_scenario_never_selects_excluded_backend: WaitAndWidenAffinityMultiExcluded => ["cluster-0000", "cluster-0001"];
+        wait_and_widen_ignore_queue_multi_excluded_scenario_never_selects_excluded_backend: WaitAndWidenIgnoreQueueMultiExcluded => ["cluster-0000", "cluster-0001"];
+        pulsar_one_excluded_scenario_never_selects_excluded_backend: PulsarOneExcluded => ["cluster-0000"];
+        round_robin_one_excluded_scenario_never_selects_excluded_backend: RoundRobinOneExcluded => ["cluster-0000"];
+        round_robin_multi_excluded_scenario_never_selects_excluded_backend: RoundRobinMultiExcluded => ["cluster-0000", "cluster-0001"];
     }
 
     #[test]
@@ -1008,96 +740,104 @@ mod tests {
         write_lb_microbench_csv(&mut output, &rows).expect("csv should render");
         let rendered = String::from_utf8(output).expect("csv should be utf8");
 
-        assert!(rendered.starts_with("scenario,candidates,iterations"));
+        assert!(
+            rendered
+                .starts_with("methodology,scenario,configured_sample_count,candidates,iterations")
+        );
         assert!(rendered.contains("selected_backend_count,top_backend,top_backend_choices"));
         assert!(rendered.contains(
-            "pulsar,8,10,2,4,1234,123.4,10,1.200,2,cluster-0001,7,cluster-0000:3;cluster-0001:7,42"
+            "choose-only-v3,pulsar,,8,10,2,4,1234,123.4,10,1.200,2,cluster-0001,7,cluster-0000:3;cluster-0001:7,42"
         ));
     }
 
     #[test]
     fn measured_requests_start_after_warmup_key_range() {
         let target = RoutingTargetKey {
-            routing_key: Some("tenant-a".to_string()),
-            model_id: PULSAR_MODEL_ID.to_string(),
+            routing_key: None,
+            model_id: String::new(),
         };
-        let cache_keys = build_cache_keys(4);
+        let cache_keys = ["key-0", "key-1", "key-2", "key-3"].map(String::from);
         let received_at = Instant::now();
 
-        let first_measured =
-            request_for_measured_iteration(&target, &cache_keys, 2, 0, received_at, None);
-        let second_measured =
-            request_for_measured_iteration(&target, &cache_keys, 2, 1, received_at, None);
-
-        assert_eq!(
-            first_measured.cache_affinity_key,
-            Some(cache_keys[2].as_str())
-        );
-        assert_eq!(
-            second_measured.cache_affinity_key,
-            Some(cache_keys[3].as_str())
-        );
+        for measured_iteration in 0..2 {
+            let iteration = 2 + measured_iteration;
+            assert_eq!(
+                request_for_iteration(&target, &cache_keys, iteration, received_at, None)
+                    .cache_affinity_key,
+                Some(cache_keys[2 + measured_iteration].as_str())
+            );
+        }
     }
 
     #[test]
     fn measured_timer_starts_after_workers_are_ready() {
-        let ready_barrier = Arc::new(Barrier::new(2));
-        let release_barrier = Arc::new(Barrier::new(2));
-        let helper_ready_barrier = Arc::clone(&ready_barrier);
-        let helper_release_barrier = Arc::clone(&release_barrier);
+        let ready_barrier = Barrier::new(2);
+        let release_barrier = Barrier::new(2);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let helper = thread::spawn(move || {
-            release_workers_after_ready_with_hook(
-                &helper_ready_barrier,
-                &helper_release_barrier,
-                || {
-                    entered_tx
-                        .send(())
-                        .expect("test should receive readiness hook");
-                },
-            )
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                entered_tx
+                    .send(())
+                    .expect("test should receive readiness hook");
+                release_workers_after_ready(&ready_barrier, &release_barrier)
+            });
+            entered_rx
+                .recv()
+                .expect("helper should enter readiness wait");
+            let ready_at = Instant::now();
+            ready_barrier.wait();
+            release_barrier.wait();
+            assert!(helper.join().expect("timer helper should not panic") >= ready_at);
         });
-
-        entered_rx
-            .recv()
-            .expect("helper should enter readiness wait");
-        let ready_at = Instant::now();
-        ready_barrier.wait();
-        release_barrier.wait();
-        let start = helper
-            .join()
-            .expect("timer release helper should not panic");
-
-        assert!(start >= ready_at);
     }
 
     #[test]
     fn merged_worker_results_use_worker_finish_time_for_elapsed_ns() {
         let start = Instant::now();
-        let first_stats = LbMicrobenchStats {
-            choices: 1,
-            ..LbMicrobenchStats::default()
-        };
-        let second_stats = LbMicrobenchStats {
-            choices: 2,
-            ..LbMicrobenchStats::default()
+        let candidates = build_candidates(4);
+        let choice = |candidate_index| stargate::load_balancer::LoadBalancerCandidateChoice {
+            candidate_index,
+            rank_depth: 1,
+            selected_after_kv_free_tokens_skip: false,
         };
 
-        let (stats, total_ns) = merge_worker_results(
-            start,
-            [
-                LbMicrobenchWorkerResult {
-                    stats: first_stats,
-                    finished_at: start + Duration::from_nanos(7),
-                },
-                LbMicrobenchWorkerResult {
-                    stats: second_stats,
-                    finished_at: start + Duration::from_nanos(11),
-                },
-            ],
+        let mut allocation_probe = LbMicrobenchMeasurements::new(candidates.len(), 32);
+        let counts_storage = allocation_probe.candidate_counts.as_ptr();
+        let choices_storage = allocation_probe.selected_candidate_indices.as_ptr();
+        for iteration in 0..32 {
+            allocation_probe.record(choice(iteration % candidates.len()));
+        }
+        assert_eq!(allocation_probe.candidate_counts.as_ptr(), counts_storage);
+        assert_eq!(
+            allocation_probe.selected_candidate_indices.as_ptr(),
+            choices_storage,
+            "measured aggregation buffers must not move while recording choices"
         );
 
-        assert_eq!(stats.choices, 3);
+        let mut first_measurements = LbMicrobenchMeasurements::new(candidates.len(), 1);
+        first_measurements.record(choice(0));
+        let mut second_measurements = LbMicrobenchMeasurements::new(candidates.len(), 2);
+        second_measurements.record(choice(1));
+        second_measurements.record(choice(1));
+        let mut worker_results = Vec::with_capacity(2);
+        let result_storage = worker_results.as_ptr();
+        worker_results.push((first_measurements, start + Duration::from_nanos(7)));
+        worker_results.push((second_measurements, start + Duration::from_nanos(11)));
+        assert_eq!(
+            worker_results.as_ptr(),
+            result_storage,
+            "raw worker-result storage must not grow while workers are timed"
+        );
+
+        let (stats, total_ns) = merge_worker_results(start, &candidates, worker_results);
+
+        assert_eq!(stats.candidate_counts, [1, 2, 0, 0]);
+        let expected_checksum =
+            update_checksum(0, &candidates[0].cluster_id).wrapping_add(update_checksum(
+                update_checksum(0, &candidates[1].cluster_id),
+                &candidates[1].cluster_id,
+            ));
+        assert_eq!(stats.checksum, expected_checksum);
         assert_eq!(total_ns, 11);
     }
 }

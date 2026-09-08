@@ -111,6 +111,29 @@ func TestMetricsDefinitionsUseServiceScopedNames(t *testing.T) {
 	}
 }
 
+func TestFunctionIDAttribute(t *testing.T) {
+	tests := []struct {
+		name       string
+		functionID string
+		want       string
+	}{
+		{name: "function", functionID: "fn-123", want: "fn-123"},
+		{name: "missing", want: "none"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			attr := FunctionIDAttribute(test.functionID)
+			if got := string(attr.Key); got != "function_id" {
+				t.Fatalf("attribute key = %q, want function_id", got)
+			}
+			if got := attr.Value.AsString(); got != test.want {
+				t.Fatalf("attribute value = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestInitStartsPrometheusMetricsServer(t *testing.T) {
 	port := freePort(t)
 
@@ -129,8 +152,41 @@ func TestInitStartsPrometheusMetricsServer(t *testing.T) {
 	if !strings.Contains(body, "llm_api_gateway_pubsub_publish_failures_total") {
 		t.Fatalf("metrics body missing pubsub counter:\n%s", body)
 	}
+	if !strings.Contains(body, "go_goroutines") {
+		t.Fatalf("metrics body missing Go runtime collector:\n%s", body)
+	}
 	if strings.Contains(body, "llm_api_gateway_pubsub_publish_failures_total_total") {
 		t.Fatalf("metrics body contains duplicated total suffix:\n%s", body)
+	}
+}
+
+func TestInitAllowsMultiplePrometheusRuntimes(t *testing.T) {
+	firstPort := freePort(t)
+	first, err := Init(context.Background(), RuntimeConfig{MetricsPort: firstPort})
+	if err != nil {
+		t.Fatalf("first Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = first.Shutdown(context.Background())
+	})
+
+	secondPort := freePort(t)
+	second, err := Init(context.Background(), RuntimeConfig{MetricsPort: secondPort})
+	if err != nil {
+		t.Fatalf("second Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = second.Shutdown(context.Background())
+	})
+
+	Add(PubSubPublishFailures(), 1)
+
+	body := waitForMetricsBody(t, fmt.Sprintf("http://127.0.0.1:%d/metrics", secondPort))
+	if !strings.Contains(body, "llm_api_gateway_pubsub_publish_failures_total") {
+		t.Fatalf("second metrics body missing pubsub counter:\n%s", body)
+	}
+	if !strings.Contains(body, "go_goroutines") {
+		t.Fatalf("second metrics body missing Go runtime collector:\n%s", body)
 	}
 }
 
@@ -149,7 +205,7 @@ func TestInitDoesNotStartMetricsServerWhenPortIsZero(t *testing.T) {
 }
 
 func TestPrometheusHandlerProducesParseableMetricNames(t *testing.T) {
-	provider, gatherer, err := newMeterProvider(context.Background(), "", resource.Empty(), true)
+	provider, gatherer, err := newMeterProvider(context.Background(), "", resource.Empty(), true, "")
 	if err != nil {
 		t.Fatalf("new meter provider: %v", err)
 	}

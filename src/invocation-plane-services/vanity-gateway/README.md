@@ -17,7 +17,7 @@ bazel test //... --flaky_test_attempts=3
 # Push to internal NGC registries (manual on MR, automatic on default
 # branch + tags). The legacy docker-build-push lane from the
 # nvcf-golang-ci-pipeline template continues to publish in parallel
-# until the synthetic-import-to-native cutover in the umbrella.
+# until the native cutover in the umbrella.
 bazel run //nvidia-internal:image_push_kaze
 bazel run //nvidia-internal:image_push_ncp_dev
 ```
@@ -43,7 +43,9 @@ Configuration is passed through environment variables.
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `MAPPING_PATH` | Yes | None | Path to the rendered mapping config file. |
+| `MAPPING_LOAD_TIMEOUT` | No | `15s` | Maximum time to wait at startup for `MAPPING_PATH` to appear. Increase this when a ConfigMap projection or remote-config sidecar materializes the file after the main container starts. Duration strings require a unit, such as `2m` or `90s`. A value without a unit is rejected when configuration is loaded, and a negative value is rejected at startup. |
 | `NVCF_API_ENDPOINT` | No | Service default | Upstream invocation service endpoint. In cluster deployments, this usually points to the in-cluster invocation service. |
+| `LLM_GATEWAY_ENDPOINT` | No | Empty | Upstream LLM Gateway endpoint. Required only when a model sets `functionType: LLM`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | Empty | OTLP endpoint for tracing. Empty disables OTLP export. |
 | `TRACING_ACCESS_TOKEN` | No | Empty | Access token for OTLP tracing. Also configurable in the secrets file under `$.tracingAccessToken`. |
 | `SECRETS_PATH` | No | `vault/secrets.json` | File used to read `tracingAccessToken` when `TRACING_ACCESS_TOKEN` is not set. |
@@ -63,8 +65,14 @@ the `v2config` mapping for both OpenAI compatible routes and vanity routes.
 Valid file updates are reloaded and the router is swapped without restarting the
 process. Invalid updates are logged and skipped.
 
-The gateway does not depend on how this file is produced. Self-managed
-deployments can provide it directly with a Kubernetes ConfigMap:
+The gateway does not depend on how this file is produced. Self-managed and
+managed deployments can provide it directly with a Kubernetes ConfigMap, or use
+a sidecar that writes remote configuration to a shared volume. Set
+`MAPPING_LOAD_TIMEOUT` when that file may not exist immediately at process
+startup.
+
+Self-managed deployments can provide the mapping directly with a Kubernetes
+ConfigMap:
 
 ```yaml
 apiVersion: v1
@@ -131,10 +139,14 @@ v2config:
         functionVersionID: 11111111-1111-1111-1111-111111111111
         usePexec: true
         sessionTimeout: 900
+        customHeaders:
+          X-Provider-Feature: enabled
+          X-Request-Source: vanity-gateway
         tooManyRequestsMessage: "Try again later or use a partner endpoint."
         shadowModelNames:
           - private/meta/llama-3.1-8b-shadow
         shadowPercentage: 10
+        shadowSamplingMethod: perBearerKey
       private_meta_llama-3_1-8b-shadow:
         modelName: private/meta/llama-3.1-8b-shadow
         functionID: 00000000-0000-0000-0000-000000000002
@@ -153,6 +165,8 @@ v2config:
           path: /v1/example/infer
           functionID: 00000000-0000-0000-0000-000000000003
           functionVersionID: 11111111-1111-1111-1111-111111111113
+          customHeaders:
+            X-Provider-Feature: enabled
         sample_pexec:
           path: /v1/example/pexec
           functionID: 00000000-0000-0000-0000-000000000004
@@ -171,12 +185,14 @@ v2config:
 | `outgoingPathOverride` | No | Upstream path to use instead of the incoming OpenAI-compatible path. Ignored when `usePexec` is true. |
 | `usePexec` | No | When `true`, route to `/v2/nvcf/pexec/functions/{functionID}` and append `/versions/{functionVersionID}` when set. |
 | `sessionTimeout` | No | Integer seconds used as the default `NVCF-POLL-SECONDS` value for this model. Missing or `0` uses `300`; caller-provided headers take precedence. |
+| `customHeaders` | No | Map of static request headers to set on the upstream request. Configured values overwrite caller-provided values for the same header. Reserved routing, protocol, auth, proxy, and `NVCF-*` headers are rejected. |
 | `eol` | No | RFC3339 timestamp. Future dates add a `Deprecation` header; past dates return `410 Gone` and hide the model from `/v1/models`. |
 | `offlineMessage` | No | Non-empty value returns `503 Service Unavailable` with this message. |
 | `tooManyRequestsMessage` | No | Message appended to upstream `429 Too Many Requests` responses for this model. |
 | `shadowModelName` | No | Legacy single shadow target. Prefer `shadowModelNames` for new config. |
 | `shadowModelNames` | No | Additional model names in the same OpenAI section that receive shadow traffic. Not supported for multipart image edit or variation endpoints. |
 | `shadowPercentage` | No | Percentage of primary requests to shadow, from `1` to `100`. Defaults to `100` when shadow targets exist. |
+| `shadowSamplingMethod` | No | Shadow admission method. Allowed values are `random` and `perBearerKey`. Missing or empty defaults to `random`. Requires at least one shadow target. Not supported for multipart image edit or variation endpoints. |
 | `shadowCancelOnClientDisconnect` | No | When `true`, cancels shadow work if the primary request context is canceled. Requires at least one shadow target. |
 
 ### Shadow Traffic Support
@@ -187,6 +203,25 @@ request bodies: `chatCompletions`, `completions`, `embeddings`, `responses`, and
 section as the primary model. The gateway rewrites the request `model` field to
 the shadow target and marks the replay with `NVCF-Shadow: true` so shadow
 requests do not recursively shadow.
+
+`shadowSamplingMethod` controls how `shadowPercentage` admits requests. The
+default method, `random`, draws a request-local bucket from `0` to `99` and
+admits the request when `bucket < shadowPercentage`.
+
+The `perBearerKey` method makes admission sticky by bearer credential. It
+requires exactly one `Authorization` header whose value starts with the
+case-insensitive `Bearer` auth scheme followed by whitespace. The gateway strips
+only the `Bearer` scheme and following separator whitespace, then hashes the
+complete remaining credential as opaque UTF-8 bytes. It computes SHA-256, reads
+the first 8 digest bytes as a big-endian `uint64`, sets
+`bucket = value % 100`, and admits the request when
+`bucket < shadowPercentage`. Bearer credential prefixes such as `nvapi`,
+`nvapi-stg`, and `nvapi-nvcf` remain part of the credential and are not
+stripped. Missing, malformed, duplicate, or non-Bearer authorization skips
+shadow dispatch when `shadowPercentage` is below `100`.
+
+`perBearerKey` is key-level sampling. It is not true user or session sampling
+and can skew shadow volume when a few bearer keys dominate traffic.
 
 Shadow traffic is not supported for multipart image endpoints: `imageEdits` and
 `imageVariations`. Config validation rejects shadow fields in those sections.
@@ -209,9 +244,63 @@ response completes.
 | `functionVersionID` | No | NVCF function version ID. When empty, the gateway targets the function without pinning a version. |
 | `outgoingPathOverride` | No | Upstream path to use instead of the incoming vanity path. Ignored when `usePexec` is true. |
 | `usePexec` | No | When `true`, route to `/v2/nvcf/pexec/functions/{functionID}` and append `/versions/{functionVersionID}` when set. |
+| `customHeaders` | No | Map of static request headers to set on the upstream request. Configured values overwrite caller-provided values for the same header. Reserved routing, protocol, auth, proxy, and `NVCF-*` headers are rejected. |
 | `eol` | No | RFC3339 timestamp. Future dates add a `Deprecation` header; past dates return `410 Gone`. |
 | `offlineMessage` | No | Non-empty value returns `503 Service Unavailable` with this message. |
-| shadow fields | No | Unsupported for Vanity URL routes. `shadowFunctionID`, `shadowFunctionVersionID`, and `shadowPercentage` are rejected during config validation. |
+| shadow fields | No | Unsupported for Vanity URL routes. `shadowFunctionID`, `shadowFunctionVersionID`, `shadowPercentage`, and `shadowSamplingMethod` are rejected during config validation. |
+
+`customHeaders` only affects outbound proxied requests; it does not add response headers. Header names must be valid HTTP field names and cannot include reserved routing, auth, protocol, proxy, or NVCF-managed names such as `Authorization`, `Host`, `function-id`, `function-version-id`, `Content-Length`, `Connection`, or any `NVCF-*` header.
+
+### LLM Function Models
+
+Set `functionType: LLM` on an OpenAI model entry to serve it from the LLM
+Gateway instead of the invocation service. Supported in `chatCompletions`,
+`responses`, and `embeddings`, the three routes the LLM Gateway serves.
+
+```yaml
+v2config:
+  openai:
+    host: api.example.com
+    chatCompletions:
+      meta_llama-3_3-70b:
+        modelName: meta/llama-3.3-70b
+        functionID: 00000000-0000-0000-0000-000000000001
+        functionType: LLM
+```
+
+Callers send the public `modelName`, exactly as they do for any other model on
+this host. The gateway looks the model up, rewrites the request `model` to
+`functionID/modelName`, and forwards it to `LLM_GATEWAY_ENDPOINT`, which routes
+on that prefix, so a caller never has to supply a function ID.
+
+Only the request is rewritten. On `/v1/chat/completions` the LLM Gateway echoes
+the model it was given, so the `model` field of the response, and of every
+streamed chunk, carries `functionID/modelName` back to the caller.
+`/v1/responses` and `/v1/embeddings` return the public model name instead.
+
+`function-id`, `function-version-id`, and `nvcf-function-id` are stripped from
+these requests. The LLM Gateway resolves the function from the model, so the
+gateway sets none of them, and a caller-supplied value is removed rather than
+forwarded: the mapping is what decides which function a caller reaches.
+`Authorization`, `NVCF-POLL-SECONDS`, and the caller's other headers pass
+through unchanged.
+
+Config validation rejects `functionType: LLM` outside the three supported
+sections, and rejects `usePexec`, `outgoingPathOverride`, and `sessionTimeout`
+on those entries because the LLM Gateway ignores them. An `X-Priority` entry in
+`customHeaders` is rejected too: the LLM Gateway answers `400 Bad Request` for
+any request carrying that header. `eol`, `offlineMessage`, and the remaining
+`customHeaders` behave as they do for other models, and the model still appears
+in `/v1/models`.
+
+Shadow traffic works on these entries. Each shadow target is resolved from the
+same model table as the primary, so it is rewritten and routed by its own
+`functionType`. A shadow of an LLM model reaches the LLM Gateway, and an LLM
+model may shadow a model served by the invocation service, or the reverse.
+
+`LLM_GATEWAY_ENDPOINT` is required whenever a model sets `functionType: LLM`. It
+is the outbound address of the LLM Gateway, so it is a full URL with a scheme
+and must not carry a path.
 
 ## Invoking OpenAI-compatible Endpoints
 
@@ -338,6 +427,30 @@ curl -v localhost:10081/health
 curl -v -H 'Host: api.example.com' localhost:10081/health
 curl -v localhost:10083/metrics
 ```
+
+`/health` reports one check per configured upstream. The `nvcf api` check probes
+`/health` on `NVCF_API_ENDPOINT`. When a model sets `functionType: LLM`, an
+`llm api gateway` check probes `/healthz` on `LLM_GATEWAY_ENDPOINT`, since the
+LLM Gateway does not serve `/health`.
+
+The two checks differ in what a failure does. A failing `nvcf api` check returns
+`503`, because that upstream serves every route. A failing `llm api gateway`
+check is reported in the response body but still returns `200`: deployments wire
+`/health` to both the readiness and liveness probes, so failing it would restart
+every pod and drop invocation-service routing when only the LLM Gateway is down.
+Requests for an LLM-routed model return `502` for as long as that upstream is
+unreachable, and everything else keeps serving.
+
+`nvcf_ai_api_gateway_shadow_requests_dropped_total` counts shadow dispatches
+dropped before replay. The `openai_model_name` label identifies the shadow
+target. The `reason` label is one of `body_read_error`, `body_rewrite_error`,
+or `concurrency_limit`.
+
+`gateway_proxy_outcome` is present only on Gateway server metrics emitted when
+the ReverseProxy ErrorHandler writes an error response. Its value is
+`client_canceled` when the inbound request is canceled before upstream response
+headers are written, or `gateway_proxy_error` for another ErrorHandler failure.
+Successful requests and upstream HTTP responses omit this label.
 
 ## Running a Local OpenAI-compatible Model
 

@@ -47,7 +47,6 @@ exclude = [
     ".gitlab",
     "node_modules",
     "fern",
-    "nvidia-internal",
     "docs/v0.5",
 ]
 

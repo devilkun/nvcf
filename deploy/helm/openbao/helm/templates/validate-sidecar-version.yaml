@@ -14,8 +14,8 @@
 # limitations under the License.
 
 {{- /*
-Install-time guard: refuse to install if the `auto-unseal-sidecar` container's
-image tag does not match the openbao server's image tag.
+Install-time guard: refuse to install if an OpenBao client image tag does not
+match the openbao server's image tag.
 
 WHY
    A bao client/server version skew between the sidecar (which runs
@@ -58,21 +58,29 @@ WHY
    does not help the sidecar's client; this guard catches that.
 
 HOW TO FIX A FAILED INSTALL
-   Bump the `image:` field of the auto-unseal-sidecar entry in your
-   values overlay (typically `values.local.yaml` `openbao.server.extraContainers`)
-   to use the same tag as `helm/values.yaml`'s `openbao.server.image.tag`.
+   Remove stale image tag overrides so the chart defaults inherit the server
+   tag, or update every OpenBao client image override to match the server tag.
 
 OUTPUT
    None on success. fail() halts install on mismatch.
 */}}
 {{- $serverTag := .Values.openbao.server.image.tag -}}
+{{- if .Values.openbao.injector.enabled -}}
+{{- $agentTag := .Values.openbao.injector.agentImage.tag -}}
+{{- if ne $agentTag $serverTag -}}
+  {{- $msg := printf "OpenBao image tag mismatch.\n\n  server         openbao.server.image.tag: %s\n  injected agent openbao.injector.agentImage.tag: %s\n\nThe server, injected agent, and auto-unseal sidecar must use the same nvcf-openbao tag.\nRemove the stale openbao.injector.agentImage.tag override so the chart default is used, or set it to '%s'." $serverTag $agentTag $serverTag -}}
+  {{- fail $msg -}}
+{{- end -}}
+{{- end -}}
 {{- range $idx, $c := .Values.openbao.server.extraContainers -}}
   {{- if eq $c.name "auto-unseal-sidecar" -}}
-    {{- $parts := splitList ":" ($c.image | default "") -}}
+    {{- $subchartContext := dict "Values" (dict "server" $.Values.openbao.server) "Chart" $.Chart -}}
+    {{- $sidecarImage := tpl ($c.image | default "") $subchartContext -}}
+    {{- $parts := splitList ":" $sidecarImage -}}
     {{- if gt (len $parts) 1 -}}
       {{- $sidecarTag := last $parts -}}
       {{- if ne $sidecarTag $serverTag -}}
-        {{- $msg := printf "auto-unseal-sidecar image tag does not match openbao server image tag.\n\n  server  (openbao.server.image.tag)            : %s\n  sidecar (extraContainers[%d].image, tag suffix): %s\n\nA bao client/server version skew here silently corrupts bao state during the\npost-install raft bootstrap; the install will appear to begin then fail with\n'failed to get raft challenge' from bao operator raft join.\n\nSee helm/templates/validate-sidecar-version.yaml for the OpenBao change refs\nthat explain why (openbao/openbao#1986, #2331, #2574, #1518, #1433).\n\nUpdate the sidecar image tag in your values overlay to match server tag\n'%s' and reinstall." $serverTag $idx $sidecarTag $serverTag -}}
+        {{- $msg := printf "OpenBao image tag mismatch.\n\n  server              openbao.server.image.tag: %s\n  auto-unseal sidecar openbao.server.extraContainers[%d].image tag: %s\n\nThe server, injected agent, and auto-unseal sidecar must use the same nvcf-openbao tag.\nRemove the stale openbao.server.extraContainers override so the chart default sidecar is used, or set the sidecar image tag to '%s'." $serverTag $idx $sidecarTag $serverTag -}}
         {{- fail $msg -}}
       {{- end -}}
     {{- end -}}

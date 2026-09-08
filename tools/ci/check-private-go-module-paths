@@ -79,8 +79,12 @@ load_native_roots() {
     local line current_path="" current_source="upstream"
 
     [[ -f "${manifest}" ]] || {
-        echo "missing ${manifest}" >&2
-        exit 1
+        # imports.yaml is intentionally not published to the OSS mirror. Without
+        # it there are no declared synthetic-import roots to enumerate, so leave
+        # native_roots empty; the caller then reports "no native roots" and exits
+        # clean. On GitLab, where the manifest exists, the full check still runs.
+        echo "check-private-go-module-paths: ${manifest} not present; no native import roots to scan."
+        return 0
     }
 
     while IFS= read -r line; do

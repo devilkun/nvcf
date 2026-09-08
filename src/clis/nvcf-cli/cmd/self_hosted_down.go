@@ -110,7 +110,7 @@ func runDown(c *cobra.Command) error {
 		Plain:      selfHostedPlain,
 		Accessible: selfHostedAccessible,
 		Cluster:    downClusterName,
-		Stack:      selfHostedStack,
+		Stack:      selfHostedControlPlaneStack,
 	})
 	if err != nil {
 		return err
@@ -155,7 +155,7 @@ func runDownPlanOnly(ctx context.Context, sink progress.EventSink, started time.
 	}
 	_ = sink.Emit(ctx, progress.Planned{
 		Cluster:       downClusterName,
-		Stack:         selfHostedStack,
+		Stack:         selfHostedControlPlaneStack,
 		Phases:        phases,
 		TotalETASec:   plan.TotalEstSec,
 		WillUninstall: plan.WillUninstall,
@@ -255,8 +255,8 @@ func runDownAllClustersPhases(c *cobra.Command, ctx context.Context, sink progre
 
 func localDownFallbackClusterNames(ctx context.Context) ([]string, error) {
 	resolved, err := selfhosted.ResolveStack(ctx, selfhosted.StackOptions{
-		Source:        selfHostedStack,
-		BuiltInOCIRef: builtInStackOCI(),
+		Source:        selfHostedComputePlaneStack,
+		BuiltInOCIRef: builtInComputePlaneStackOCI(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve stack: %w", err)
@@ -294,7 +294,7 @@ func clusterNamesFromStackOut(stackPath string) ([]string, error) {
 	return out, nil
 }
 
-func registeredClusterName(cl client.SISCluster) string {
+func registeredClusterName(cl client.ICMSCluster) string {
 	if cl.ClusterName != "" {
 		return cl.ClusterName
 	}
@@ -314,14 +314,12 @@ func runDownComputePlaneForCluster(c *cobra.Command, ctx context.Context, sink p
 	_ = sink.Emit(ctx, progress.PhaseStarted{Num: 2, Name: "uninstall-compute-plane", StartedAt: p2})
 
 	resolved, err := selfhosted.ResolveStack(ctx, selfhosted.StackOptions{
-		Source:        selfHostedStack,
-		BuiltInOCIRef: builtInStackOCI(),
+		Source:        selfHostedComputePlaneStack,
+		BuiltInOCIRef: builtInComputePlaneStackOCI(),
 	})
 	if err != nil {
 		return fmt.Errorf("resolve stack: %w", err)
 	}
-
-	helmfileFile, selector := computePlaneTarget(resolved.Path)
 
 	// The compute-plane helmfile (helmfile-nvca-operator.yaml.gotmpl) reads
 	// CLUSTER_ID/CLUSTER_GROUP_ID/IDENTITY_SOURCE/CLUSTER_REGION from env
@@ -333,6 +331,10 @@ func runDownComputePlaneForCluster(c *cobra.Command, ctx context.Context, sink p
 	extra := []string{
 		"CLUSTER_NAME=" + clusterName,
 		"NCA_ID=" + downNCAID,
+		// The worker helmfile also requires OUTPUT_DIR to resolve
+		// $OUTPUT_DIR/$CLUSTER_NAME-register-values.yaml, the same
+		// directory readRegisterValuesYAML reads from below.
+		"OUTPUT_DIR=" + filepath.Join(resolved.Path, "out"),
 	}
 	unregisterClusterID := clusterName
 	if rv, err := readRegisterValuesYAML(resolved.Path, clusterName); err == nil {
@@ -352,8 +354,6 @@ func runDownComputePlaneForCluster(c *cobra.Command, ctx context.Context, sink p
 		ClusterName:     clusterName,
 		KubeContext:     selfHostedComputePlaneContext,
 		StackPath:       resolved.Path,
-		HelmfileFile:    helmfileFile,
-		Selector:        selector,
 		Env:             selfHostedEnv,
 		HelmRuntimeMode: helmRuntimeMode,
 		Stdout:          c.OutOrStdout(),
@@ -451,8 +451,8 @@ func runDownControlPlane(c *cobra.Command, ctx context.Context, sink progress.Ev
 	_ = sink.Emit(ctx, progress.PhaseStarted{Num: 4, Name: "uninstall-control-plane", StartedAt: p4})
 
 	resolved, err := selfhosted.ResolveStack(ctx, selfhosted.StackOptions{
-		Source:        selfHostedStack,
-		BuiltInOCIRef: builtInStackOCI(),
+		Source:        selfHostedControlPlaneStack,
+		BuiltInOCIRef: builtInControlPlaneStackOCI(),
 	})
 	if err != nil {
 		return fmt.Errorf("resolve stack: %w", err)
@@ -480,10 +480,10 @@ func runDownControlPlane(c *cobra.Command, ctx context.Context, sink progress.Ev
 }
 
 type registeredClusterLister interface {
-	ListClusters(ctx context.Context, sisURL, ncaID string) ([]client.SISCluster, error)
+	ListClusters(ctx context.Context, sisURL, ncaID string) ([]client.ICMSCluster, error)
 }
 
-func listRegisteredClusters(ctx context.Context, icmsURL, ncaID string) ([]client.SISCluster, error) {
+func listRegisteredClusters(ctx context.Context, icmsURL, ncaID string) ([]client.ICMSCluster, error) {
 	deleter, closeDeleter, err := newClusterDeleterForDown(icmsURL)
 	if err != nil {
 		return nil, fmt.Errorf("constructing cluster lister: %w", err)

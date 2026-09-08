@@ -19,9 +19,13 @@ pub struct RoutingTargetKey {
     pub model_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeliveryTarget {
-    Local { inference_server_id: String },
+impl RoutingTargetKey {
+    pub(crate) fn new(routing_key: Option<String>, model_id: impl Into<String>) -> Self {
+        Self {
+            routing_key,
+            model_id: model_id.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,5 +35,4 @@ pub(crate) struct RegistrationIdentity {
     pub(crate) inference_server_url: String,
     pub(crate) routing_key: Option<String>,
     pub(crate) reverse_tunnel: bool,
-    pub(crate) coordinated_calibration: bool,
 }

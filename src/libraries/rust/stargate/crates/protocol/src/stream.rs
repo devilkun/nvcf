@@ -15,12 +15,16 @@
 
 use crate::ProtocolError;
 use crate::protocol::{
-    QuicBodyOrTrailer, QuicMessage, read_body_or_trailer_from_stream, read_from_stream,
-    read_header_map_from_stream, write_body_to_stream, write_header_map_to_stream,
-    write_trailer_map_to_stream,
+    QuicBodyOrTrailer, QuicMessage, expect_stream_end, read_body_or_trailer_from_stream,
+    read_from_stream, read_header_map_from_stream, write_body_to_stream,
+    write_header_map_to_stream, write_trailer_map_to_stream,
 };
 use quinn::{StoppedError, VarInt};
 use tracing::warn;
+
+fn protocol_violation(message: &'static str) -> ProtocolError {
+    ProtocolError::ProtocolViolation(message.to_string())
+}
 
 pub struct SendStream {
     sent_headers: bool,
@@ -39,9 +43,7 @@ impl SendStream {
 
     pub async fn send_header(&mut self, header: http::HeaderMap) -> Result<(), ProtocolError> {
         if self.sent_headers {
-            return Err(ProtocolError::ProtocolViolation(
-                "headers already sent".to_string(),
-            ));
+            return Err(protocol_violation("headers already sent"));
         }
         write_header_map_to_stream(&mut self.send, &header).await?;
         self.sent_headers = true;
@@ -50,23 +52,19 @@ impl SendStream {
 
     pub async fn send_body(&mut self, body: bytes::Bytes) -> Result<(), ProtocolError> {
         if !self.sent_headers {
-            return Err(ProtocolError::ProtocolViolation(
-                "must send headers before sending body".to_string(),
-            ));
+            return Err(protocol_violation("must send headers before sending body"));
         }
         write_body_to_stream(&mut self.send, body).await
     }
 
     pub async fn send_trailer(&mut self, trailer: http::HeaderMap) -> Result<(), ProtocolError> {
         if !self.sent_headers {
-            return Err(ProtocolError::ProtocolViolation(
-                "must send headers before sending trailer".to_string(),
+            return Err(protocol_violation(
+                "must send headers before sending trailer",
             ));
         }
         if self.eos {
-            return Err(ProtocolError::ProtocolViolation(
-                "stream already finished".to_string(),
-            ));
+            return Err(protocol_violation("stream already finished"));
         }
         write_trailer_map_to_stream(&mut self.send, &trailer).await
     }
@@ -133,23 +131,18 @@ impl RecvStream {
         }
     }
 
+    fn recv_mut(&mut self) -> Result<&mut quinn::RecvStream, ProtocolError> {
+        self.recv
+            .as_mut()
+            .ok_or_else(|| protocol_violation("stream already stopped or dropped"))
+    }
+
     pub async fn recv_header(&mut self) -> Result<http::HeaderMap, ProtocolError> {
         if self.received_header {
-            return Err(ProtocolError::ProtocolViolation(
-                "recv_header called more than once".to_string(),
-            ));
+            return Err(protocol_violation("recv_header called more than once"));
         }
-        let header_map = match read_header_map_from_stream(self.recv.as_mut().ok_or_else(|| {
-            ProtocolError::ProtocolViolation("stream already stopped or dropped".to_string())
-        })?)
-        .await?
-        {
-            Some(header_map) => header_map,
-            None => {
-                return Err(ProtocolError::ProtocolViolation(
-                    "expected header message, got none".to_string(),
-                ));
-            }
+        let Some(header_map) = read_header_map_from_stream(self.recv_mut()?).await? else {
+            return Err(protocol_violation("expected header message, got none"));
         };
         self.received_header = true;
         Ok(header_map)
@@ -157,15 +150,11 @@ impl RecvStream {
 
     pub async fn recv_body(&mut self) -> Result<RecvBodyFrame, ProtocolError> {
         if !self.received_header {
-            return Err(ProtocolError::ProtocolViolation(
-                "must call recv_header once before recv_body".to_string(),
+            return Err(protocol_violation(
+                "must call recv_header once before recv_body",
             ));
         }
-        match read_body_or_trailer_from_stream(self.recv.as_mut().ok_or_else(|| {
-            ProtocolError::ProtocolViolation("stream already stopped or dropped".to_string())
-        })?)
-        .await?
-        {
+        match read_body_or_trailer_from_stream(self.recv_mut()?).await? {
             Some(QuicBodyOrTrailer::Body(body)) => Ok(RecvBodyFrame::Body(body)),
             Some(QuicBodyOrTrailer::Trailer(trailer)) => {
                 self.received_trailer = Some(trailer);
@@ -180,62 +169,39 @@ impl RecvStream {
 
     pub async fn recv_trailer(&mut self) -> Result<Option<http::HeaderMap>, ProtocolError> {
         if !self.received_header {
-            return Err(ProtocolError::ProtocolViolation(
-                "must call recv_header once before recv_trailer".to_string(),
+            return Err(protocol_violation(
+                "must call recv_header once before recv_trailer",
             ));
         }
         let trailer = match (self.received_trailer.take(), self.eos) {
             (Some(t), _) => Some(t),
             (None, true) => None,
-            (None, false) => {
-                match read_body_or_trailer_from_stream(self.recv.as_mut().ok_or_else(|| {
-                    ProtocolError::ProtocolViolation(
-                        "stream already stopped or dropped".to_string(),
-                    )
-                })?)
-                .await?
-                {
-                    Some(QuicBodyOrTrailer::Trailer(trailer)) => Some(trailer),
-                    None => {
-                        self.eos = true;
-                        None
-                    }
-                    Some(QuicBodyOrTrailer::Body(_)) => {
-                        return Err(ProtocolError::ProtocolViolation(
-                            "expected trailer message, got body".to_string(),
-                        ));
-                    }
+            (None, false) => match read_body_or_trailer_from_stream(self.recv_mut()?).await? {
+                Some(QuicBodyOrTrailer::Trailer(trailer)) => Some(trailer),
+                None => {
+                    self.eos = true;
+                    None
                 }
-            }
+                Some(QuicBodyOrTrailer::Body(_)) => {
+                    return Err(protocol_violation("expected trailer message, got body"));
+                }
+            },
         };
 
         if !self.eos {
-            match self.recv_any().await? {
-                None => (),
-                Some(m) => {
-                    return Err(ProtocolError::ProtocolViolation(format!(
-                        "expected none after trailer, got {m}"
-                    )));
-                }
-            }
+            expect_stream_end(self.recv_mut()?).await?;
+            self.eos = true;
         }
 
         Ok(trailer)
     }
 
     pub async fn recv_any(&mut self) -> Result<Option<QuicMessage>, ProtocolError> {
-        let recv = self.recv.as_mut().ok_or_else(|| {
-            ProtocolError::ProtocolViolation("stream already stopped or dropped".to_string())
-        })?;
-        let reader = match read_from_stream(recv).await? {
-            Some(reader) => reader,
-            None => {
-                self.eos = true;
-                return Ok(None);
-            }
+        let Some(reader) = read_from_stream(self.recv_mut()?).await? else {
+            self.eos = true;
+            return Ok(None);
         };
-        let message = QuicMessage::from_reader(reader)?;
-        Ok(Some(message))
+        QuicMessage::from_reader(reader).map(Some)
     }
 
     pub async fn stop(mut self, code: u32) -> Option<VarInt> {
@@ -263,36 +229,14 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use quinn::Endpoint;
-    use rustls::pki_types::CertificateDer;
     use std::future::Future;
-    use std::sync::Arc;
 
-    struct QuicPair {
-        client_connection: quinn::Connection,
-        server_connection: quinn::Connection,
-        _client_endpoint: Endpoint,
-        _server_endpoint: Endpoint,
-    }
-
-    struct SendOnlyStream {
-        send: SendStream,
-        _client_recv: quinn::RecvStream,
-        _quic: QuicPair,
-    }
-
-    struct RecvOnlyStream {
-        recv: RecvStream,
-        writer: tokio::task::JoinHandle<()>,
-        _server_send: quinn::SendStream,
-        _client_recv: quinn::RecvStream,
-        _quic: QuicPair,
-    }
+    type QuicPair = (quinn::Connection, quinn::Connection, Endpoint, Endpoint);
 
     async fn quic_pair() -> QuicPair {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let server_config = server_config();
         let server_endpoint =
-            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+            Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
             let incoming = server_endpoint.accept().await.unwrap();
@@ -310,136 +254,113 @@ mod tests {
             .unwrap();
         let (server_endpoint, server_connection) = server_task.await.unwrap();
 
-        QuicPair {
+        (
             client_connection,
             server_connection,
-            _client_endpoint: client_endpoint,
-            _server_endpoint: server_endpoint,
-        }
+            client_endpoint,
+            server_endpoint,
+        )
     }
 
-    async fn send_only_stream() -> SendOnlyStream {
-        let quic = quic_pair().await;
-        let (client_send, client_recv) = quic.client_connection.open_bi().await.unwrap();
-        SendOnlyStream {
-            send: SendStream::new(client_send),
-            _client_recv: client_recv,
-            _quic: quic,
-        }
-    }
-
-    async fn recv_stream_from_writer<F, Fut>(write: F) -> RecvOnlyStream
+    async fn recv_stream_from_writer<F, Fut>(write: F) -> (RecvStream, QuicPair)
     where
-        F: FnOnce(SendStream) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnOnce(SendStream) -> Fut,
+        Fut: Future<Output = ()>,
     {
         let quic = quic_pair().await;
-        let (client_send, client_recv) = quic.client_connection.open_bi().await.unwrap();
-        let writer = tokio::spawn(write(SendStream::new(client_send)));
-        let (server_send, server_recv) = quic.server_connection.accept_bi().await.unwrap();
-        RecvOnlyStream {
-            recv: RecvStream::new(server_recv),
-            writer,
-            _server_send: server_send,
-            _client_recv: client_recv,
-            _quic: quic,
-        }
+        let (client_send, _) = quic.0.open_bi().await.unwrap();
+        write(SendStream::new(client_send)).await;
+        let (_, server_recv) = quic.1.accept_bi().await.unwrap();
+        (RecvStream::new(server_recv), quic)
+    }
+
+    async fn recv_header_only_stream() -> (RecvStream, QuicPair) {
+        recv_stream_from_writer(|mut send| async move {
+            send.send_header(headers()).await.unwrap();
+            send.finish().unwrap();
+        })
+        .await
     }
 
     fn server_config() -> quinn::ServerConfig {
         let (cert_pem, key_pem) = stargate_tls::generate_self_signed_cert().unwrap();
-        let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*cert_pem)
-            .collect::<std::result::Result<_, _>>()
+        let cert_chain = rustls_pemfile::certs(&mut &*cert_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         let key = rustls_pemfile::private_key(&mut &*key_pem)
             .unwrap()
             .unwrap();
-        let tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .unwrap();
-        quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls_config).unwrap(),
-        ))
+        quinn::ServerConfig::with_single_cert(cert_chain, key).unwrap()
     }
 
     fn headers() -> http::HeaderMap {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-test", "value".parse().unwrap());
-        headers
+        [(
+            http::HeaderName::from_static("x-test"),
+            "value".parse().unwrap(),
+        )]
+        .into_iter()
+        .collect()
     }
 
     fn assert_protocol_violation<T>(result: Result<T, ProtocolError>, expected: &str) {
-        match result {
-            Err(ProtocolError::ProtocolViolation(message)) => {
-                assert!(
-                    message.contains(expected),
-                    "expected violation containing {expected:?}, got {message:?}"
-                );
-            }
-            Err(other) => panic!("expected protocol violation, got {other:?}"),
-            Ok(_) => panic!("expected protocol violation, got success"),
-        }
+        let Err(ProtocolError::ProtocolViolation(message)) = result else {
+            panic!("expected protocol violation")
+        };
+        assert!(
+            message.contains(expected),
+            "expected {expected:?}, got {message:?}"
+        );
     }
 
     #[tokio::test]
     async fn send_stream_rejects_ordering_violations_and_finish_is_idempotent() {
-        let mut pair = send_only_stream().await;
+        let quic = quic_pair().await;
+        let (client_send, _) = quic.0.open_bi().await.unwrap();
+        let mut send = SendStream::new(client_send);
 
         assert_protocol_violation(
-            pair.send.send_body(Bytes::from_static(b"early")).await,
+            send.send_body(Bytes::from_static(b"early")).await,
             "must send headers before sending body",
         );
         assert_protocol_violation(
-            pair.send.send_trailer(headers()).await,
+            send.send_trailer(headers()).await,
             "must send headers before sending trailer",
         );
 
-        pair.send.send_header(headers()).await.unwrap();
+        send.send_header(headers()).await.unwrap();
+        assert_protocol_violation(send.send_header(headers()).await, "headers already sent");
+        send.send_body(Bytes::from_static(b"body")).await.unwrap();
+        send.finish().unwrap();
+        send.finish().unwrap();
         assert_protocol_violation(
-            pair.send.send_header(headers()).await,
-            "headers already sent",
-        );
-        pair.send
-            .send_body(Bytes::from_static(b"body"))
-            .await
-            .unwrap();
-        pair.send.finish().unwrap();
-        pair.send.finish().unwrap();
-        assert_protocol_violation(
-            pair.send.send_trailer(headers()).await,
+            send.send_trailer(headers()).await,
             "stream already finished",
         );
     }
 
     #[tokio::test]
     async fn recv_stream_rejects_ordering_violations() {
-        let mut pair = recv_stream_from_writer(|mut send| async move {
-            send.send_header(headers()).await.unwrap();
-            send.finish().unwrap();
-        })
-        .await;
+        let (mut recv, _quic) = recv_header_only_stream().await;
 
         assert_protocol_violation(
-            pair.recv.recv_body().await,
+            recv.recv_body().await,
             "must call recv_header once before recv_body",
         );
         assert_protocol_violation(
-            pair.recv.recv_trailer().await,
+            recv.recv_trailer().await,
             "must call recv_header once before recv_trailer",
         );
 
-        pair.recv.recv_header().await.unwrap();
+        recv.recv_header().await.unwrap();
         assert_protocol_violation(
-            pair.recv.recv_header().await,
+            recv.recv_header().await,
             "recv_header called more than once",
         );
-        pair.writer.await.unwrap();
     }
 
     #[tokio::test]
     async fn recv_trailer_returns_buffered_trailer_after_body_read() {
-        let mut pair = recv_stream_from_writer(|mut send| async move {
+        let (mut recv, _quic) = recv_stream_from_writer(|mut send| async move {
             let mut trailers = http::HeaderMap::new();
             trailers.insert("x-trailer", "done".parse().unwrap());
             send.send_header(headers()).await.unwrap();
@@ -449,61 +370,68 @@ mod tests {
         })
         .await;
 
-        pair.recv.recv_header().await.unwrap();
+        recv.recv_header().await.unwrap();
         assert_eq!(
-            pair.recv.recv_body().await.unwrap(),
+            recv.recv_body().await.unwrap(),
             RecvBodyFrame::Body(Bytes::from_static(b"body"))
         );
         assert_eq!(
-            pair.recv.recv_body().await.unwrap(),
+            recv.recv_body().await.unwrap(),
             RecvBodyFrame::TrailersReady
         );
-        let trailers = pair.recv.recv_trailer().await.unwrap().unwrap();
+        let trailers = recv.recv_trailer().await.unwrap().unwrap();
         assert_eq!(trailers.get("x-trailer").unwrap(), "done");
-        pair.writer.await.unwrap();
     }
 
     #[tokio::test]
     async fn recv_body_returns_explicit_end_on_clean_eof() {
-        let mut pair = recv_stream_from_writer(|mut send| async move {
-            send.send_header(headers()).await.unwrap();
-            send.finish().unwrap();
-        })
-        .await;
+        let (mut recv, _quic) = recv_header_only_stream().await;
 
-        pair.recv.recv_header().await.unwrap();
-        assert_eq!(pair.recv.recv_body().await.unwrap(), RecvBodyFrame::End);
-        pair.writer.await.unwrap();
+        recv.recv_header().await.unwrap();
+        assert_eq!(recv.recv_body().await.unwrap(), RecvBodyFrame::End);
     }
 
     #[tokio::test]
     async fn recv_trailer_returns_none_on_clean_eof() {
-        let mut pair = recv_stream_from_writer(|mut send| async move {
-            send.send_header(headers()).await.unwrap();
-            send.finish().unwrap();
-        })
-        .await;
+        let (mut recv, _quic) = recv_header_only_stream().await;
 
-        pair.recv.recv_header().await.unwrap();
-        assert!(pair.recv.recv_trailer().await.unwrap().is_none());
-        assert!(pair.recv.recv_trailer().await.unwrap().is_none());
-        pair.writer.await.unwrap();
+        recv.recv_header().await.unwrap();
+        assert!(recv.recv_trailer().await.unwrap().is_none());
+        assert!(recv.recv_trailer().await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn recv_trailer_rejects_body_before_trailers() {
-        let mut pair = recv_stream_from_writer(|mut send| async move {
+        let (mut recv, _quic) = recv_stream_from_writer(|mut send| async move {
             send.send_header(headers()).await.unwrap();
             send.send_body(Bytes::from_static(b"body")).await.unwrap();
             send.finish().unwrap();
         })
         .await;
 
-        pair.recv.recv_header().await.unwrap();
+        recv.recv_header().await.unwrap();
         assert_protocol_violation(
-            pair.recv.recv_trailer().await,
+            recv.recv_trailer().await,
             "expected trailer message, got body",
         );
-        pair.writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_trailer_rejects_frames_after_trailer() {
+        let (mut recv, _quic) = recv_stream_from_writer(|mut send| async move {
+            send.send_header(headers()).await.unwrap();
+            send.send_trailer(headers()).await.unwrap();
+            send.send_body(Bytes::from_static(b"late body"))
+                .await
+                .unwrap();
+            send.finish().unwrap();
+        })
+        .await;
+
+        recv.recv_header().await.unwrap();
+        assert_protocol_violation(
+            recv.recv_trailer().await,
+            "expected none after trailer, got Body",
+        );
     }
 }

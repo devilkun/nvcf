@@ -17,21 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use stargate_auth::AuthTokenProvider;
-use stargate_proto::pb::InferenceServerStatus;
 use stargate_protocol::TunnelTransportProtocol;
 
-use crate::bringup::BringupConfig;
-use crate::output_token_parser::OutputTokenParserFactory;
-use crate::queue_admission::{PylonQueueMismatchRetryConfig, QueueAdmissionTracker};
-use crate::quic_http_tunnel::{PylonRetryConfig, TunnelError};
-use crate::request_observer::RequestObservation;
-use crate::request_quality_monitor::RequestQualityMonitorConfig;
-use crate::stats::PylonMetrics;
+use crate::quic_http_tunnel::{TunnelError, TunnelForwardingConfig};
 
-use super::state::CurrentModelStats;
-use super::urls::{
-    effective_cluster_id, infer_upstream_http_base_url, is_direct_inference_server_url,
-};
+use super::urls::{infer_upstream_http_base_url, is_direct_inference_server_url};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -47,34 +37,36 @@ pub struct InferenceServerRegistrationConfig {
     pub inference_server_id: String,
     pub cluster_id: String,
     pub inference_server_url: String,
-    pub upstream_http_base_url: Option<String>,
+    pub forwarding: TunnelForwardingConfig,
     pub min_update_interval: Duration,
-    pub status: InferenceServerStatus,
     pub reverse_tunnel: bool,
+    pub tls_cert_pem: Option<Vec<u8>>,
+    pub grpc_tls_ca_cert_pem: Option<Vec<u8>>,
     pub quic_insecure: bool,
     pub tunnel_protocol: TunnelTransportProtocol,
-    pub bringup: BringupConfig,
-    pub output_token_parser_factory: OutputTokenParserFactory,
-    pub request_observation_tx: Option<flume::Sender<RequestObservation>>,
-    pub request_quality_monitor: RequestQualityMonitorConfig,
-    pub metrics: Option<Arc<PylonMetrics>>,
-    pub retry: PylonRetryConfig,
-    pub queue_mismatch_retry: PylonQueueMismatchRetryConfig,
-    pub queue_tracker: QueueAdmissionTracker,
     pub auth_token_provider: Option<Arc<AuthTokenProvider>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RegistrationStartPlan {
+#[derive(Debug)]
+pub(super) struct RegistrationSessionConfig {
     pub(super) watch_seeds: Vec<String>,
+    pub(super) inference_server_id: String,
     pub(super) cluster_id: String,
-    pub(super) upstream_http_base_url: String,
+    pub(super) inference_server_url: String,
+    pub(super) forwarding: TunnelForwardingConfig,
+    pub(super) min_update_interval: Duration,
+    pub(super) reverse_tunnel: bool,
+    pub(super) tls_cert_pem: Option<Vec<u8>>,
+    pub(super) grpc_tls_ca_cert_pem: Option<Vec<u8>>,
+    pub(super) quic_insecure: bool,
+    pub(super) tunnel_protocol: TunnelTransportProtocol,
+    pub(super) auth_token_provider: Option<Arc<AuthTokenProvider>>,
 }
 
-impl RegistrationStartPlan {
-    pub(super) fn from_config(
-        config: &InferenceServerRegistrationConfig,
-    ) -> Result<Self, ClientError> {
+impl TryFrom<InferenceServerRegistrationConfig> for RegistrationSessionConfig {
+    type Error = ClientError;
+
+    fn try_from(mut config: InferenceServerRegistrationConfig) -> Result<Self, Self::Error> {
         if config.seeds.is_empty() {
             return Err(ClientError::Config("stargate seeds are empty".to_string()));
         }
@@ -84,31 +76,33 @@ impl RegistrationStartPlan {
             ));
         }
 
-        let upstream_http_base_url = config
-            .upstream_http_base_url
-            .clone()
-            .or_else(|| {
-                config
-                    .reverse_tunnel
-                    .then(|| infer_upstream_http_base_url(&config.inference_server_url))
-                    .flatten()
-            })
-            .ok_or_else(|| {
+        let cluster_id = if config.cluster_id.is_empty() {
+            config.inference_server_id.clone()
+        } else {
+            std::mem::take(&mut config.cluster_id)
+        };
+        let inference_server_url = if config.reverse_tunnel {
+            infer_upstream_http_base_url(&config.inference_server_url).ok_or_else(|| {
                 ClientError::Config(
-                    "upstream_http_base_url is required when inference_server_url is not http(s)"
-                        .to_string(),
+                    "reverse registration inference_server_url must be http(s)".to_string(),
                 )
-            })?;
-
+            })?
+        } else {
+            config.inference_server_url
+        };
         Ok(Self {
-            watch_seeds: config.seeds.clone(),
-            cluster_id: effective_cluster_id(&config.cluster_id, &config.inference_server_id),
-            upstream_http_base_url,
+            watch_seeds: config.seeds,
+            inference_server_id: config.inference_server_id,
+            cluster_id,
+            inference_server_url,
+            forwarding: config.forwarding,
+            min_update_interval: config.min_update_interval,
+            reverse_tunnel: config.reverse_tunnel,
+            tls_cert_pem: config.tls_cert_pem,
+            grpc_tls_ca_cert_pem: config.grpc_tls_ca_cert_pem,
+            quic_insecure: config.quic_insecure,
+            tunnel_protocol: config.tunnel_protocol,
+            auth_token_provider: config.auth_token_provider,
         })
     }
-}
-
-pub struct InferenceServerUpdateChannels {
-    pub status: flume::Sender<InferenceServerStatus>,
-    pub model_stats: flume::Sender<(String, CurrentModelStats)>,
 }

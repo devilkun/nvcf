@@ -41,7 +41,7 @@ const (
 
 // ClusterLister is the SIS subset the collector needs.
 type ClusterLister interface {
-	ListClusters(ctx context.Context, sisURL, ncaID string) ([]client.SISCluster, error)
+	ListClusters(ctx context.Context, sisURL, ncaID string) ([]client.ICMSCluster, error)
 }
 
 // Collector composes status snapshots from SIS + kube data.
@@ -259,7 +259,7 @@ func (c *Collector) collectClusters(ctx context.Context) ([]progress.ClusterRow,
 	return clusters, nil
 }
 
-func (c *Collector) clusterRow(cl client.SISCluster) progress.ClusterRow {
+func (c *Collector) clusterRow(cl client.ICMSCluster) progress.ClusterRow {
 	row := progress.ClusterRow{
 		Name: cl.ClusterName,
 		// GPU/GPUCount/ActiveDeployments/LastSeenAgeSec: not available

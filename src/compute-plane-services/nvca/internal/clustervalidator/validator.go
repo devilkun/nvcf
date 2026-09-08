@@ -44,6 +44,7 @@ type ValidationState struct {
 	GPUOperatorInstalled     bool
 	K8sVersion               string
 	TotalNodes               string
+	ContainerRuntime         string
 	Recommendations          []string
 	Warnings                 []string
 
@@ -65,6 +66,34 @@ type ValidationState struct {
 	// EnforcementCritical is true when the enforcement config has
 	// critical: true, meaning enforcement failure blocks readiness.
 	EnforcementCritical bool
+
+	// EndpointResults captures per-endpoint reachability outcomes for the
+	// summary ConfigMap / metrics pipeline. Keyed by the user-supplied
+	// endpoint name (the same string Prometheus will use as the label
+	// value). Populated by checkConfigurableReachability when a network
+	// check config is loaded; empty otherwise.
+	EndpointResults map[string]EndpointResult
+	// NetpolPairResults captures per-pair NetworkPolicy-coverage outcomes
+	// for the summary ConfigMap / metrics pipeline. Keyed by the
+	// user-supplied pair name. Populated by checkConfigurableNetworkPolicies.
+	NetpolPairResults map[string]NetpolPairResult
+}
+
+// EndpointResult is one row of ValidationState.EndpointResults — the
+// per-endpoint outcome the agent will surface as a Prometheus gauge.
+type EndpointResult struct {
+	Reachable bool
+	Critical  bool
+}
+
+// NetpolPairResult is one row of ValidationState.NetpolPairResults. The
+// fields mirror clustervalidator.PairStatus so buildSummary can convert
+// directly. Directions holds the per-direction, per-policy-side breakdown
+// keyed by NetpolDirectionAToB / NetpolDirectionBToA.
+type NetpolPairResult struct {
+	Passed     bool
+	Critical   bool
+	Directions map[string]DirectionStatus
 }
 
 // Run executes all cluster validation checks and prints a summary.
@@ -74,7 +103,20 @@ type ValidationState struct {
 // configNamespace and configName identify an optional ConfigMap that holds
 // user-defined reachability and network-policy checks. When the ConfigMap
 // does not exist the configurable checks are silently skipped.
-func Run(ctx context.Context, client kubernetes.Interface, configNamespace, configName string) error {
+//
+// summaryNamespace is where the summary ConfigMap is written for the agent to
+// read — kept separate from configNamespace so a config-namespace override
+// can't redirect the summary away from the namespace the agent watches.
+//
+// emitMetrics gates that write. In-cluster runs emit by default; callers pass
+// false for preflight (no agent to read it, no RBAC to write it).
+func Run(
+	ctx context.Context,
+	client kubernetes.Interface,
+	configNamespace, configName, summaryNamespace string,
+	emitMetrics bool,
+) error {
+	startedAt := time.Now()
 	log := core.GetLogger(ctx)
 	log.Info("Starting NVCF cluster validation")
 	log.Info("")
@@ -131,7 +173,21 @@ func Run(ctx context.Context, client kubernetes.Interface, configNamespace, conf
 		}
 	}
 
-	return printSummary(state)
+	summaryErr := printSummary(state)
+
+	// Persist the summary (to summaryNamespace, the agent's watch namespace)
+	// for the agent to publish as metrics. Gated on emitMetrics so preflight
+	// skips it. Best-effort: failures are logged, never block the verdict.
+	verdict := "NVCF-Ready"
+	if summaryErr != nil {
+		verdict = "NVCF-Not-Ready"
+	}
+	if emitMetrics && summaryNamespace != "" {
+		writeSummaryConfigMap(ctx, log, client, summaryNamespace,
+			buildSummary(state, startedAt, summaryErr == nil, verdict))
+	}
+
+	return summaryErr
 }
 
 // printSummary outputs the final validation results and returns an error if
@@ -206,7 +262,7 @@ func printSummary(state *ValidationState) error {
 		checks = append(checks, check{
 			*state.ConfigurableNetPolOK,
 			"Configurable Network Policies: All Checks Passed",
-			"Configurable Network Policies: Some Checks Failed",
+			"Configurable Network Policies: One or more checks failed",
 			isCritical,
 		})
 	}
@@ -252,6 +308,9 @@ func printSummary(state *ValidationState) error {
 		log.Info("Validated Cluster:")
 		printInfo(log, fmt.Sprintf("  Kubernetes Version: %s", state.K8sVersion))
 		printInfo(log, fmt.Sprintf("  Total Nodes: %s", state.TotalNodes))
+		if state.ContainerRuntime != "" {
+			printInfo(log, fmt.Sprintf("  Container Runtime: %s", state.ContainerRuntime))
+		}
 	} else {
 		log.Infof("%s╔═══════════════════════════════════════════════════════════╗%s", colorRed, colorReset)
 		log.Infof("%s║              %s  Cluster is NVCF-Not-Ready  %s              ║%s", colorRed, iconCross, iconCross, colorReset)

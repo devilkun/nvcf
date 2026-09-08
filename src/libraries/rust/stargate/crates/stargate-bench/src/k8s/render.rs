@@ -75,7 +75,7 @@ pub(super) fn render_manifest(render: RenderManifestConfig<'_>) -> RenderedManif
     }
 
     stargate.push_str(&format!(
-        "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: stargate\n  namespace: {stargate_ns}\nspec:\n  selector:\n    app: stargate\n  ports:\n    - name: grpc\n      port: 50071\n      targetPort: grpc\n    - name: reverse\n      port: 50072\n      targetPort: reverse\n      protocol: UDP\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: stargate-http\n  namespace: {stargate_ns}\nspec:\n  type: NodePort\n  selector:\n    app: stargate\n  ports:\n    - name: http\n      port: 8000\n      targetPort: http\n      nodePort: {http_node_port}\n    - name: metrics\n      port: 9090\n      targetPort: metrics\n      nodePort: {metrics_node_port}\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: stargate-headless\n  namespace: {stargate_ns}\nspec:\n  clusterIP: None\n  selector:\n    app: stargate\n  ports:\n    - name: http\n      port: 8000\n      targetPort: http\n    - name: metrics\n      port: 9090\n      targetPort: metrics\n    - name: grpc\n      port: 50071\n      targetPort: grpc\n    - name: reverse\n      port: 50072\n      targetPort: reverse\n      protocol: UDP\n---\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: stargate\n  namespace: {stargate_ns}\nspec:\n  serviceName: stargate-headless\n  replicas: {stargate_count}\n  selector:\n    matchLabels:\n      app: stargate\n  template:\n    metadata:\n      labels:\n        app: stargate\n    spec:\n      containers:\n        - name: stargate\n          image: {stargate_image}\n          imagePullPolicy: IfNotPresent\n          args:\n            - --stargate-id=$(POD_NAME)\n            - --listen-addr=0.0.0.0:50071\n            - --model-discovery-listen-addr=0.0.0.0:50073\n            - --http-listen-addr=0.0.0.0:8000\n            - --advertise-addr=$(POD_IP):50071\n            - --stargate-discovery-dns-name=stargate-headless.{stargate_ns}.svc.cluster.local\n            - --advertised-hostname-template={{pod_name}}-external.{stargate_ns}.svc.cluster.local\n            - --pod-name=$(POD_NAME)\n            - --pod-namespace=$(POD_NAMESPACE)\n            - --metrics-port=9090\n            - --lb-config-path=/config/lb-config.json\n            - --reverse-tunnel-listen-addr=0.0.0.0:50072\n            - --quic-insecure\n            - --tunnel-protocol={tunnel_protocol}\n          env:\n            - name: POD_NAME\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.name\n            - name: POD_NAMESPACE\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.namespace\n            - name: POD_IP\n              valueFrom:\n                fieldRef:\n                  fieldPath: status.podIP\n          ports:\n            - name: grpc\n              containerPort: 50071\n            - name: model-discovery\n              containerPort: 50073\n            - name: reverse\n              containerPort: 50072\n              protocol: UDP\n            - name: http\n              containerPort: 8000\n            - name: metrics\n              containerPort: 9090\n          readinessProbe:\n            httpGet:\n              path: /readyz\n              port: http\n            initialDelaySeconds: 2\n            periodSeconds: 2\n          livenessProbe:\n            httpGet:\n              path: /healthz\n              port: http\n            initialDelaySeconds: 5\n            periodSeconds: 5\n          volumeMounts:\n            - name: lb-config\n              mountPath: /config\n      volumes:\n        - name: lb-config\n          configMap:\n            name: stargate-lb-config\n---\n",
+        "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: stargate\n  namespace: {stargate_ns}\nspec:\n  selector:\n    app: stargate\n  ports:\n    - name: grpc\n      port: 50071\n      targetPort: grpc\n    - name: reverse\n      port: 50072\n      targetPort: reverse\n      protocol: UDP\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: stargate-http\n  namespace: {stargate_ns}\nspec:\n  type: NodePort\n  selector:\n    app: stargate\n  ports:\n    - name: http\n      port: 8000\n      targetPort: http\n      nodePort: {http_node_port}\n    - name: metrics\n      port: 9090\n      targetPort: metrics\n      nodePort: {metrics_node_port}\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: stargate-headless\n  namespace: {stargate_ns}\nspec:\n  clusterIP: None\n  selector:\n    app: stargate\n  ports:\n    - name: http\n      port: 8000\n      targetPort: http\n    - name: metrics\n      port: 9090\n      targetPort: metrics\n    - name: grpc\n      port: 50071\n      targetPort: grpc\n    - name: reverse\n      port: 50072\n      targetPort: reverse\n      protocol: UDP\n---\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: stargate\n  namespace: {stargate_ns}\nspec:\n  serviceName: stargate-headless\n  replicas: {stargate_count}\n  selector:\n    matchLabels:\n      app: stargate\n  template:\n    metadata:\n      labels:\n        app: stargate\n    spec:\n      containers:\n        - name: stargate\n          image: {stargate_image}\n          imagePullPolicy: IfNotPresent\n          args:\n            - --stargate-id=$(POD_NAME)\n            - --listen-addr=0.0.0.0:50071\n            - --model-discovery-listen-addr=0.0.0.0:50073\n            - --http-listen-addr=0.0.0.0:8000\n            - --advertise-addr=$(POD_IP):50071\n            - --stargate-discovery-dns-name=stargate-headless.{stargate_ns}.svc.cluster.local\n            - --advertised-hostname-template={{pod_name}}-external.{stargate_ns}.svc.cluster.local\n            - --pod-name=$(POD_NAME)\n            - --pod-namespace=$(POD_NAMESPACE)\n            - --metrics-port=9090\n            - --lb-config-path=/config/lb-config.json\n            - --backend-connectivity=reverse\n            - --reverse-tunnel-listen-addr=0.0.0.0:50072\n            - --quic-insecure\n            - --tunnel-protocol={tunnel_protocol}\n          env:\n            - name: POD_NAME\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.name\n            - name: POD_NAMESPACE\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.namespace\n            - name: POD_IP\n              valueFrom:\n                fieldRef:\n                  fieldPath: status.podIP\n          ports:\n            - name: grpc\n              containerPort: 50071\n            - name: model-discovery\n              containerPort: 50073\n            - name: reverse\n              containerPort: 50072\n              protocol: UDP\n            - name: http\n              containerPort: 8000\n            - name: metrics\n              containerPort: 9090\n          readinessProbe:\n            httpGet:\n              path: /readyz\n              port: http\n            initialDelaySeconds: 2\n            periodSeconds: 2\n          livenessProbe:\n            httpGet:\n              path: /healthz\n              port: http\n            initialDelaySeconds: 5\n            periodSeconds: 5\n          volumeMounts:\n            - name: lb-config\n              mountPath: /config\n      volumes:\n        - name: lb-config\n          configMap:\n            name: stargate-lb-config\n---\n",
         http_node_port = render.http_node_port,
         metrics_node_port = render.metrics_node_port,
         stargate_count = config.stargates.count,
@@ -126,7 +126,7 @@ pub(super) fn render_manifest(render: RenderManifestConfig<'_>) -> RenderedManif
             ));
         }
         backends.push_str(&format!(
-            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {inference_server_id}-pylon\n  namespace: {backends_ns}\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: {inference_server_id}-pylon\n  template:\n    metadata:\n      labels:\n        app: {inference_server_id}-pylon\n        benchmark.stargate/profile: {profile_name}\n    spec:\n      containers:\n        - name: pylon\n          image: {pylon_image}\n          imagePullPolicy: IfNotPresent\n          args:\n            - --upstream-http-base-url=http://{upstream_backend_name}-http.{backends_ns}.svc.cluster.local:8090\n            - --model-name={model}\n            - --stargate-address=stargate.{stargate_ns}.svc.cluster.local:50071\n            - --inference-server-id={inference_server_id}\n{cluster_id_arg}            - --reverse-tunnel\n            - --quic-insecure\n            - --tunnel-protocol={tunnel_protocol}\n            - --kv-cache-stats-path=/kv-cache/stats\n            - --min-update-interval-ms=100\n            - --disable-bringup\n            - --active-canary-interval-ms=0\n            - --benchmark-fixed-last-mean-input-tps={last_mean_input_tps}\n",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {inference_server_id}-pylon\n  namespace: {backends_ns}\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: {inference_server_id}-pylon\n  template:\n    metadata:\n      labels:\n        app: {inference_server_id}-pylon\n        benchmark.stargate/profile: {profile_name}\n    spec:\n      containers:\n        - name: pylon\n          image: {pylon_image}\n          imagePullPolicy: IfNotPresent\n          args:\n            - --upstream-http-base-url=http://{upstream_backend_name}-http.{backends_ns}.svc.cluster.local:8090\n            - --model-name={model}\n            - --stargate-address=stargate.{stargate_ns}.svc.cluster.local:50071\n            - --inference-server-id={inference_server_id}\n{cluster_id_arg}            - --backend-connectivity=reverse\n            - --quic-insecure\n            - --tunnel-protocol={tunnel_protocol}\n            - --kv-cache-stats-path=/kv-cache/stats\n            - --min-update-interval-ms=100\n            - --disable-bringup\n            - --active-canary-interval-ms=0\n            - --initial-input-tps={last_mean_input_tps}\n            - --benchmark-pin-input-tps\n",
             upstream_backend_name = pylon.upstream_backend_name,
             inference_server_id = pylon.inference_server_id,
             profile_name = pylon.profile_slug,
@@ -147,141 +147,15 @@ fn render_otel_collector(
     backends_ns: &str,
     collector_metrics_node_port: u16,
 ) -> String {
-    r#"apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: otel-collector
-  namespace: __STARGATE_NS__
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: otel-collector-__STARGATE_NS__
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "namespaces", "endpoints", "services"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: otel-collector-__STARGATE_NS__
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: otel-collector-__STARGATE_NS__
-subjects:
-  - kind: ServiceAccount
-    name: otel-collector
-    namespace: __STARGATE_NS__
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: otel-collector-config
-  namespace: __STARGATE_NS__
-data:
-  otel-collector.yaml: |
-    receivers:
-      prometheus:
-        config:
-          scrape_configs:
-            - job_name: stargate
-              scrape_interval: 1s
-              kubernetes_sd_configs:
-                - role: pod
-                  namespaces:
-                    names: ["__STARGATE_NS__"]
-              relabel_configs:
-                - action: keep
-                  source_labels: [__meta_kubernetes_pod_label_app]
-                  regex: stargate
-                - source_labels: [__meta_kubernetes_pod_ip]
-                  target_label: __address__
-                  replacement: $1:9090
-              metric_relabel_configs:
-                - action: keep
-                  source_labels: [__name__]
-                  regex: stargate_requests_total|stargate_proxy_retries_total|stargate_proxy_retry_exhausted_total|stargate_routing_selections_total|stargate_routing_kv_free_token_fallback_selections_total|stargate_proxy_duration_seconds_.+|stargate_routing_duration_seconds_.+|stargate_active_inference_servers
-            - job_name: pylon
-              scrape_interval: 1s
-              kubernetes_sd_configs:
-                - role: pod
-                  namespaces:
-                    names: ["__BACKENDS_NS__"]
-              relabel_configs:
-                - action: keep
-                  source_labels: [__meta_kubernetes_pod_label_app]
-                  regex: backend-.+-pylon
-                - source_labels: [__meta_kubernetes_pod_ip]
-                  target_label: __address__
-                  replacement: $1:9089
-              metric_relabel_configs:
-                - action: keep
-                  source_labels: [__name__]
-                  regex: target_info|pylon_requests_total|pylon_.+
-    exporters:
-      prometheus:
-        endpoint: 0.0.0.0:9464
-    service:
-      pipelines:
-        metrics:
-          receivers: [prometheus]
-          exporters: [prometheus]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: otel-collector
-  namespace: __STARGATE_NS__
-spec:
-  type: NodePort
-  selector:
-    app: otel-collector
-  ports:
-    - name: prometheus
-      port: 9464
-      targetPort: prometheus
-      nodePort: __COLLECTOR_METRICS_NODE_PORT__
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: otel-collector
-  namespace: __STARGATE_NS__
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: otel-collector
-  template:
-    metadata:
-      labels:
-        app: otel-collector
-    spec:
-      serviceAccountName: otel-collector
-      containers:
-        - name: otel-collector
-          image: otel/opentelemetry-collector-contrib:0.111.0
-          imagePullPolicy: IfNotPresent
-          args:
-            - --config=/conf/otel-collector.yaml
-          ports:
-            - name: prometheus
-              containerPort: 9464
-          volumeMounts:
-            - name: config
-              mountPath: /conf
-      volumes:
-        - name: config
-          configMap:
-            name: otel-collector-config
----
-"#
-    .replace("__STARGATE_NS__", stargate_ns)
-    .replace("__BACKENDS_NS__", backends_ns)
-    .replace(
-        "__COLLECTOR_METRICS_NODE_PORT__",
-        &collector_metrics_node_port.to_string(),
-    )
+    let template = include_str!("otel_collector.yaml");
+    let start = template
+        .find("apiVersion: v1\n")
+        .expect("OTEL collector template should contain a Kubernetes manifest");
+    template[start..]
+        .replace("__STARGATE_NS__", stargate_ns)
+        .replace("__BACKENDS_NS__", backends_ns)
+        .replace(
+            "__COLLECTOR_METRICS_NODE_PORT__",
+            &collector_metrics_node_port.to_string(),
+        )
 }

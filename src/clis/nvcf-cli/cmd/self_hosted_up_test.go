@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -62,11 +63,15 @@ func resetUpFlags(t *testing.T) {
 	selfHostedUpCmd.SetContext(nil)
 	prevFinalHealth := waitForComputePlaneHealth
 	prevCurrentKubeContext := selfHostedUpCurrentKubeContext
+	prevFetchRootCA := fetchControlPlaneRootCAPEM
 	waitForComputePlaneHealth = func(context.Context, computePlaneHealthRequest) (computePlaneHealthResult, error) {
 		return computePlaneHealthResult{BackendHealth: "healthy"}, nil
 	}
 	selfHostedUpCurrentKubeContext = func() (string, error) {
 		return "k3d-ncp-local", nil
+	}
+	fetchControlPlaneRootCAPEM = func(context.Context, string) (string, error) {
+		return "", nil
 	}
 	t.Cleanup(func() {
 		upClusterName = ""
@@ -84,6 +89,7 @@ func resetUpFlags(t *testing.T) {
 		selfHostedUpCmd.SetContext(nil)
 		waitForComputePlaneHealth = prevFinalHealth
 		selfHostedUpCurrentKubeContext = prevCurrentKubeContext
+		fetchControlPlaneRootCAPEM = prevFetchRootCA
 	})
 }
 
@@ -202,17 +208,22 @@ func TestSelfHostedUp_PlainEmitsPhaseLines(t *testing.T) {
 		return "https://k8s.example/.well-known/oidc", `{"keys":[]}`, "psat", nil
 	}
 
-	// Provide a stack tree + a fake helmfile binary that emits a stub
-	// manifest. The helmfile binary is invoked twice: once for control plane
-	// (helmfile.d/ default) and once for compute plane.
-	stackDir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(stackDir, "helmfile.d"), 0o755))
-	require.NoError(t, os.MkdirAll(filepath.Join(stackDir, "out"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(stackDir, "global.yaml.gotmpl"), []byte("# stub\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(stackDir, "out", "test-register-values.yaml"), []byte("clusterID: stale-id\n"), 0o644))
+	// Provide separate custom stack trees so the test proves compute-plane
+	// environment values are derived from the resolved compute stack.
+	controlPlaneStackDir := t.TempDir()
+	computePlaneStackDir := t.TempDir()
+	for _, stackDir := range []string{controlPlaneStackDir, computePlaneStackDir} {
+		require.NoError(t, os.MkdirAll(filepath.Join(stackDir, "helmfile.d"), 0o755))
+		require.NoError(t, os.MkdirAll(filepath.Join(stackDir, "out"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(stackDir, "global.yaml.gotmpl"), []byte("# stub\n"), 0o644))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(computePlaneStackDir, "out", "test-register-values.yaml"), []byte("clusterID: stale-id\n"), 0o644))
+	helmfileLog := filepath.Join(t.TempDir(), "helmfile.log")
+	t.Setenv("NVCF_TEST_HELMFILE_LOG", helmfileLog)
+	t.Setenv("OUTPUT_DIR", "")
 	fakeBin := filepath.Join(t.TempDir(), "helmfile")
 	require.NoError(t, os.WriteFile(fakeBin,
-		[]byte("#!/bin/sh\nprintf 'apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: stub\\n'\n"),
+		[]byte("#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"$OUTPUT_DIR\" >> \"$NVCF_TEST_HELMFILE_LOG\"\nprintf 'apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: stub\\n'\n"),
 		0o755))
 	t.Setenv("PATH", filepath.Dir(fakeBin)+":"+os.Getenv("PATH"))
 
@@ -232,7 +243,8 @@ func TestSelfHostedUp_PlainEmitsPhaseLines(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "up",
 		"--cluster-name=test",
-		"--stack", stackDir,
+		"--control-plane-stack", controlPlaneStackDir,
+		"--compute-plane-stack", computePlaneStackDir,
 		"--plain",
 	})
 	require.NoError(t, rootCmd.Execute())
@@ -246,7 +258,7 @@ func TestSelfHostedUp_PlainEmitsPhaseLines(t *testing.T) {
 	assert.Regexp(t, `\[03/8\] render-cp: starting`, out)
 	assert.Regexp(t, `\[04/8\] apply-cp: starting`, out)
 	assert.Regexp(t, `\[04/8\] apply-cp: complete`, out)
-	profilePath := filepath.Join(stackDir, "out", "control-plane-profile.yaml")
+	profilePath := filepath.Join(controlPlaneStackDir, "out", "control-plane-profile.yaml")
 	assert.Contains(t, out, "Wrote control-plane profile: "+profilePath)
 	assert.Regexp(t, `\[05/8\] check-cp: starting`, out)
 	assert.Regexp(t, `\[06/8\] register: starting`, out)
@@ -273,11 +285,19 @@ func TestSelfHostedUp_PlainEmitsPhaseLines(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(profileBody), "kind: ControlPlaneProfile")
 	assert.Contains(t, string(profileBody), "clusterName: test")
-	registerValues, err := os.ReadFile(filepath.Join(stackDir, "out", "test-register-values.yaml"))
+	registerValues, err := os.ReadFile(filepath.Join(computePlaneStackDir, "out", "test-register-values.yaml"))
 	require.NoError(t, err)
 	assert.Contains(t, string(registerValues), "icmsServiceURL: http://api.sis.svc.cluster.local:8080")
 	assert.Contains(t, string(registerValues), "revalServiceURL: http://reval.nvcf.svc.cluster.local:8080")
 	assert.Contains(t, string(registerValues), "natsURL: nats://nats.nats-system.svc.cluster.local:4222")
+	helmfileInvocations, err := os.ReadFile(helmfileLog)
+	require.NoError(t, err)
+	invocations := strings.Split(strings.TrimSpace(string(helmfileInvocations)), "\n")
+	require.Len(t, invocations, 2)
+	assert.Contains(t, invocations[0], controlPlaneStackDir+"/helmfile.d/")
+	assert.True(t, strings.HasSuffix(invocations[0], "|"), "control-plane Helmfile must not receive OUTPUT_DIR: %s", invocations[0])
+	assert.Contains(t, invocations[1], computePlaneStackDir+"/helmfile.d/")
+	assert.True(t, strings.HasSuffix(invocations[1], "|"+filepath.Join(computePlaneStackDir, "out")), "compute-plane Helmfile must receive its stack-local OUTPUT_DIR: %s", invocations[1])
 }
 
 // TestUp_PlanOnly_NoHelmfileInvocation runs the orchestrator with --plan-only
@@ -331,7 +351,8 @@ func TestUp_PlanOnly_NoHelmfileInvocation(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "up",
 		"--cluster-name=test",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--plan-only",
 		"--json",
 	})
@@ -431,7 +452,8 @@ func TestUp_FailureEvent_HasCategoryAndRemediation(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "up",
 		"--cluster-name=test",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--json",
 	})
 
@@ -534,7 +556,8 @@ func TestUp_SIGTERM_EmitsCancellation(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "up",
 		"--cluster-name=test",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--json",
 	})
 
@@ -630,7 +653,8 @@ func TestSelfHostedUp_RejectsNonLocalEnvBeforePreflight(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "up",
 		"--cluster-name=test",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--env=prd",
 		"--plain",
 	})
@@ -679,7 +703,8 @@ func TestSelfHostedUp_RejectsSplitClusterModeBeforePreflight(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "up",
 		"--cluster-name=test",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--control-plane-context=cp",
 		"--compute-plane-context=gpu1",
 		"--icms-url=http://sis.example.test",
@@ -726,7 +751,8 @@ func TestSelfHostedUp_RejectsNonK3DContextBeforePreflight(t *testing.T) {
 	rootCmd.SetArgs([]string{
 		"self-hosted", "up",
 		"--cluster-name=test",
-		"--stack", stackDir,
+		"--control-plane-stack", stackDir,
+		"--compute-plane-stack", stackDir,
 		"--plain",
 	})
 
@@ -821,12 +847,6 @@ func TestAuthGate_RefreshTokenForcesReMint(t *testing.T) {
 		selfHostedRefreshToken = false
 		selfHostedToken = ""
 	})
-
-	// Force the TTY seam to true so the non-interactive gate does not short-circuit
-	// before reaching the init path under test.
-	prevTTY := stdinIsTerminal
-	t.Cleanup(func() { stdinIsTerminal = prevTTY })
-	stdinIsTerminal = func() bool { return true }
 
 	// Stub client.LoadConfig by patching the seam at authGatePhase5 level:
 	// inject baseHTTPURL via env so the real LoadConfig returns our server URL.
@@ -944,12 +964,6 @@ func TestAuthGate_FingerprintMismatchReMints(t *testing.T) {
 		selfHostedToken = ""
 	})
 
-	// Force the TTY seam to true so the non-interactive gate does not short-circuit
-	// before reaching the init path under test.
-	prevTTY := stdinIsTerminal
-	t.Cleanup(func() { stdinIsTerminal = prevTTY })
-	stdinIsTerminal = func() bool { return true }
-
 	t.Setenv("NVCF_BASE_HTTP_URL", srv.URL)
 
 	var sink progress.EventSink = nullSink{}
@@ -958,10 +972,10 @@ func TestAuthGate_FingerprintMismatchReMints(t *testing.T) {
 	assert.Equal(t, 1, initCalled, "init must be called when fingerprint has changed (key rotation)")
 }
 
-// TestAuthGate_NonInteractiveExitsCleanly verifies that --non-interactive bails
-// out with a clear error rather than letting `nvcf-cli init` block on a stdin
-// read in CI. REQ-8.
-func TestAuthGate_NonInteractiveExitsCleanly(t *testing.T) {
+// TestAuthGate_NonInteractiveAttemptsInit verifies that --non-interactive still
+// attempts the admin-token mint. The init path calls the API Keys admin route
+// directly, so CI/headless callers should not fail before the API call is tried.
+func TestAuthGate_NonInteractiveAttemptsInit(t *testing.T) {
 	srv := newTestFingerprintServer(t, "key-x")
 
 	stateDir := t.TempDir()
@@ -992,24 +1006,18 @@ func TestAuthGate_NonInteractiveExitsCleanly(t *testing.T) {
 		selfHostedToken = ""
 	})
 
-	// TTY=true so the only reason to bail is --non-interactive.
-	prevTTY := stdinIsTerminal
-	t.Cleanup(func() { stdinIsTerminal = prevTTY })
-	stdinIsTerminal = func() bool { return true }
-
 	t.Setenv("NVCF_BASE_HTTP_URL", srv.URL)
 
 	var sink progress.EventSink = nullSink{}
 	err := authGatePhase5(context.Background(), sink, time.Now())
-	require.Error(t, err, "auth gate must error under --non-interactive when no cached token")
-	assert.Contains(t, err.Error(), "non-interactive")
-	assert.Equal(t, 0, initCalled, "runSelfHostedInit must NOT be invoked under --non-interactive")
+	require.NoError(t, err, "auth gate must try init under --non-interactive when no cached token")
+	assert.Equal(t, 1, initCalled, "runSelfHostedInit must be invoked under --non-interactive")
 }
 
-// TestAuthGate_NonTTYExitsCleanly verifies that piped (non-TTY) stdin bails
-// out the same way as --non-interactive, since `nvcf-cli init` cannot prompt.
-// REQ-8.
-func TestAuthGate_NonTTYExitsCleanly(t *testing.T) {
+// TestAuthGate_NonTTYAttemptsInit verifies that piped (non-TTY) stdin still
+// attempts the admin-token mint. The init path does not need stdin when the
+// self-hosted API Keys admin route is reachable.
+func TestAuthGate_NonTTYAttemptsInit(t *testing.T) {
 	srv := newTestFingerprintServer(t, "key-y")
 
 	stateDir := t.TempDir()
@@ -1040,18 +1048,12 @@ func TestAuthGate_NonTTYExitsCleanly(t *testing.T) {
 		selfHostedToken = ""
 	})
 
-	// Simulate piped/non-TTY stdin; --non-interactive is not set.
-	prevTTY := stdinIsTerminal
-	t.Cleanup(func() { stdinIsTerminal = prevTTY })
-	stdinIsTerminal = func() bool { return false }
-
 	t.Setenv("NVCF_BASE_HTTP_URL", srv.URL)
 
 	var sink progress.EventSink = nullSink{}
 	err := authGatePhase5(context.Background(), sink, time.Now())
-	require.Error(t, err, "auth gate must error under non-TTY stdin when no cached token")
-	assert.Contains(t, err.Error(), "TTY")
-	assert.Equal(t, 0, initCalled, "runSelfHostedInit must NOT be invoked when stdin is not a TTY")
+	require.NoError(t, err, "auth gate must try init under non-TTY stdin when no cached token")
+	assert.Equal(t, 1, initCalled, "runSelfHostedInit must be invoked when stdin is not a TTY")
 }
 
 // recordingSink captures every progress event for later assertions. Used by
@@ -1400,6 +1402,288 @@ func TestNamespacePodsReadySkipsTerminalPods(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ready)
 	assert.Empty(t, reason)
+}
+
+// sequencedClusterClient is a test double for selfhosted.ClusterClient that
+// returns a programmable sequence of (response, error) pairs from
+// RegisterCluster. It is used to drive the SRD §9.4 401-retry tests.
+type sequencedClusterClient struct {
+	registerCalls   int
+	registerResults []sequencedRegisterResult
+	lastRequest     selfhosted.RegisterRequest
+}
+
+type sequencedRegisterResult struct {
+	resp *selfhosted.RegisterResponse
+	err  error
+}
+
+func (s *sequencedClusterClient) RegisterCluster(_ context.Context, req selfhosted.RegisterRequest) (*selfhosted.RegisterResponse, error) {
+	s.lastRequest = req
+	idx := s.registerCalls
+	s.registerCalls++
+	if idx >= len(s.registerResults) {
+		return nil, fmt.Errorf("sequencedClusterClient: no result for call %d", idx)
+	}
+	r := s.registerResults[idx]
+	return r.resp, r.err
+}
+
+func (s *sequencedClusterClient) DeleteClusterByName(_ context.Context, _, _ string) (int, error) {
+	return 0, nil
+}
+
+func (s *sequencedClusterClient) DeleteCluster(_ context.Context, _ string) error { return nil }
+
+func (s *sequencedClusterClient) Close() error { return nil }
+
+// newRegisterRetryRun builds a minimal selfHostedUpRun suitable for exercising
+// registerClusterWithRetry directly. The sink discards events and ctx is fresh.
+func newRegisterRetryRun() *selfHostedUpRun {
+	return &selfHostedUpRun{
+		ctx:  context.Background(),
+		sink: nullSink{},
+	}
+}
+
+// TestIsHTTP401Err covers the message shapes the SIS client emits on 401 so
+// future client refactors that change the wrapping format trip this guard.
+func TestIsHTTP401Err(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"sis api error format", errors.New("SIS API error 401: unauthorized"), true},
+		{"wrapped sis api error", fmt.Errorf("cluster register: %w", errors.New("SIS API error 401: unauthorized")), true},
+		{"http prefix", errors.New("HTTP 401 unauthorized"), true},
+		{"status prefix", errors.New("status 401"), true},
+		{"403 not 401", errors.New("SIS API error 403: forbidden"), false},
+		{"500 not 401", errors.New("SIS API error 500: internal"), false},
+		{"generic without code", errors.New("connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isHTTP401Err(tc.err))
+		})
+	}
+}
+
+// TestRegisterClusterWithRetry_First401AutoRecoverySucceeds verifies the
+// SRD §9.4 happy path: when SIS returns 401 on the first attempt, the
+// orchestrator clears the cached token, runs init to re-mint, and retries
+// the register call. The second attempt succeeds and the response is returned.
+func TestRegisterClusterWithRetry_First401AutoRecoverySucceeds(t *testing.T) {
+	// Persist a token so we can observe ClearTokens running.
+	stateDir := t.TempDir()
+	t.Setenv("HOME", stateDir)
+	sm := state.NewStateManager()
+	require.NoError(t, sm.Load())
+	s := sm.GetState()
+	s.Token = "stale-token"
+	s.TokenExpiration = time.Now().Add(time.Hour)
+	s.SelfHostedAuth = &state.SelfHostedAuth{
+		Token:     "stale-token",
+		ExpiresAt: time.Now().Add(time.Hour),
+		Fingerprint: &state.FingerprintRef{
+			IssuerURL:       "https://cp.test",
+			JWKSKid:         "key-1",
+			APIKeysEndpoint: "https://cp.test/api-keys",
+		},
+	}
+	require.NoError(t, sm.Save())
+
+	selfHostedToken = ""
+	t.Cleanup(func() { selfHostedToken = "" })
+
+	initCalls := 0
+	prevInit := runSelfHostedInit
+	t.Cleanup(func() { runSelfHostedInit = prevInit })
+	runSelfHostedInit = func(context.Context) error {
+		initCalls++
+		return nil
+	}
+
+	cc := &sequencedClusterClient{
+		registerResults: []sequencedRegisterResult{
+			{nil, errors.New("SIS API error 401: token revoked")},
+			{&selfhosted.RegisterResponse{ClusterID: "cid-ok", ClusterGroupID: "grp-ok"}, nil},
+		},
+	}
+	prevClientFactory := newClusterClientForSelfHosted
+	t.Cleanup(func() { newClusterClientForSelfHosted = prevClientFactory })
+	newClusterClientForSelfHosted = func(string) (selfhosted.ClusterClient, error) {
+		return cc, nil
+	}
+
+	resp, err := newRegisterRetryRun().registerClusterWithRetry(cc, selfhosted.RegisterRequest{ClusterName: "test"})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "cid-ok", resp.ClusterID)
+	assert.Equal(t, 2, cc.registerCalls, "register must be retried exactly once after 401")
+	assert.Equal(t, 1, initCalls, "runSelfHostedInit must be invoked once between attempts")
+
+	// ClearTokens must have run: Token field is empty but SelfHostedAuth
+	// fingerprint is preserved.
+	sm2 := state.NewStateManager()
+	require.NoError(t, sm2.Load())
+	s2 := sm2.GetState()
+	assert.Empty(t, s2.Token, "cached Token must be cleared")
+	require.NotNil(t, s2.SelfHostedAuth)
+	require.NotNil(t, s2.SelfHostedAuth.Fingerprint)
+	assert.Equal(t, "key-1", s2.SelfHostedAuth.Fingerprint.JWKSKid, "fingerprint must be preserved across ClearTokens")
+}
+
+func TestRegisterClusterWithRetry_RebuildsClusterClientAfterRemint(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("HOME", stateDir)
+
+	selfHostedToken = ""
+	t.Cleanup(func() { selfHostedToken = "" })
+
+	selfHostedICMSURL = "https://icms.example"
+	t.Cleanup(func() { selfHostedICMSURL = "" })
+
+	initCalls := 0
+	prevInit := runSelfHostedInit
+	t.Cleanup(func() { runSelfHostedInit = prevInit })
+	runSelfHostedInit = func(context.Context) error {
+		initCalls++
+		return nil
+	}
+
+	initialCC := &sequencedClusterClient{
+		registerResults: []sequencedRegisterResult{
+			{nil, errors.New("SIS API error 401: token expired")},
+			{nil, errors.New("stale client reused")},
+		},
+	}
+	retryCC := &sequencedClusterClient{
+		registerResults: []sequencedRegisterResult{
+			{&selfhosted.RegisterResponse{ClusterID: "cid-fresh", ClusterGroupID: "grp-fresh"}, nil},
+		},
+	}
+
+	factoryCalls := 0
+	prevClientFactory := newClusterClientForSelfHosted
+	t.Cleanup(func() { newClusterClientForSelfHosted = prevClientFactory })
+	newClusterClientForSelfHosted = func(icmsURL string) (selfhosted.ClusterClient, error) {
+		factoryCalls++
+		assert.Equal(t, selfHostedICMSURL, icmsURL)
+		return retryCC, nil
+	}
+
+	resp, err := newRegisterRetryRun().registerClusterWithRetry(initialCC, selfhosted.RegisterRequest{ClusterName: "test"})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "cid-fresh", resp.ClusterID)
+	assert.Equal(t, 1, initCalls, "runSelfHostedInit must be invoked once before rebuilding the client")
+	assert.Equal(t, 1, factoryCalls, "retry must rebuild the client so it can read the reminted credential")
+	assert.Equal(t, 1, initialCC.registerCalls, "stale client must not be reused after remint")
+	assert.Equal(t, 1, retryCC.registerCalls, "fresh client must perform the retry")
+}
+
+// TestRegisterClusterWithRetry_Second401IsTerminal verifies that a 401 on the
+// retry attempt is propagated to the caller (so the existing phase_failed
+// emission path runs) and that no third attempt is made.
+func TestRegisterClusterWithRetry_Second401IsTerminal(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("HOME", stateDir)
+
+	selfHostedToken = ""
+	t.Cleanup(func() { selfHostedToken = "" })
+
+	initCalls := 0
+	prevInit := runSelfHostedInit
+	t.Cleanup(func() { runSelfHostedInit = prevInit })
+	runSelfHostedInit = func(context.Context) error {
+		initCalls++
+		return nil
+	}
+
+	cc := &sequencedClusterClient{
+		registerResults: []sequencedRegisterResult{
+			{nil, errors.New("SIS API error 401: unauthorized")},
+			{nil, errors.New("SIS API error 401: still unauthorized")},
+		},
+	}
+	prevClientFactory := newClusterClientForSelfHosted
+	t.Cleanup(func() { newClusterClientForSelfHosted = prevClientFactory })
+	newClusterClientForSelfHosted = func(string) (selfhosted.ClusterClient, error) {
+		return cc, nil
+	}
+
+	resp, err := newRegisterRetryRun().registerClusterWithRetry(cc, selfhosted.RegisterRequest{ClusterName: "test"})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "401", "second 401 must surface to caller")
+	assert.Equal(t, 2, cc.registerCalls, "exactly two register attempts on persistent 401 (no infinite loop)")
+	assert.Equal(t, 1, initCalls, "init must run exactly once between attempts")
+}
+
+// TestRegisterClusterWithRetry_TokenFlagSkipsRetry verifies that when the
+// operator supplied --token=$JWT, a 401 surfaces immediately as a hard
+// failure and no init/remint is invoked. The operator's explicit token must
+// not be silently invalidated by an auto-remint.
+func TestRegisterClusterWithRetry_TokenFlagSkipsRetry(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("HOME", stateDir)
+
+	selfHostedToken = "operator-supplied-jwt"
+	t.Cleanup(func() { selfHostedToken = "" })
+
+	initCalls := 0
+	prevInit := runSelfHostedInit
+	t.Cleanup(func() { runSelfHostedInit = prevInit })
+	runSelfHostedInit = func(context.Context) error {
+		initCalls++
+		return nil
+	}
+
+	cc := &sequencedClusterClient{
+		registerResults: []sequencedRegisterResult{
+			{nil, errors.New("SIS API error 401: unauthorized")},
+		},
+	}
+
+	resp, err := newRegisterRetryRun().registerClusterWithRetry(cc, selfhosted.RegisterRequest{ClusterName: "test"})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Equal(t, 1, cc.registerCalls, "no retry when --token is supplied")
+	assert.Equal(t, 0, initCalls, "init must not run when operator supplied an explicit token")
+}
+
+// TestRegisterClusterWithRetry_NonAuthErrorIsNotRetried verifies that non-401
+// errors (e.g. 5xx, 409, network errors) propagate to the caller on the first
+// attempt without triggering a retry — the auth-gate contract is 401-only.
+func TestRegisterClusterWithRetry_NonAuthErrorIsNotRetried(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("HOME", stateDir)
+
+	selfHostedToken = ""
+	t.Cleanup(func() { selfHostedToken = "" })
+
+	initCalls := 0
+	prevInit := runSelfHostedInit
+	t.Cleanup(func() { runSelfHostedInit = prevInit })
+	runSelfHostedInit = func(context.Context) error {
+		initCalls++
+		return nil
+	}
+
+	cc := &sequencedClusterClient{
+		registerResults: []sequencedRegisterResult{
+			{nil, errors.New("SIS API error 500: internal server error")},
+		},
+	}
+
+	resp, err := newRegisterRetryRun().registerClusterWithRetry(cc, selfhosted.RegisterRequest{ClusterName: "test"})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "500")
+	assert.Equal(t, 1, cc.registerCalls, "non-401 errors must not trigger a retry")
+	assert.Equal(t, 0, initCalls, "init must not run for non-401 errors")
 }
 
 func TestEnsureNamespaceWaitsForTerminatingNamespaceBeforeRecreate(t *testing.T) {

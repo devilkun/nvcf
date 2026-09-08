@@ -20,17 +20,15 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use futures::future;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use quinn::Endpoint;
 use stargate_protocol::TunnelTransportProtocol;
-use tokio::sync::{Semaphore, oneshot};
 
-use super::summary::summarize_samples;
-use super::tls::{SERVER_NAME, client_endpoint, connect_quic, server_config};
-use super::trials::{collect_samples, duration_us};
+use super::tls::{SERVER_NAME, client_endpoint, connect_quic};
+use super::trials::{ResponseMeasurement, benchmark_requests, duration_us, request_headers};
 use super::{
-    PayloadShape, RequestSample, RunningServer, SERVER_SHUTDOWN_TIMEOUT, TransportBenchConfig,
-    TransportKind, TransportRunOutcome,
+    PayloadShape, SERVER_SHUTDOWN_TIMEOUT, TransportBenchConfig, TransportKind,
+    TransportRunOutcome, start_quic_server,
 };
 
 const WEBTRANSPORT_TUNNEL_PATH: &str = "/_stargate/webtransport";
@@ -38,14 +36,12 @@ const WEBTRANSPORT_TUNNEL_PATH: &str = "/_stargate/webtransport";
 type H3ClientBidiStream = <h3_quinn::OpenStreams as h3::quic::OpenStreams<Bytes>>::BidiStream;
 type H3ClientRequestStream = h3::client::RequestStream<H3ClientBidiStream, Bytes>;
 #[derive(Clone)]
-struct WebTransportRequestConnection {
-    connection_index: usize,
+struct WebTransportSession {
     connection: quinn::Connection,
     bidi_header: Bytes,
 }
 
 struct WebTransportBenchmarkClient {
-    endpoint: Endpoint,
     connection: quinn::Connection,
     send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     connect_stream: H3ClientRequestStream,
@@ -57,97 +53,42 @@ pub(super) async fn run_webtransport_h3_quinn(
     shape: PayloadShape,
     trial_index: usize,
 ) -> Result<TransportRunOutcome> {
-    let server = start_webtransport_server(config, shape.response_chunks.clone()).await?;
-    let clients = connect_webtransport_clients(config, server.addr, &server.cert_pem).await?;
-    let request_connections = Arc::new(
+    let server = start_quic_server(
+        config,
+        TunnelTransportProtocol::WebTransport,
+        shape.response_chunks.clone(),
+        "bind WebTransport QUIC server",
+        "read WebTransport server addr",
+        handle_webtransport_connection,
+    )?;
+    let (endpoint, clients) =
+        connect_webtransport_clients(config, server.addr, &server.cert_pem).await?;
+    let sessions = Arc::new(
         clients
             .iter()
-            .enumerate()
-            .map(|(connection_index, client)| WebTransportRequestConnection {
-                connection_index,
+            .map(|client| WebTransportSession {
                 connection: client.connection.clone(),
                 bidi_header: client.bidi_header.clone(),
             })
             .collect::<Vec<_>>(),
     );
-
-    if config.warmup_requests > 0 {
-        let _ = drive_webtransport_requests(
-            request_connections.clone(),
-            shape.clone(),
-            config.warmup_requests,
-            config.concurrency,
-        )
-        .await?;
-    }
-
-    let started_at = Instant::now();
-    let samples = drive_webtransport_requests(
-        request_connections,
-        shape.clone(),
-        config.request_count,
-        config.concurrency,
+    let outcome = benchmark_requests(
+        config,
+        TransportKind::WebTransportH3Quinn,
+        trial_index,
+        shape,
+        move |request_index, connection_index, shape| {
+            let session = sessions[connection_index].clone();
+            move |started_at| {
+                execute_webtransport_request(session, shape, request_index, started_at)
+            }
+        },
     )
     .await?;
-    let measured_duration = started_at.elapsed();
 
-    close_webtransport_clients(clients).await;
+    close_webtransport_clients(endpoint, clients).await;
     server.shutdown().await?;
-
-    let summary = summarize_samples(
-        TransportKind::WebTransportH3Quinn,
-        &samples,
-        measured_duration,
-    );
-    Ok(TransportRunOutcome {
-        transport: TransportKind::WebTransportH3Quinn,
-        trial_index,
-        summary,
-        samples,
-    })
-}
-
-async fn start_webtransport_server(
-    config: TransportBenchConfig,
-    response_chunks: Arc<Vec<Bytes>>,
-) -> Result<RunningServer> {
-    let generated = server_config(
-        config,
-        TunnelTransportProtocol::WebTransport.alpn_protocols(),
-    )?;
-    let endpoint = Endpoint::server(generated.server_config, "127.0.0.1:0".parse()?)
-        .context("bind WebTransport QUIC server")?;
-    let addr = endpoint
-        .local_addr()
-        .context("read WebTransport server addr")?;
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                incoming = endpoint.accept() => {
-                    let Some(incoming) = incoming else { break };
-                    let response_chunks = response_chunks.clone();
-                    let config = config;
-                    tokio::spawn(async move {
-                        if let Ok(connection) = incoming.await {
-                            let _ = handle_webtransport_connection(connection, config, response_chunks).await;
-                        }
-                    });
-                }
-            }
-        }
-        endpoint.close(0_u32.into(), b"benchmark shutdown");
-        endpoint.wait_idle().await;
-        Ok(())
-    });
-
-    Ok(RunningServer {
-        addr,
-        cert_pem: generated.cert_pem,
-        shutdown_tx,
-        task,
-    })
+    Ok(outcome)
 }
 
 async fn handle_webtransport_connection(
@@ -155,17 +96,16 @@ async fn handle_webtransport_connection(
     config: TransportBenchConfig,
     response_chunks: Arc<Vec<Bytes>>,
 ) -> Result<()> {
-    let mut builder = h3::server::builder();
-    builder
-        .send_grease(config.http3_send_grease)
-        .enable_webtransport(true)
-        .enable_extended_connect(true)
-        .enable_datagram(true)
-        .max_webtransport_sessions(1);
-    let mut h3_connection: h3::server::Connection<h3_quinn::Connection, Bytes> = builder
-        .build(h3_quinn::Connection::new(connection.clone()))
-        .await
-        .map_err(|error| anyhow!("create WebTransport h3 server connection: {error:?}"))?;
+    let mut h3_connection: h3::server::Connection<h3_quinn::Connection, Bytes> =
+        h3::server::builder()
+            .send_grease(config.http3_send_grease)
+            .enable_webtransport(true)
+            .enable_extended_connect(true)
+            .enable_datagram(true)
+            .max_webtransport_sessions(1)
+            .build(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .map_err(|error| anyhow!("create WebTransport h3 server connection: {error:?}"))?;
     let Some(resolver) = h3_connection
         .accept()
         .await
@@ -177,14 +117,11 @@ async fn handle_webtransport_connection(
         .resolve_request()
         .await
         .map_err(|error| anyhow!("resolve WebTransport CONNECT: {error:?}"))?;
-    let is_webtransport = request
-        .extensions()
-        .get::<h3::ext::Protocol>()
-        .is_some_and(|protocol| *protocol == h3::ext::Protocol::WEB_TRANSPORT);
     ensure!(
         request.method() == Method::CONNECT
             && request.uri().path() == WEBTRANSPORT_TUNNEL_PATH
-            && is_webtransport,
+            && request.extensions().get::<h3::ext::Protocol>()
+                == Some(&h3::ext::Protocol::WEB_TRANSPORT),
         "invalid WebTransport CONNECT request"
     );
     let session_id = connect_stream.id().into_inner();
@@ -242,14 +179,12 @@ async fn handle_webtransport_http_benchmark_stream(
         .is_some()
     {}
 
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
     let response_head = stargate_protocol::WebTransportHttpResponseHead {
         status: StatusCode::OK,
-        headers: response_headers,
+        headers: HeaderMap::from_iter([(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )]),
     };
     stargate_protocol::write_webtransport_http_response_head(&mut quinn_send, &response_head)
         .await
@@ -268,7 +203,7 @@ async fn connect_webtransport_clients(
     config: TransportBenchConfig,
     addr: SocketAddr,
     server_cert_pem: &[u8],
-) -> Result<Vec<WebTransportBenchmarkClient>> {
+) -> Result<(Endpoint, Vec<WebTransportBenchmarkClient>)> {
     let endpoint = client_endpoint(
         config,
         TunnelTransportProtocol::WebTransport.alpn_protocols(),
@@ -277,27 +212,23 @@ async fn connect_webtransport_clients(
     let mut clients = Vec::with_capacity(config.quic_connections);
     for _ in 0..config.quic_connections {
         let connection = connect_quic(&endpoint, addr).await?;
-        let mut builder = h3::client::builder();
-        builder
-            .send_grease(config.http3_send_grease)
-            .enable_extended_connect(true)
-            .enable_datagram(true);
         let (mut driver, mut send_request): (
             h3::client::Connection<h3_quinn::Connection, Bytes>,
             h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-        ) = builder
+        ) = h3::client::builder()
+            .send_grease(config.http3_send_grease)
+            .enable_extended_connect(true)
+            .enable_datagram(true)
             .build(h3_quinn::Connection::new(connection.clone()))
             .await
             .map_err(|error| anyhow!("create WebTransport h3 client: {error:?}"))?;
         let driver_task = tokio::spawn(async move {
             let error = future::poll_fn(|cx| driver.poll_close(cx)).await;
-            if error.is_h3_no_error() {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "WebTransport h3 client connection closed: {error:?}"
-                ))
-            }
+            ensure!(
+                error.is_h3_no_error(),
+                "WebTransport h3 client connection closed: {error:?}"
+            );
+            Ok(())
         });
 
         let mut request = Request::builder()
@@ -331,7 +262,6 @@ async fn connect_webtransport_clients(
             .to_bytes();
 
         clients.push(WebTransportBenchmarkClient {
-            endpoint: endpoint.clone(),
             connection,
             send_request,
             connect_stream,
@@ -339,11 +269,10 @@ async fn connect_webtransport_clients(
             driver_task,
         });
     }
-    Ok(clients)
+    Ok((endpoint, clients))
 }
 
-async fn close_webtransport_clients(clients: Vec<WebTransportBenchmarkClient>) {
-    let endpoint = clients.first().map(|client| client.endpoint.clone());
+async fn close_webtransport_clients(endpoint: Endpoint, clients: Vec<WebTransportBenchmarkClient>) {
     for mut client in clients {
         // Drop the CONNECT stream and final request sender before closing QUIC so the H3 driver can drain shutdown.
         drop(client.connect_stream);
@@ -356,136 +285,52 @@ async fn close_webtransport_clients(clients: Vec<WebTransportBenchmarkClient>) {
             client.driver_task.abort();
         }
     }
-    if let Some(endpoint) = endpoint {
-        endpoint.wait_idle().await;
-    }
-}
-
-async fn drive_webtransport_requests(
-    connections: Arc<Vec<WebTransportRequestConnection>>,
-    shape: PayloadShape,
-    request_count: usize,
-    concurrency: usize,
-) -> Result<Vec<RequestSample>> {
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks = Vec::with_capacity(request_count);
-    for request_index in 0..request_count {
-        let request_connection = connections[request_index % connections.len()].clone();
-        let shape = shape.clone();
-        let semaphore = semaphore.clone();
-        tasks.push(tokio::spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("semaphore should remain open");
-            execute_webtransport_request(request_connection, shape, request_index).await
-        }));
-    }
-    collect_samples(tasks).await
+    endpoint.wait_idle().await;
 }
 
 async fn execute_webtransport_request(
-    request_connection: WebTransportRequestConnection,
+    session: WebTransportSession,
     shape: PayloadShape,
     request_index: usize,
-) -> RequestSample {
-    let started_at = Instant::now();
-    let result = async {
-        let (quinn_send, quinn_recv) = request_connection
-            .connection
-            .open_bi()
-            .await
-            .context("open WebTransport request stream")?;
-        let mut quinn_send = quinn_send;
-        let mut quinn_recv = quinn_recv;
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("x-request-id"),
-            HeaderValue::from_str(&format!("transport-bench-{request_index}"))
-                .context("build request id")?,
-        );
-        headers.insert(
-            HeaderName::from_static("x-model"),
-            HeaderValue::from_static("transport-bench-model"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-input-tokens"),
-            HeaderValue::from_static("1"),
-        );
-        let request_head = stargate_protocol::WebTransportHttpRequestHead {
-            method: Method::POST,
-            path_and_query: "/v1/chat/completions".to_string(),
-            headers,
-        };
-        stargate_protocol::write_webtransport_http_request_head_after_prefix(
-            &mut quinn_send,
-            request_connection.bidi_header.clone(),
-            &request_head,
-        )
+    started_at: Instant,
+) -> Result<ResponseMeasurement> {
+    let (mut quinn_send, mut quinn_recv) = session
+        .connection
+        .open_bi()
         .await
-        .context("send WebTransport request head")?;
-        for chunk in shape.request_chunks.iter() {
-            stargate_protocol::write_webtransport_http_body(&mut quinn_send, chunk.clone())
-                .await
-                .context("send WebTransport request body")?;
-        }
-        stargate_protocol::finish_webtransport_http_stream(&mut quinn_send)
-            .context("finish WebTransport request")?;
-
-        let response_head =
-            stargate_protocol::read_webtransport_http_response_head(&mut quinn_recv)
-                .await
-                .context("read WebTransport response head")?;
-        let response_headers_us = duration_us(started_at.elapsed());
-        let response_status = Some(response_head.status.as_u16());
-        let mut first_body_us = None;
-        let mut response_bytes = 0usize;
-        while let Some(chunk) =
-            stargate_protocol::read_webtransport_http_body_chunk(&mut quinn_recv)
-                .await
-                .context("read WebTransport response body")?
-        {
-            if first_body_us.is_none() {
-                first_body_us = Some(duration_us(started_at.elapsed()));
-            }
-            response_bytes += chunk.len();
-        }
-        Ok::<_, anyhow::Error>((
-            response_status,
-            response_headers_us,
-            first_body_us,
-            response_bytes,
-        ))
+        .context("open WebTransport request stream")?;
+    let request_head = stargate_protocol::WebTransportHttpRequestHead {
+        method: Method::POST,
+        path_and_query: "/v1/chat/completions".to_string(),
+        headers: request_headers(request_index)?,
+    };
+    stargate_protocol::write_webtransport_http_request_head_after_prefix(
+        &mut quinn_send,
+        session.bidi_header.clone(),
+        &request_head,
+    )
+    .await
+    .context("send WebTransport request head")?;
+    for chunk in shape.request_chunks.iter() {
+        stargate_protocol::write_webtransport_http_body(&mut quinn_send, chunk.clone())
+            .await
+            .context("send WebTransport request body")?;
     }
-    .await;
+    stargate_protocol::finish_webtransport_http_stream(&mut quinn_send)
+        .context("finish WebTransport request")?;
 
-    match result {
-        Ok((response_status, response_headers_us, first_body_us, response_bytes)) => {
-            RequestSample {
-                request_index,
-                connection_index: request_connection.connection_index,
-                ok: response_status == Some(200) && response_bytes == shape.response_bytes,
-                response_status,
-                request_bytes: shape.request_bytes,
-                response_bytes,
-                response_headers_us: Some(response_headers_us),
-                first_body_us,
-                completion_us: duration_us(started_at.elapsed()),
-                error: None,
-            }
-        }
-        Err(error) => RequestSample {
-            request_index,
-            connection_index: request_connection.connection_index,
-            ok: false,
-            response_status: None,
-            request_bytes: shape.request_bytes,
-            response_bytes: 0,
-            response_headers_us: None,
-            first_body_us: None,
-            completion_us: duration_us(started_at.elapsed()),
-            error: Some(error.to_string()),
-        },
+    let response_head = stargate_protocol::read_webtransport_http_response_head(&mut quinn_recv)
+        .await
+        .context("read WebTransport response head")?;
+    let mut response = ResponseMeasurement::new(
+        Some(response_head.status.as_u16()),
+        duration_us(started_at.elapsed()),
+    );
+    while let Some(chunk) = stargate_protocol::read_webtransport_http_body_chunk(&mut quinn_recv)
+        .await
+        .context("read WebTransport response body")?
+    {
+        response.record_body(started_at, chunk.len());
     }
+    Ok(response)
 }

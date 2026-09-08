@@ -82,6 +82,9 @@ EOF
 assert_missing_docker_config_blocks_target start
 assert_missing_docker_config_blocks_target build-and-deploy-cluster
 
+fake_gpu_count="$(yq -r '.topology.nodePools.default.gpuCount' "$ROOT_DIR/apps/fake-gpu-operator/values.yaml")"
+assert_eq "2" "$fake_gpu_count" "fake GPU count"
+
 print_directory_clusters="$(MAKEFLAGS=--print-directory; export MAKEFLAGS; run_make print-compute-clusters)"
 assert_eq "ncp-local-compute-1" "$print_directory_clusters" "print-directory compute cluster output"
 if ! grep -q '\$(MAKE) --no-print-directory -s print-compute-clusters' "$ROOT_DIR/Makefile"; then
@@ -131,9 +134,78 @@ done
 if ! grep -q '\${CONTROL_PLANE_NATS_PORT}:4222' "$ROOT_DIR/k3d-config-control-plane.yaml"; then
   fail "control-plane k3d config must expose CONTROL_PLANE_NATS_PORT to Gateway port 4222"
 fi
+if ! grep -q '\${CONTROL_PLANE_GRPC_PORT}:9090' "$ROOT_DIR/k3d-config-control-plane.yaml"; then
+  fail "control-plane k3d config must expose CONTROL_PLANE_GRPC_PORT to Gateway port 9090"
+fi
+if ! grep -q '\${CONTROL_PLANE_GRPC_PROXY_PORT}:10081' "$ROOT_DIR/k3d-config-control-plane.yaml"; then
+  fail "control-plane k3d config must expose CONTROL_PLANE_GRPC_PROXY_PORT to Gateway port 10081"
+fi
+if ! grep -q '\${CONTROL_PLANE_GRPC_WORKER_PORT}:10086' "$ROOT_DIR/k3d-config-control-plane.yaml"; then
+  fail "control-plane k3d config must expose CONTROL_PLANE_GRPC_WORKER_PORT to Gateway port 10086"
+fi
+if ! grep -q '\${CONTROL_PLANE_LLM_GRPC_PORT}:50071' "$ROOT_DIR/k3d-config-control-plane.yaml"; then
+  fail "control-plane k3d config must expose CONTROL_PLANE_LLM_GRPC_PORT to the LLM TCP Gateway listener"
+fi
+if ! grep -q '\${CONTROL_PLANE_LLM_QUIC_PORT}:50072' "$ROOT_DIR/k3d-config-control-plane.yaml"; then
+  fail "control-plane k3d config must expose CONTROL_PLANE_LLM_QUIC_PORT to the LLM UDP Gateway listener"
+fi
+if ! grep -q '10081:10081' "$ROOT_DIR/k3d-config.yaml"; then
+  fail "single-cluster k3d config must expose the stack-owned grpc-gw TCP listener on host port 10081"
+fi
+if ! grep -q 'service-nvct-api.yaml' "$ROOT_DIR/apps/compute-control-plane-endpoints/kustomization.yaml"; then
+  fail "compute control-plane endpoint aliases must include the NVCT API Service"
+fi
+if ! grep -q 'targetPort: grpc' "$ROOT_DIR/apps/compute-control-plane-endpoints/service-nvct-api.yaml"; then
+  fail "compute NVCT API alias Service must expose the worker gRPC port"
+fi
+if ! grep -q 'service-grpc.yaml' "$ROOT_DIR/apps/compute-control-plane-endpoints/kustomization.yaml"; then
+  fail "compute control-plane endpoint aliases must include the grpc-proxy worker Service"
+fi
+if ! grep -q 'targetPort: worker-tcp' "$ROOT_DIR/apps/compute-control-plane-endpoints/service-grpc.yaml"; then
+  fail "compute grpc-proxy alias Service must expose the worker TCP port"
+fi
+if ! grep -q 'service-llm-request-router.yaml' "$ROOT_DIR/apps/compute-control-plane-endpoints/kustomization.yaml"; then
+  fail "compute control-plane endpoint aliases must include the LLM request-router Service"
+fi
+if ! grep -q 'targetPort: llm-grpc' "$ROOT_DIR/apps/compute-control-plane-endpoints/service-llm-request-router.yaml"; then
+  fail "compute LLM request-router alias Service must expose the registration port"
+fi
+if ! grep -A4 'targetPort: llm-quic' "$ROOT_DIR/apps/compute-control-plane-endpoints/service-llm-request-router.yaml" | grep -q 'protocol: UDP'; then
+  fail "compute LLM request-router alias Service must expose the reverse-tunnel UDP port"
+fi
 
 if ! grep -q 'name: nats' "$ROOT_DIR/apps/envoy-gateway/gateway.yaml"; then
   fail "control-plane Gateway must define a nats TCP listener"
+fi
+if ! grep -R -q 'name: api-grpc-gw' "$ROOT_DIR/apps/envoy-gateway"; then
+  fail "control-plane Gateway must define a worker-facing API gRPC listener"
+fi
+if ! grep -R -q 'protocol: HTTP' "$ROOT_DIR/apps/envoy-gateway/gateway-grpc.yaml"; then
+  fail "worker-facing API gRPC Gateway must use HTTP protocol for GRPCRoute"
+fi
+if ! grep -R -q 'name: grpc-gw' "$ROOT_DIR/apps/envoy-gateway"; then
+  fail "control-plane Gateway must define the stack-owned grpc-gw TCP listener"
+fi
+if ! grep -R -q 'name: worker-tcp' "$ROOT_DIR/apps/envoy-gateway/gateway-grpc.yaml"; then
+  fail "control-plane Gateway must define the grpc-proxy worker TCP listener"
+fi
+if ! grep -R -q 'name: llm-grpc' "$ROOT_DIR/apps/envoy-gateway/gateway-grpc.yaml"; then
+  fail "control-plane Gateway must define the LLM worker HTTPS listener"
+fi
+if ! awk '/name: llm-grpc/{found=1; next} found && /protocol: HTTPS/{https=1} found && /mode: Terminate/{terminate=1} found && /name: llm-request-router-grpc-tls/{secret=1; exit} END{exit !(https && terminate && secret)}' "$ROOT_DIR/apps/envoy-gateway/gateway-grpc.yaml"; then
+  fail "LLM registration Gateway listener must terminate HTTPS with the dedicated gRPC Secret"
+fi
+if awk '/name: llm-grpc/{inside=1; next} inside && /name: llm-quic/{inside=0} inside && /^[[:space:]]+hostname:/{found=1} END{exit !found}' "$ROOT_DIR/apps/envoy-gateway/gateway-grpc.yaml"; then
+  fail "LLM registration listener must not constrain the Stargate HTTP/2 authority with a hostname"
+fi
+if ! grep -R -q 'name: llm-quic' "$ROOT_DIR/apps/envoy-gateway/gateway-grpc.yaml"; then
+  fail "control-plane Gateway must define the LLM worker UDP listener"
+fi
+if ! awk '/name: llm-quic/{found=1; next} found && /protocol: UDP/{ok=1; exit} END{exit !ok}' "$ROOT_DIR/apps/envoy-gateway/gateway-grpc.yaml"; then
+  fail "LLM reverse-tunnel Gateway listener must use UDP"
+fi
+if ! grep -q 'kubectl apply -k .*apps/envoy-gateway' "$ROOT_DIR/scripts/setup-gateway-api.sh"; then
+  fail "gateway setup must apply the full envoy-gateway kustomization"
 fi
 
 if grep -R -q 'type: ExternalName' "$ROOT_DIR/apps/compute-control-plane-endpoints"; then
@@ -152,15 +224,51 @@ fi
 if ! grep -q 'CONTROL_PLANE_LB_HTTP_PORT=80' "$ROOT_DIR/Makefile"; then
   fail "Makefile must pass the control-plane HTTP container port to endpoint configuration"
 fi
+if ! grep -q 'CONTROL_PLANE_LB_GRPC_PORT=9090' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass the control-plane gRPC container port to endpoint configuration"
+fi
+if ! grep -q 'CONTROL_PLANE_GRPC_PROXY_PORT ?= 10081' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must define the host port for the stack-owned grpc-gw TCP listener"
+fi
+if ! grep -q 'CONTROL_PLANE_GRPC_PROXY_PORT="$(CONTROL_PLANE_GRPC_PROXY_PORT)"' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass CONTROL_PLANE_GRPC_PROXY_PORT to the control-plane k3d config"
+fi
+if ! grep -q 'CONTROL_PLANE_GRPC_WORKER_PORT ?= 10086' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must define the host port for the grpc-proxy worker TCP listener"
+fi
+if ! grep -q 'CONTROL_PLANE_GRPC_WORKER_PORT="$(CONTROL_PLANE_GRPC_WORKER_PORT)"' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass CONTROL_PLANE_GRPC_WORKER_PORT to the control-plane k3d config"
+fi
+if ! grep -q 'CONTROL_PLANE_LLM_GRPC_PORT ?= 50071' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must define the host port for the LLM worker TCP listener"
+fi
+if ! grep -q 'CONTROL_PLANE_LLM_QUIC_PORT ?= 50072' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must define the host port for the LLM worker UDP listener"
+fi
+if ! grep -q 'CONTROL_PLANE_LLM_GRPC_PORT="$(CONTROL_PLANE_LLM_GRPC_PORT)"' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass CONTROL_PLANE_LLM_GRPC_PORT to the control-plane k3d config"
+fi
+if ! grep -q 'CONTROL_PLANE_LLM_QUIC_PORT="$(CONTROL_PLANE_LLM_QUIC_PORT)"' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass CONTROL_PLANE_LLM_QUIC_PORT to the control-plane k3d config"
+fi
 if ! grep -q 'CONTROL_PLANE_LB_NATS_PORT=4222' "$ROOT_DIR/Makefile"; then
   fail "Makefile must pass the control-plane NATS container port to endpoint configuration"
+fi
+if ! grep -q 'CONTROL_PLANE_LB_GRPC_WORKER_PORT=10086' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass the grpc-proxy worker container port to endpoint configuration"
+fi
+if ! grep -q 'CONTROL_PLANE_LB_LLM_GRPC_PORT=50071' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass the LLM registration container port to endpoint configuration"
+fi
+if ! grep -q 'CONTROL_PLANE_LB_LLM_QUIC_PORT=50072' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must pass the LLM reverse-tunnel container port to endpoint configuration"
 fi
 dns_target="$(awk '/^configure-compute-control-plane-dns:/{show=1} /^deploy-compute-control-plane-endpoints:/{show=0} show{print}' "$ROOT_DIR/Makefile")"
 if grep -q 'CLUSTER_NAME' <<<"$dns_target"; then
   fail "compute DNS configuration must not pass unused CLUSTER_NAME"
 fi
 
-for unsupported_alias in 'api.${domain}' 'api-keys.${domain}' 'invocation.${domain}'; do
+for unsupported_alias in 'api.${domain}' 'api-keys.${domain}'; do
   if grep -q "$unsupported_alias" "$ROOT_DIR/scripts/configure-control-plane-dns.sh"; then
     fail "compute DNS must not advertise unsupported control-plane alias '${unsupported_alias}'"
   fi
@@ -175,22 +283,76 @@ fi
 if ! grep -q "reval.${custom_domain}" <<<"$rendered_routes"; then
   fail "control-plane ReVal route must use CONTROL_PLANE_DOMAIN"
 fi
-if grep -q "kind: TCPRoute" <<<"$rendered_routes"; then
+if ! grep -q "ess-api.ess.svc.cluster.local" <<<"$rendered_routes"; then
+  fail "control-plane ESS route must advertise the service DNS hostname used by workers"
+fi
+if ! grep -q "api.nvcf.svc.cluster.local" <<<"$rendered_routes"; then
+  fail "control-plane API route must advertise the in-cluster API hostname used by workers"
+fi
+if ! grep -q "invocation.nvcf.svc.cluster.local" <<<"$rendered_routes"; then
+  fail "control-plane invocation route must advertise the service DNS hostname used by workers"
+fi
+if ! grep -q "nvct-api.nvcf.svc.cluster.local" <<<"$rendered_routes"; then
+  fail "control-plane NVCT route must advertise the service DNS hostname used by task workers"
+fi
+if grep -q "ess.${custom_domain}" <<<"$rendered_routes"; then
+  fail "control-plane ESS route must not add a topology-specific .test hostname"
+fi
+if grep -q "invocation.${custom_domain}" <<<"$rendered_routes"; then
+  fail "control-plane invocation route must not add a topology-specific .test hostname"
+fi
+if ! grep -q "nvcf-api-control-plane-grpc" <<<"$rendered_routes"; then
+  fail "control-plane API gRPC route must expose the in-cluster API gRPC port used by workers"
+fi
+if ! grep -q "nvct-api-control-plane-grpc" <<<"$rendered_routes"; then
+  fail "control-plane NVCT gRPC route must expose the in-cluster NVCT gRPC port used by task workers"
+fi
+if ! grep -q "kind: GRPCRoute" <<<"$rendered_routes"; then
+  fail "control-plane API gRPC route must use GRPCRoute for worker gRPC clients"
+fi
+if ! grep -A12 "nvcf-api-control-plane-grpc" <<<"$rendered_routes" | grep -q "sectionName: http"; then
+  fail "control-plane API gRPC route must attach to the HTTP listener"
+fi
+if ! grep -A14 "nvct-api-control-plane-grpc" <<<"$rendered_routes" | grep -q "sectionName: http"; then
+  fail "control-plane NVCT gRPC route must attach to the HTTP listener"
+fi
+if grep -A4 'name: nats' <<<"$rendered_routes" | grep -q "kind: TCPRoute"; then
   fail "ncp-local must not render the NATS TCPRoute; nvcf-gateway-routes owns that route"
 fi
 if grep -q "sis.nvcf-control-plane.test" <<<"$rendered_routes"; then
   fail "custom control-plane routes must not keep the default domain"
 fi
 
-endpoints_yaml="$(CONTROL_PLANE_DOMAIN="$custom_domain" CONTROL_PLANE_LB_IP=172.18.0.7 CONTROL_PLANE_LB_HTTP_PORT=18080 CONTROL_PLANE_LB_NATS_PORT=14222 CLUSTER_NAME=ncp-local-compute-1 "$ROOT_DIR/scripts/configure-control-plane-endpoints.sh" --dry-run)"
+endpoints_yaml="$(CONTROL_PLANE_DOMAIN="$custom_domain" CONTROL_PLANE_LB_IP=172.18.0.7 CONTROL_PLANE_LB_HTTP_PORT=18080 CONTROL_PLANE_LB_GRPC_PORT=19090 CONTROL_PLANE_LB_GRPC_WORKER_PORT=20086 CONTROL_PLANE_LB_LLM_GRPC_PORT=25071 CONTROL_PLANE_LB_LLM_QUIC_PORT=25072 CONTROL_PLANE_LB_NATS_PORT=14222 CLUSTER_NAME=ncp-local-compute-1 "$ROOT_DIR/scripts/configure-control-plane-endpoints.sh" --dry-run)"
 if ! grep -q "ip: 172.18.0.7" <<<"$endpoints_yaml"; then
   fail "compute endpoint dry-run must point at the control-plane load balancer container IP"
 fi
 if ! grep -q "port: 18080" <<<"$endpoints_yaml"; then
   fail "compute HTTP endpoint dry-run must use CONTROL_PLANE_LB_HTTP_PORT"
 fi
+if ! grep -A12 "name: nvct-api" <<<"$endpoints_yaml" | grep -q "port: 18080"; then
+  fail "compute NVCT endpoint dry-run must use CONTROL_PLANE_LB_HTTP_PORT"
+fi
+if ! grep -A16 "name: nvct-api" <<<"$endpoints_yaml" | grep -q "port: 19090"; then
+  fail "compute NVCT endpoint dry-run must use CONTROL_PLANE_LB_GRPC_PORT"
+fi
+if ! grep -q "port: 19090" <<<"$endpoints_yaml"; then
+  fail "compute gRPC endpoint dry-run must use CONTROL_PLANE_LB_GRPC_PORT"
+fi
+if ! grep -A10 "name: grpc" <<<"$endpoints_yaml" | grep -q "port: 20086"; then
+  fail "compute grpc-proxy worker endpoint dry-run must use CONTROL_PLANE_LB_GRPC_WORKER_PORT"
+fi
 if ! grep -q "port: 14222" <<<"$endpoints_yaml"; then
   fail "compute NATS endpoint dry-run must use CONTROL_PLANE_LB_NATS_PORT"
+fi
+if ! grep -A14 "name: llm-request-router" <<<"$endpoints_yaml" | grep -q "port: 25071"; then
+  fail "compute LLM request-router endpoint dry-run must use CONTROL_PLANE_LB_LLM_GRPC_PORT"
+fi
+if ! grep -A14 "name: llm-request-router" <<<"$endpoints_yaml" | grep -q "port: 25072"; then
+  fail "compute LLM request-router endpoint dry-run must use CONTROL_PLANE_LB_LLM_QUIC_PORT"
+fi
+if ! grep -A14 "name: llm-request-router" <<<"$endpoints_yaml" | grep -q "protocol: UDP"; then
+  fail "compute LLM request-router endpoint dry-run must preserve UDP for reverse QUIC"
 fi
 
 fake_bin="$(mktemp -d)"
@@ -217,45 +379,35 @@ done
 if grep -q "172.18.0.1" <<<"$dns_yaml"; then
   fail "compute DNS dry-run must not point control-plane hostnames at the Docker gateway"
 fi
-for unsupported_alias in "api.${custom_domain}" "api-keys.${custom_domain}" "invocation.${custom_domain}"; do
+for unsupported_alias in "api.${custom_domain}" "api-keys.${custom_domain}" "ess.${custom_domain}" "invocation.${custom_domain}"; do
   if grep -q "$unsupported_alias" <<<"$dns_yaml"; then
     fail "compute DNS must not advertise unsupported alias '${unsupported_alias}'"
   fi
 done
 
-if ! grep -q 'SAMPLE_NGC_ORG' "$ROOT_DIR/Makefile"; then
-  fail "Makefile must expose SAMPLE_NGC_ORG for sample image configuration"
+if ! grep -q 'SAMPLE_IMAGE' "$ROOT_DIR/Makefile"; then
+  fail "Makefile must expose SAMPLE_IMAGE for sample image configuration"
 fi
 if ! grep -q 'scripts/render-sample.sh' "$ROOT_DIR/Makefile"; then
   fail "deploy-sample must render the sample image from Makefile inputs"
 fi
 
-tmp_output="$(mktemp)"
-if SAMPLE_IMAGE= SAMPLE_NGC_ORG=ngc-org SAMPLE_NGC_TEAM=ngc-team "$ROOT_DIR/scripts/render-sample.sh" --dry-run >"$tmp_output" 2>&1; then
-  cat "$tmp_output" >&2
-  rm -f "$tmp_output"
-  fail "sample render must fail when ngc-org/ngc-team placeholders are not replaced"
+default_sample_yaml="$(SAMPLE_IMAGE=registry.k8s.io/e2e-test-images/agnhost:2.53 "$ROOT_DIR/scripts/render-sample.sh" --dry-run)"
+if ! grep -q 'image: registry.k8s.io/e2e-test-images/agnhost:2.53' <<<"$default_sample_yaml"; then
+  fail "sample render must use the default agnhost image"
 fi
-if grep -q 'Internal example' "$tmp_output"; then
-  cat "$tmp_output" >&2
-  rm -f "$tmp_output"
-  fail "sample render placeholder error must not include internal examples"
-fi
-if ! grep -q 'SAMPLE_NGC_ORG=my-org SAMPLE_NGC_TEAM=my-team' "$tmp_output"; then
-  cat "$tmp_output" >&2
-  rm -f "$tmp_output"
-  fail "sample render placeholder error must include a generic example"
-fi
-rm -f "$tmp_output"
-
-sample_yaml="$(SAMPLE_NGC_ORG=my-org SAMPLE_NGC_TEAM=my-team "$ROOT_DIR/scripts/render-sample.sh" --dry-run)"
-if ! grep -q 'image: nvcr.io/my-org/my-team/alpine-k8s:1.30.12' <<<"$sample_yaml"; then
-  fail "sample render must use SAMPLE_NGC_ORG and SAMPLE_NGC_TEAM overrides"
+if ! grep -q 'netexec' <<<"$default_sample_yaml"; then
+  fail "default sample render must run agnhost netexec"
 fi
 
-custom_sample_yaml="$(SAMPLE_IMAGE=registry.example.com/custom/team/image SAMPLE_IMAGE_TAG=v1 "$ROOT_DIR/scripts/render-sample.sh" --dry-run)"
+custom_sample_yaml="$(SAMPLE_IMAGE=registry.example.com/custom/team/image:v1 "$ROOT_DIR/scripts/render-sample.sh" --dry-run)"
 if ! grep -q 'image: registry.example.com/custom/team/image:v1' <<<"$custom_sample_yaml"; then
-  fail "sample render must allow SAMPLE_IMAGE to override the NGC path"
+  fail "sample render must allow SAMPLE_IMAGE overrides"
+fi
+
+digest_sample_yaml="$(SAMPLE_IMAGE=registry.example.com/custom/team/image@sha256:deadbeef "$ROOT_DIR/scripts/render-sample.sh" --dry-run)"
+if ! grep -q 'image: registry.example.com/custom/team/image@sha256:deadbeef' <<<"$digest_sample_yaml"; then
+  fail "sample render must preserve digest-pinned SAMPLE_IMAGE references"
 fi
 
 echo "PASS: multicluster Makefile dry tests"

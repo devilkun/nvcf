@@ -5,10 +5,17 @@ NVCA operator on a separately registered compute cluster, all driven by the
 documented Helmfile workflow.
 
 <Info>
-This setup is for **local development only**. It uses fake GPUs, a single
+This setup is for local development only. It uses fake GPUs, a single
 Cassandra replica, and ephemeral storage. Do not use this for production
 workloads.
 </Info>
+
+Clone the public repository and run the remaining commands from its root:
+
+```bash
+git clone https://github.com/nvidia/nvcf.git
+cd nvcf
+```
 
 ## Topology
 
@@ -17,14 +24,18 @@ workloads.
 | `ncp-local-cp` | Control plane | `k3d-ncp-local-cp` |
 | `ncp-local-compute-1` | Compute plane (first worker) | `k3d-ncp-local-compute-1` |
 
-Cross-cluster traffic from the compute cluster reaches the control-plane
-load balancer via `.test` host aliases that
+Cross-cluster traffic from the compute cluster uses the same service-DNS
+hostnames as the local stack values. During topology bootstrap,
 `tools/ncp-local-cluster/scripts/configure-control-plane-endpoints.sh`
-provisions:
+creates compute-cluster alias Services and Endpoints for those names, and the
+Endpoints point at the control-plane k3d load balancer:
 
-- `http://sis.nvcf-control-plane.test:8080`
-- `http://reval.nvcf-control-plane.test:8080`
-- `nats://nats.nvcf-control-plane.test:4222`
+- `http://api.sis.svc.cluster.local:8080`
+- `http://reval.nvcf.svc.cluster.local:8080`
+- `nats://nats.nats-system.svc.cluster.local:4222`
+- `http://ess-api.ess.svc.cluster.local:8080`
+- `http://invocation.nvcf.svc.cluster.local:8080`
+- `api.nvcf.svc.cluster.local:9090`
 
 ## Prerequisites
 
@@ -34,9 +45,10 @@ Install the following tools:
 - [k3d](https://k3d.io/#installation) v5.x or later
 - `kubectl`
 - `helm` >= 3.12
+- [Go](https://go.dev/doc/install) >= 1.24.0 (required to build `nvcf-cli`)
 - `helmfile` >= 1.1.0, < 1.2.0
 - `helm-diff` plugin: `helm plugin install https://github.com/databus23/helm-diff`
-- An **NGC API key** from [ngc.nvidia.com](https://ngc.nvidia.com) with
+- An NGC API key from [ngc.nvidia.com](https://ngc.nvidia.com) with
   access to the NVCF chart and image registry.
 - The NGC organization and team slugs that hold the chart/image repository
   you have access to.
@@ -45,7 +57,7 @@ Install the following tools:
   exist on disk before those steps run:
 
   ```bash
-  go build -o nvcf-cli ./src/clis/nvcf-cli
+  go build -C src/clis/nvcf-cli -o ../../../nvcf-cli .
   ```
 
 Export the env vars used below:
@@ -65,7 +77,9 @@ make -C tools/ncp-local-cluster build-and-deploy-multicluster
 <Note>
 The single-cluster (`ncp-local`) and multi-cluster
 (`ncp-local-cp` + `ncp-local-compute-N`) topologies both claim host
-ports 8080/8443/4222 and cannot coexist. If you already have the
+ports 8080/8443/4222 and cannot coexist. The multi-cluster control plane also
+claims host ports 9090 and 10081 for worker-facing API gRPC and the stack-owned
+grpc-proxy TCP listener. If you already have the
 single-cluster topology running:
 
 ```bash
@@ -74,34 +88,41 @@ make -C tools/ncp-local-cluster destroy CLUSTER_NAME=ncp-local
 
 </Note>
 
-## Step 2: Author the multi-cluster Helmfile environment file
+## Step 2: Author the multi-cluster Helmfile environment files
 
 The values-driven Helmfile path has no control-plane profile; the operator
-must author topology-correct URLs in the environment file. Use the
-**multi-cluster** fixture (NOT the single-cluster one):
+must author topology-correct URLs in the environment files. Use the
+multi-cluster fixtures for this flow:
 
 ```bash
 cp tests/bdd/fixtures/self-managed-local-bdd-multi.yaml \
    deploy/stacks/self-managed/environments/local-bdd.yaml
+cp tests/bdd/fixtures/nvcf-compute-plane-local-bdd-multi.yaml \
+   deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml
 ```
 
 Substitute your NGC org and team:
 
 ```bash
-sed -i.bak \
-  -e "s|REPLACE_WITH_SAMPLE_NGC_ORG|${SAMPLE_NGC_ORG}|g" \
-  -e "s|REPLACE_WITH_SAMPLE_NGC_TEAM|${SAMPLE_NGC_TEAM}|g" \
-  deploy/stacks/self-managed/environments/local-bdd.yaml
-rm deploy/stacks/self-managed/environments/local-bdd.yaml.bak
+for file in \
+  deploy/stacks/self-managed/environments/local-bdd.yaml \
+  deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml; do
+  sed -i.bak \
+    -e "s|REPLACE_WITH_SAMPLE_NGC_ORG|${SAMPLE_NGC_ORG}|g" \
+    -e "s|REPLACE_WITH_SAMPLE_NGC_TEAM|${SAMPLE_NGC_TEAM}|g" \
+    "$file"
+  rm "${file}.bak"
+done
 ```
 
-<Warning>
-The multi-cluster fixture's `global.nvcaOperator.selfManaged.*` URLs use
-`.test` hostnames. The single-cluster fixture's in-cluster DNS (for example
-`http://api.sis.svc.cluster.local:8080`) would resolve only inside the
-control-plane cluster and the NVCA agent on the compute cluster would 401
-against ICMS at runtime. Use the right fixture.
-</Warning>
+<Note>
+The multi-cluster fixture intentionally uses service-DNS hostnames such as
+`api.sis.svc.cluster.local` and `invocation.nvcf.svc.cluster.local`. In this
+split topology those names resolve on the compute cluster because Step 1
+created alias Services and Endpoints that forward to the control-plane load
+balancer. Do not replace these values with topology-specific `.test`
+hostnames.
+</Note>
 
 ## Step 3: Author the secrets file
 
@@ -109,7 +130,7 @@ against ICMS at runtime. Use the right fixture.
 cp deploy/stacks/self-managed/secrets/secrets.yaml.template \
    deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml
 
-BASE64_CRED=$(echo -n "\$oauthtoken:${NGC_API_KEY}" | base64 -w0)
+BASE64_CRED=$(printf '%s' "\$oauthtoken:${NGC_API_KEY}" | base64 | tr -d '\n')
 sed -i.bak "s|REPLACE_WITH_BASE64_DOCKER_CREDENTIAL|${BASE64_CRED}|g" \
   deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml
 rm deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml.bak
@@ -181,29 +202,50 @@ done
 ## Step 9: Register the compute cluster
 
 ```bash
-make -C deploy/stacks/self-managed register-cluster \
+$(pwd)/nvcf-cli \
+  --config $(pwd)/tests/bdd/fixtures/nvcf-cli-local.yaml \
+  self-hosted \
+  --control-plane-stack deploy/stacks/self-managed \
+  --env local-bdd \
+  --control-plane-context k3d-ncp-local-cp \
+  --compute-plane-context k3d-ncp-local-compute-1 \
+  control-plane profile export \
+  --cluster-name ncp-local-cp
+
+$(pwd)/nvcf-cli \
+  --config $(pwd)/tests/bdd/fixtures/nvcf-cli-local.yaml \
+  init
+
+make -C deploy/stacks/nvcf-compute-plane register-cluster \
   CLUSTER_NAME=ncp-local-compute-1 \
+  CONTROL_PLANE_PROFILE=$(pwd)/deploy/stacks/self-managed/out/control-plane-profile.yaml \
+  COMPUTE_KUBE_CONTEXT=k3d-ncp-local-compute-1 \
   NVCF_CLI=$(pwd)/nvcf-cli \
   NVCF_CLI_CONFIG=$(pwd)/tests/bdd/fixtures/nvcf-cli-local.yaml
 ```
 
 <Note>
-`make register-cluster` runs `nvcf-cli init` internally before
-`cluster register`, so this flow does not need a separate `init` step.
+The profile export uses both contexts to capture compute-reachable endpoints
+and control-plane trust. Run `nvcf-cli init` explicitly. The Make target
+forwards `NVCF_CLI_CONFIG` to registration but does not initialize it.
 </Note>
 
-The target produces
-`deploy/stacks/self-managed/out/ncp-local-compute-1-register-values.yaml`.
+The target writes the registration handoff file to
+`deploy/stacks/nvcf-compute-plane/registration/ncp-local-compute-1-register-values.yaml`.
+The `template`, `install`, and `apply` targets copy that file into
+`deploy/stacks/nvcf-compute-plane/out/` before running Helmfile.
 
 ## Step 10: Install the NVCA operator on the compute cluster
 
 ```bash
-make -C deploy/stacks/self-managed install-nvca-operator \
+make -C deploy/stacks/nvcf-compute-plane install \
   CLUSTER_NAME=ncp-local-compute-1 \
   HELMFILE_ENV=local-bdd \
   NVCF_CLI=$(pwd)/nvcf-cli \
   NVCF_CLI_CONFIG=$(pwd)/tests/bdd/fixtures/nvcf-cli-local.yaml
 ```
+
+This uses the compute-plane `local-bdd.yaml` file created in Step 2.
 
 ## Step 11: Verify
 

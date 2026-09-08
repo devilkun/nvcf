@@ -18,13 +18,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::common::{
-    MapResolver, base_config, bind_ephemeral, bind_ephemeral_udp, init_crypto, start_dummy_backend,
+    MapResolver, base_config, init_crypto, localhost_reverse_tunnel_config, start_dummy_backend,
     wait_for_routing, wait_for_unroutable,
 };
 use pylon_lib::{
-    OutputTokenParserFactory, ReverseQuicTunnelConfig, ReverseQuicTunnelHandle,
-    TunnelTransportProtocol, start_reverse_quic_tunnel,
+    ReverseQuicTunnelConfig, ReverseQuicTunnelHandle, TunnelTransportProtocol,
+    start_reverse_quic_tunnel,
 };
+use stargate::runtime::BoundStargateListeners;
 use stargate_forwarding::ForwardingResolver;
 use stargate_proto::pb::stargate_control_plane_client::StargateControlPlaneClient;
 use stargate_proto::pb::{
@@ -66,7 +67,6 @@ fn make_registration(
         inference_server_url,
         models,
         reverse_tunnel: true,
-        coordinated_calibration: false,
     }
 }
 
@@ -94,11 +94,12 @@ impl TwoStargatesQuic {
     }
 }
 
-/// Spins up two stargates with reverse tunnel + QUIC forwarding.
+/// Spins up two stargates with reverse tunnel + development-only QUIC peer
+/// relay coverage.
 /// Resolver on A maps "sg-b.stargate.external" -> B's reverse tunnel addr.
 /// Resolver on B maps "sg-a.stargate.external" -> A's reverse tunnel addr.
 async fn start_two_stargates_with_quic() -> TwoStargatesQuic {
-    start_two_stargates_with_quic_tls(None, None, true, TunnelTransportProtocol::Custom).await
+    start_two_stargates_with_quic_tls(None, None, true, TunnelTransportProtocol::RawQuic).await
 }
 
 async fn start_two_stargates_with_quic_tls(
@@ -109,15 +110,43 @@ async fn start_two_stargates_with_quic_tls(
 ) -> TwoStargatesQuic {
     let peers = Arc::new(Mutex::new(Vec::<StargateInfo>::new()));
 
-    let (grpc_a, grpc_listener_a) = bind_ephemeral();
-    let (grpc_b, grpc_listener_b) = bind_ephemeral();
-    let (http_a, http_listener_a) = bind_ephemeral();
-    let (http_b, http_listener_b) = bind_ephemeral();
-    let (reverse_a, reverse_socket_a) = bind_ephemeral_udp();
-    let (reverse_b, reverse_socket_b) = bind_ephemeral_udp();
     let server_tls_identity =
         stargate_tls::ServerTlsIdentity::from_optional_pem(tls_cert_pem.clone(), tls_key_pem)
             .expect("test TLS cert/key pair should be complete");
+
+    let mut config_a = base_config(
+        "sg-a",
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config_a.dns_poll_interval = Duration::from_secs(1);
+    let reverse_tunnel_a = localhost_reverse_tunnel_config("127.0.0.1:0".parse().unwrap());
+    // Exercise both secure and insecure QUIC relay modes from the same topology helper.
+    config_a.proxy_transport.quic.tls_cert_pem = tls_cert_pem.clone();
+    config_a.proxy_transport.quic.server_tls_identity = server_tls_identity.clone();
+    config_a.proxy_transport.quic.quic_insecure = quic_insecure;
+    config_a.proxy_transport.quic.tunnel_protocol = tunnel_protocol;
+    let listeners_a = BoundStargateListeners::bind(&mut config_a).unwrap();
+    let grpc_a = config_a.grpc_listen_addr;
+    let http_a = config_a.http_listen_addr;
+    let reverse_a = reverse_tunnel_a.listen_addr();
+
+    let mut config_b = base_config(
+        "sg-b",
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config_b.dns_poll_interval = Duration::from_secs(1);
+    let reverse_tunnel_b = localhost_reverse_tunnel_config("127.0.0.1:0".parse().unwrap());
+    // Exercise both secure and insecure QUIC relay modes from the same topology helper.
+    config_b.proxy_transport.quic.tls_cert_pem = tls_cert_pem;
+    config_b.proxy_transport.quic.server_tls_identity = server_tls_identity;
+    config_b.proxy_transport.quic.quic_insecure = quic_insecure;
+    config_b.proxy_transport.quic.tunnel_protocol = tunnel_protocol;
+    let listeners_b = BoundStargateListeners::bind(&mut config_b).unwrap();
+    let grpc_b = config_b.grpc_listen_addr;
+    let http_b = config_b.http_listen_addr;
+    let reverse_b = reverse_tunnel_b.listen_addr();
 
     // QUIC forwarding resolvers match against *.stargate.external SNI
     let mut resolver_a = MapResolver::new("sg-a.stargate.external");
@@ -128,37 +157,23 @@ async fn start_two_stargates_with_quic_tls(
     resolver_b.insert("sg-a.stargate.external", reverse_a);
     let resolver_b: Arc<dyn ForwardingResolver> = Arc::new(resolver_b);
 
+    config_a.forwarding = Some(resolver_a);
     let discovery_a = crate::common::SharedDiscovery::new("sg-a", grpc_a, http_a, peers.clone());
-    let mut config_a = base_config("sg-a", grpc_a, http_a);
-    config_a.dns_poll_interval = Duration::from_secs(1);
-    config_a.advertised_hostname_template = Some("localhost".to_string());
-    config_a.reverse_tunnel_listen_addr = Some(reverse_a);
-    // Exercise both secure and insecure QUIC relay modes from the same topology helper.
-    config_a.proxy_transport.tls_cert_pem = tls_cert_pem.clone();
-    config_a.proxy_transport.server_tls_identity = server_tls_identity.clone();
-    config_a.proxy_transport.quic_insecure = quic_insecure;
-    config_a.proxy_transport.tunnel_protocol = tunnel_protocol;
-    let runtime_a = stargate::runtime::StargateRuntime::new(config_a, Box::new(discovery_a))
-        .with_forwarding(resolver_a)
-        .with_grpc_listener(grpc_listener_a)
-        .with_http_listener(http_listener_a)
-        .with_reverse_tunnel_socket(reverse_socket_a);
+    let runtime_a = stargate::runtime::StargateRuntime::new(
+        config_a,
+        Box::new(discovery_a),
+        listeners_a,
+        Some(reverse_tunnel_a),
+    );
 
+    config_b.forwarding = Some(resolver_b);
     let discovery_b = crate::common::SharedDiscovery::new("sg-b", grpc_b, http_b, peers.clone());
-    let mut config_b = base_config("sg-b", grpc_b, http_b);
-    config_b.dns_poll_interval = Duration::from_secs(1);
-    config_b.advertised_hostname_template = Some("localhost".to_string());
-    config_b.reverse_tunnel_listen_addr = Some(reverse_b);
-    // Exercise both secure and insecure QUIC relay modes from the same topology helper.
-    config_b.proxy_transport.tls_cert_pem = tls_cert_pem;
-    config_b.proxy_transport.server_tls_identity = server_tls_identity;
-    config_b.proxy_transport.quic_insecure = quic_insecure;
-    config_b.proxy_transport.tunnel_protocol = tunnel_protocol;
-    let runtime_b = stargate::runtime::StargateRuntime::new(config_b, Box::new(discovery_b))
-        .with_forwarding(resolver_b)
-        .with_grpc_listener(grpc_listener_b)
-        .with_http_listener(http_listener_b)
-        .with_reverse_tunnel_socket(reverse_socket_b);
+    let runtime_b = stargate::runtime::StargateRuntime::new(
+        config_b,
+        Box::new(discovery_b),
+        listeners_b,
+        Some(reverse_tunnel_b),
+    );
 
     let handle_a = runtime_a.start().await.expect("stargate A failed");
     let handle_b = runtime_b.start().await.expect("stargate B failed");
@@ -195,7 +210,7 @@ impl Default for ReverseTunnelDialOptions {
         Self {
             tls_cert_pem: None,
             quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::Custom,
+            tunnel_protocol: TunnelTransportProtocol::RawQuic,
         }
     }
 }
@@ -285,7 +300,6 @@ async fn connect_reverse_tunnel_with_sni_retry_tls(
         config.tls_cert_pem = options.tls_cert_pem.clone();
         config.quic_insecure = options.quic_insecure;
         config.tunnel_protocol = options.tunnel_protocol;
-        config.output_token_parser_factory = OutputTokenParserFactory::vllm();
         match start_reverse_quic_tunnel(config).await {
             Ok(handle) => return handle,
             Err(_) if tokio::time::Instant::now() < deadline => {
@@ -300,38 +314,54 @@ async fn connect_reverse_tunnel_with_sni_retry_tls(
     }
 }
 
+struct ReverseRouteCase<'a> {
+    grpc: SocketAddr,
+    reverse: SocketAddr,
+    http: SocketAddr,
+    sni: &'a str,
+    backend_id: &'a str,
+    model: &'a str,
+    dial: ReverseTunnelDialOptions,
+}
+
+async fn assert_reverse_route(case: ReverseRouteCase<'_>) {
+    let backend_addr = start_dummy_backend(case.model).await;
+    let backend_url = format!("http://{backend_addr}");
+    let registration =
+        register_reverse_backend(case.grpc, case.backend_id, case.model, backend_url.clone()).await;
+    let tunnel = connect_reverse_tunnel_with_sni_retry_tls(
+        case.reverse,
+        case.sni,
+        case.backend_id,
+        &backend_url,
+        Duration::from_secs(5),
+        case.dial,
+    )
+    .await;
+
+    wait_for_routing(case.http, case.model, Duration::from_secs(15)).await;
+    tunnel.shutdown().await;
+    // Close the gRPC registration stream before stargate shutdown so
+    // tonic's graceful shutdown doesn't block on in-flight RPCs.
+    drop(registration);
+}
+
 /// Reverse tunnel connected to A with SNI for B is relayed to B.
 /// Backend registered directly on B becomes routable through B.
 #[tokio::test]
 async fn reverse_tunnel_relayed_to_correct_peer() {
     init_crypto();
     let sg = start_two_stargates_with_quic().await;
-
-    let backend_addr = start_dummy_backend("relay-model").await;
-    let backend_url = format!("http://{backend_addr}");
-    let reg = register_reverse_backend(
-        sg.grpc_b,
-        "relay-backend",
-        "relay-model",
-        backend_url.clone(),
-    )
+    assert_reverse_route(ReverseRouteCase {
+        grpc: sg.grpc_b,
+        reverse: sg.reverse_a,
+        http: sg.http_b,
+        sni: "sg-b.stargate.external",
+        backend_id: "relay-backend",
+        model: "relay-model",
+        dial: ReverseTunnelDialOptions::default(),
+    })
     .await;
-
-    let tunnel = connect_reverse_tunnel_with_sni_retry(
-        sg.reverse_a,
-        "sg-b.stargate.external",
-        "relay-backend",
-        &backend_url,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_routing(sg.http_b, "relay-model", Duration::from_secs(15)).await;
-
-    tunnel.shutdown().await;
-    // Close the gRPC registration stream before stargate shutdown so
-    // tonic's graceful shutdown doesn't block on in-flight RPCs.
-    drop(reg);
     sg.shutdown().await;
 }
 
@@ -342,36 +372,19 @@ async fn reverse_http3_tunnel_relayed_to_correct_peer() {
     init_crypto();
     let sg =
         start_two_stargates_with_quic_tls(None, None, true, TunnelTransportProtocol::Http3).await;
-
-    let backend_addr = start_dummy_backend("relay-http3-model").await;
-    let backend_url = format!("http://{backend_addr}");
-    let reg = register_reverse_backend(
-        sg.grpc_b,
-        "relay-http3-backend",
-        "relay-http3-model",
-        backend_url.clone(),
-    )
-    .await;
-
-    let tunnel = connect_reverse_tunnel_with_sni_retry_tls(
-        sg.reverse_a,
-        "sg-b.stargate.external",
-        "relay-http3-backend",
-        &backend_url,
-        Duration::from_secs(5),
-        ReverseTunnelDialOptions {
+    assert_reverse_route(ReverseRouteCase {
+        grpc: sg.grpc_b,
+        reverse: sg.reverse_a,
+        http: sg.http_b,
+        sni: "sg-b.stargate.external",
+        backend_id: "relay-http3-backend",
+        model: "relay-http3-model",
+        dial: ReverseTunnelDialOptions {
             tunnel_protocol: TunnelTransportProtocol::Http3,
             ..ReverseTunnelDialOptions::default()
         },
-    )
+    })
     .await;
-
-    wait_for_routing(sg.http_b, "relay-http3-model", Duration::from_secs(15)).await;
-
-    tunnel.shutdown().await;
-    // Close the gRPC registration stream before stargate shutdown so
-    // tonic's graceful shutdown doesn't block on in-flight RPCs.
-    drop(reg);
     sg.shutdown().await;
 }
 
@@ -389,40 +402,24 @@ async fn reverse_tunnel_relay_preserves_peer_sni_for_verified_quic() {
         Some(cert_pem.clone()),
         Some(key_pem),
         false,
-        TunnelTransportProtocol::Custom,
+        TunnelTransportProtocol::RawQuic,
     )
     .await;
 
-    let backend_addr = start_dummy_backend("relay-secure-model").await;
-    let backend_url = format!("http://{backend_addr}");
-    let reg = register_reverse_backend(
-        sg.grpc_b,
-        "relay-secure-backend",
-        "relay-secure-model",
-        backend_url.clone(),
-    )
-    .await;
-
-    let tunnel = connect_reverse_tunnel_with_sni_retry_tls(
-        sg.reverse_a,
-        "sg-b.stargate.external",
-        "relay-secure-backend",
-        &backend_url,
-        Duration::from_secs(5),
-        ReverseTunnelDialOptions {
+    assert_reverse_route(ReverseRouteCase {
+        grpc: sg.grpc_b,
+        reverse: sg.reverse_a,
+        http: sg.http_b,
+        sni: "sg-b.stargate.external",
+        backend_id: "relay-secure-backend",
+        model: "relay-secure-model",
+        dial: ReverseTunnelDialOptions {
             tls_cert_pem: Some(cert_pem),
             quic_insecure: false,
-            tunnel_protocol: TunnelTransportProtocol::Custom,
+            tunnel_protocol: TunnelTransportProtocol::RawQuic,
         },
-    )
+    })
     .await;
-
-    wait_for_routing(sg.http_b, "relay-secure-model", Duration::from_secs(15)).await;
-
-    tunnel.shutdown().await;
-    // Close the gRPC registration stream before stargate shutdown so
-    // tonic's graceful shutdown doesn't block on in-flight RPCs.
-    drop(reg);
     sg.shutdown().await;
 }
 
@@ -433,26 +430,16 @@ async fn reverse_tunnel_relayed_b_to_a() {
     init_crypto();
     let sg = start_two_stargates_with_quic().await;
 
-    let backend_addr = start_dummy_backend("b2a-model").await;
-    let backend_url = format!("http://{backend_addr}");
-    let reg =
-        register_reverse_backend(sg.grpc_a, "b2a-backend", "b2a-model", backend_url.clone()).await;
-
-    let tunnel = connect_reverse_tunnel_with_sni_retry(
-        sg.reverse_b,
-        "sg-a.stargate.external",
-        "b2a-backend",
-        &backend_url,
-        Duration::from_secs(5),
-    )
+    assert_reverse_route(ReverseRouteCase {
+        grpc: sg.grpc_a,
+        reverse: sg.reverse_b,
+        http: sg.http_a,
+        sni: "sg-a.stargate.external",
+        backend_id: "b2a-backend",
+        model: "b2a-model",
+        dial: ReverseTunnelDialOptions::default(),
+    })
     .await;
-
-    wait_for_routing(sg.http_a, "b2a-model", Duration::from_secs(15)).await;
-
-    tunnel.shutdown().await;
-    // Close the gRPC registration stream before stargate shutdown so
-    // tonic's graceful shutdown doesn't block on in-flight RPCs.
-    drop(reg);
     sg.shutdown().await;
 }
 
@@ -462,31 +449,16 @@ async fn reverse_tunnel_for_self_handled_locally() {
     init_crypto();
     let sg = start_two_stargates_with_quic().await;
 
-    let backend_addr = start_dummy_backend("local-model").await;
-    let backend_url = format!("http://{backend_addr}");
-    let reg = register_reverse_backend(
-        sg.grpc_a,
-        "local-backend",
-        "local-model",
-        backend_url.clone(),
-    )
+    assert_reverse_route(ReverseRouteCase {
+        grpc: sg.grpc_a,
+        reverse: sg.reverse_a,
+        http: sg.http_a,
+        sni: "sg-a.stargate.external",
+        backend_id: "local-backend",
+        model: "local-model",
+        dial: ReverseTunnelDialOptions::default(),
+    })
     .await;
-
-    let tunnel = connect_reverse_tunnel_with_sni_retry(
-        sg.reverse_a,
-        "sg-a.stargate.external",
-        "local-backend",
-        &backend_url,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_routing(sg.http_a, "local-model", Duration::from_secs(15)).await;
-
-    tunnel.shutdown().await;
-    // Close the gRPC registration stream before stargate shutdown so
-    // tonic's graceful shutdown doesn't block on in-flight RPCs.
-    drop(reg);
     sg.shutdown().await;
 }
 
@@ -521,7 +493,6 @@ async fn duplicate_reverse_tunnel_rejected() {
         );
         c.sni_override = Some("sg-a.stargate.external".to_string());
         c.quic_insecure = true;
-        c.output_token_parser_factory = OutputTokenParserFactory::vllm();
         c
     };
     let result = start_reverse_quic_tunnel(config2).await;
@@ -603,7 +574,6 @@ async fn reverse_tunnel_unregistered_id_rejected_through_relay() {
         );
         c.sni_override = Some("sg-b.stargate.external".to_string());
         c.quic_insecure = true;
-        c.output_token_parser_factory = OutputTokenParserFactory::vllm();
         c
     };
     let result = start_reverse_quic_tunnel(config).await;
@@ -624,9 +594,17 @@ async fn relayed_tunnel_peer_unreachable() {
 
     let peers = Arc::new(Mutex::new(Vec::<StargateInfo>::new()));
 
-    let (grpc_a, grpc_listener_a) = bind_ephemeral();
-    let (http_a, http_listener_a) = bind_ephemeral();
-    let (reverse_a, reverse_socket_a) = bind_ephemeral_udp();
+    let mut config_a = base_config(
+        "sg-a",
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config_a.dns_poll_interval = Duration::from_secs(1);
+    let reverse_tunnel_a = localhost_reverse_tunnel_config("127.0.0.1:0".parse().unwrap());
+    let listeners_a = BoundStargateListeners::bind(&mut config_a).unwrap();
+    let grpc_a = config_a.grpc_listen_addr;
+    let http_a = config_a.http_listen_addr;
+    let reverse_a = reverse_tunnel_a.listen_addr();
 
     // Point "sg-unreachable.stargate.external" at an address that refuses connections
     let unreachable_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -634,16 +612,14 @@ async fn relayed_tunnel_peer_unreachable() {
     resolver_a.insert("sg-unreachable.stargate.external", unreachable_addr);
     let resolver_a: Arc<dyn ForwardingResolver> = Arc::new(resolver_a);
 
+    config_a.forwarding = Some(resolver_a);
     let discovery_a = crate::common::SharedDiscovery::new("sg-a", grpc_a, http_a, peers.clone());
-    let mut config_a = base_config("sg-a", grpc_a, http_a);
-    config_a.dns_poll_interval = Duration::from_secs(1);
-    config_a.advertised_hostname_template = Some("localhost".to_string());
-    config_a.reverse_tunnel_listen_addr = Some(reverse_a);
-    let runtime_a = stargate::runtime::StargateRuntime::new(config_a, Box::new(discovery_a))
-        .with_forwarding(resolver_a)
-        .with_grpc_listener(grpc_listener_a)
-        .with_http_listener(http_listener_a)
-        .with_reverse_tunnel_socket(reverse_socket_a);
+    let runtime_a = stargate::runtime::StargateRuntime::new(
+        config_a,
+        Box::new(discovery_a),
+        listeners_a,
+        Some(reverse_tunnel_a),
+    );
 
     let handle_a = runtime_a.start().await.expect("stargate A failed");
 
@@ -659,7 +635,6 @@ async fn relayed_tunnel_peer_unreachable() {
         );
         c.sni_override = Some("sg-unreachable.stargate.external".to_string());
         c.quic_insecure = true;
-        c.output_token_parser_factory = OutputTokenParserFactory::vllm();
         c
     };
     let result = start_reverse_quic_tunnel(config).await;

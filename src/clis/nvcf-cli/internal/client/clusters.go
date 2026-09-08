@@ -27,7 +27,7 @@ import (
 	"net/url"
 )
 
-// RegisterClusterRequest represents the request to register a cluster with SIS
+// RegisterClusterRequest represents the request to register a cluster with ICMS
 type RegisterClusterRequest struct {
 	ClusterName      string   `json:"clusterName"`
 	ClusterGroupName string   `json:"clusterGroupName"`
@@ -56,14 +56,14 @@ type UpdateClusterJWKSRequest struct {
 
 const (
 	errFailedToSendRequest = "failed to send request: %w"
-	errSISAPI              = "SIS API error %d: %s"
+	errICMSAPI              = "ICMS API error %d: %s"
 )
 
-// RegisterCluster registers a new cluster with SIS
+// RegisterCluster registers a new cluster with ICMS
 func (c *Client) RegisterCluster(ctx context.Context, sisURL, ncaID string, req *RegisterClusterRequest) (*RegisterClusterResponse, error) {
 	endpoint := fmt.Sprintf("/v1/accounts/%s/clusters", url.PathEscape(ncaID))
 
-	resp, err := c.makeSISRequest(ctx, "POST", sisURL, endpoint, req)
+	resp, err := c.makeICMSRequest(ctx, "POST", sisURL, endpoint, req)
 	if err != nil {
 		return nil, fmt.Errorf(errFailedToSendRequest, err)
 	}
@@ -75,7 +75,7 @@ func (c *Client) RegisterCluster(ctx context.Context, sisURL, ncaID string, req 
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf(errSISAPI, resp.StatusCode, string(body))
+		return nil, fmt.Errorf(errICMSAPI, resp.StatusCode, string(body))
 	}
 
 	var result RegisterClusterResponse
@@ -90,7 +90,7 @@ func (c *Client) RegisterCluster(ctx context.Context, sisURL, ncaID string, req 
 func (c *Client) UpdateClusterJWKS(ctx context.Context, sisURL, clusterID string, req *UpdateClusterJWKSRequest) error {
 	endpoint := fmt.Sprintf("/v1/nvca/clusters/%s/jwks", url.PathEscape(clusterID))
 
-	resp, err := c.makeSISRequest(ctx, "PUT", sisURL, endpoint, req)
+	resp, err := c.makeICMSRequest(ctx, "PUT", sisURL, endpoint, req)
 	if err != nil {
 		return fmt.Errorf(errFailedToSendRequest, err)
 	}
@@ -99,28 +99,39 @@ func (c *Client) UpdateClusterJWKS(ctx context.Context, sisURL, clusterID string
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			return fmt.Errorf("SIS API error %d (failed to read error body: %v)", resp.StatusCode, readErr)
+			return fmt.Errorf("ICMS API error %d (failed to read error body: %v)", resp.StatusCode, readErr)
 		}
-		return fmt.Errorf(errSISAPI, resp.StatusCode, string(body))
+		return fmt.Errorf(errICMSAPI, resp.StatusCode, string(body))
 	}
 
 	return nil
 }
 
-// SISCluster represents a cluster returned by the SIS list-clusters endpoint.
-type SISCluster struct {
+// ICMSCluster represents a cluster returned by the ICMS list-clusters endpoint.
+//
+// The enrichment fields below (NVCAVersion, ClusterStatus, NVCALastConnected,
+// HealthyHeartbeatReportTime) exist in the SIS cluster_by_cluster_id table and
+// populate only if the list endpoint serializes them. They back the control-
+// plane view of `cluster agent status`. Follow-up: SIS should expose a richer
+// GET /v1/accounts/{ncaId}/clusters/{clusterId} so callers do not list-and-match.
+type ICMSCluster struct {
 	ClusterID      string `json:"clusterId,omitempty"`
 	ClusterName    string `json:"clusterName,omitempty"`
 	ClusterGroupID string `json:"clusterGroupId,omitempty"`
+
+	NVCAVersion                string `json:"nvcaVersion,omitempty"`
+	ClusterStatus              string `json:"status,omitempty"`
+	NVCALastConnected          string `json:"nvcaLastConnected,omitempty"`
+	HealthyHeartbeatReportTime string `json:"healthyHeartbeatReportTime,omitempty"`
 }
 
-// ListClusters lists clusters for an account via the SIS endpoint
+// ListClusters lists clusters for an account via the ICMS endpoint
 // GET /v1/accounts/{ncaId}/clusters. This uses cluster-management auth,
 // unlike the NVCF API's ListClusterGroups which requires NVCF API auth.
-func (c *Client) ListClusters(ctx context.Context, sisURL, ncaID string) ([]SISCluster, error) {
+func (c *Client) ListClusters(ctx context.Context, sisURL, ncaID string) ([]ICMSCluster, error) {
 	endpoint := fmt.Sprintf("/v1/accounts/%s/clusters", url.PathEscape(ncaID))
 
-	resp, err := c.makeSISRequest(ctx, "GET", sisURL, endpoint, nil)
+	resp, err := c.makeICMSRequest(ctx, "GET", sisURL, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf(errFailedToSendRequest, err)
 	}
@@ -132,10 +143,10 @@ func (c *Client) ListClusters(ctx context.Context, sisURL, ncaID string) ([]SISC
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(errSISAPI, resp.StatusCode, string(body))
+		return nil, fmt.Errorf(errICMSAPI, resp.StatusCode, string(body))
 	}
 
-	var result []SISCluster
+	var result []ICMSCluster
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
@@ -143,14 +154,14 @@ func (c *Client) ListClusters(ctx context.Context, sisURL, ncaID string) ([]SISC
 	return result, nil
 }
 
-// DeleteCluster deletes a cluster registration from SIS using the
+// DeleteCluster deletes a cluster registration from ICMS using the
 // account-scoped endpoint DELETE /v1/accounts/{ncaId}/clusters/{clusterId}.
 // The legacy /v1/nvca/clusters/{clusterId} route is not a valid SIS path and
 // returns 404.
 func (c *Client) DeleteCluster(ctx context.Context, sisURL, ncaID, clusterID string) error {
 	endpoint := fmt.Sprintf("/v1/accounts/%s/clusters/%s", url.PathEscape(ncaID), url.PathEscape(clusterID))
 
-	resp, err := c.makeSISRequest(ctx, "DELETE", sisURL, endpoint, nil)
+	resp, err := c.makeICMSRequest(ctx, "DELETE", sisURL, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf(errFailedToSendRequest, err)
 	}
@@ -159,15 +170,15 @@ func (c *Client) DeleteCluster(ctx context.Context, sisURL, ncaID, clusterID str
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			return fmt.Errorf("SIS API error %d (failed to read error body: %v)", resp.StatusCode, readErr)
+			return fmt.Errorf("ICMS API error %d (failed to read error body: %v)", resp.StatusCode, readErr)
 		}
-		return fmt.Errorf(errSISAPI, resp.StatusCode, string(body))
+		return fmt.Errorf(errICMSAPI, resp.StatusCode, string(body))
 	}
 
 	return nil
 }
 
-func (c *Client) makeSISRequest(ctx context.Context, method, sisURL, endpoint string, body interface{}) (*http.Response, error) {
+func (c *Client) makeICMSRequest(ctx context.Context, method, sisURL, endpoint string, body interface{}) (*http.Response, error) {
 	var reqBody io.Reader
 	if body != nil {
 		jsonBody, err := json.Marshal(body)

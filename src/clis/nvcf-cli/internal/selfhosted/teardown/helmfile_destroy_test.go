@@ -86,7 +86,6 @@ func TestDestroy_DefaultHelmfileFile(t *testing.T) {
 	require.NoError(t, Destroy(opts, &discardSink{}))
 
 	args := recorded.Args
-	// Without HelmfileFile override, -f should point to StackPath+"/helmfile.yaml.gotmpl"
 	assert.Contains(t, args, "/mystack/helmfile.d/")
 }
 
@@ -128,7 +127,6 @@ func TestDestroy_HelmfileFileOverride(t *testing.T) {
 
 	args := recorded.Args
 	assert.Contains(t, args, "helmfile-compute.yaml.gotmpl")
-	// The default StackPath+"/helmfile.yaml.gotmpl" must NOT appear when overridden.
 	for _, a := range args {
 		assert.NotEqual(t, "/stack/helmfile.d/", a)
 	}

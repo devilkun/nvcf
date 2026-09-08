@@ -23,7 +23,8 @@ bazel test //... --flaky_test_attempts=3
 ```
 
 CI subproject id: `ratelimiter`. Native Bazel validation and release wiring
-live in `tools/ci/subproject-validations.yaml`.
+live in `tools/ci/subproject-validations.yaml`, an internal GitLab CI config
+not present in this public snapshot.
 
 ## Proto and Test Gotchas
 
@@ -33,4 +34,5 @@ live in `tools/ci/subproject-validations.yaml`.
 - `protoc` is required for proto regeneration.
 - Package tests under `ratelimiter/cmd` bind fixed local ports such as
   `127.0.0.1:3320`; address conflicts are usually environmental.
-- New hand-authored Go files must use the existing SPDX Apache-2.0 header.
+- New hand-authored Go files must use the existing SPDX Apache-2.0
+  header. `check-license` enforces this at CI time.

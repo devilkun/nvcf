@@ -304,3 +304,20 @@ agent:
 	require.NotNil(t, cluster.NVCFBackend.Spec.AgentConfig.NATSHostOverride)
 	assert.Equal(t, "nats.gateway.example.test", *cluster.NVCFBackend.Spec.AgentConfig.NATSHostOverride)
 }
+
+func TestConfigMapClient_GetCluster_LLMRequestRouterAddress(t *testing.T) {
+	yamlWithLLMRequestRouter := `
+clusterId: test-cluster-id
+clusterName: test-cluster
+agent:
+  llmRequestRouterAddress: llm-request-router.nvcf.svc.cluster.local:50071
+`
+
+	c := newConfigMapClient(nvidiaiov1.EnvTypeProd, dummyFetcher(yamlWithLLMRequestRouter, nil), DefaultVaultOAuthClientMountPathTemplate)
+	cluster, err := c.GetCluster(context.Background(), "")
+	require.NoError(t, err)
+	require.NotNil(t, cluster)
+
+	assert.Equal(t, "llm-request-router.nvcf.svc.cluster.local:50071",
+		cluster.NVCFBackend.Spec.AgentConfig.LLMRequestRouterAddress)
+}

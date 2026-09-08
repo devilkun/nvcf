@@ -26,7 +26,7 @@ import (
 )
 
 func selfHostedPreflightTools() []selfhosted.BinarySpec {
-	return selfhosted.DefaultToolsWithPreferredDir(localStackBinDir(selfHostedStack))
+	return selfhosted.DefaultToolsWithPreferredDir(localStackBinDir(selfHostedControlPlaneStack))
 }
 
 func localStackBinDir(stackSource string) string {

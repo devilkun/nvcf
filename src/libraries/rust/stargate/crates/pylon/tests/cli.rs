@@ -21,6 +21,8 @@ fn invalid_metrics_addr_exits_nonzero() {
         .args([
             "--upstream-http-base-url",
             "http://127.0.0.1:1",
+            "--initial-input-tps",
+            "100",
             "--metrics-host",
             "not-a-socket-host",
         ])

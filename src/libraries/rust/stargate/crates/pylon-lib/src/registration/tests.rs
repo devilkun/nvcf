@@ -13,53 +13,424 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::router_stream::{RouterAdvertisedStatusTracker, observe_advertised_statuses};
-use super::urls::infer_upstream_http_base_url;
-use super::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::pin::Pin;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bringup::{BringupConfig, BringupModelUpdate, ModelBringupState};
-use crate::output_token_parser::OutputTokenParserFactory;
-use crate::queue_admission::{PylonQueueMismatchRetryConfig, QueueAdmissionTracker};
-use crate::quic_http_tunnel::{
-    PylonRetryConfig, ReverseQuicTunnelHandle, TunnelError, TunnelForwardingConfig,
+use futures::Stream;
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+use stargate_proto::pb::stargate_control_plane_server::{
+    StargateControlPlane, StargateControlPlaneServer,
 };
-use crate::request_quality_monitor::RequestQualityMonitorConfig;
-use crate::stats::PylonMetrics;
 use stargate_proto::pb::{
-    InferenceServerAck, InferenceServerModelRegistration, InferenceServerStatus, ModelStats,
+    InferenceServerAck, InferenceServerModelRegistration, InferenceServerRegistration,
+    InferenceServerStatus, ModelStats, StargateInfo, WatchStargatesRequest, WatchStargatesResponse,
 };
 use stargate_protocol::TunnelTransportProtocol;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
-
-use axum::Router;
-use axum::extract::State;
-use axum::response::Response;
-use axum::routing::{get, post};
+use stargate_runtime::OwnedTask;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
+use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::{Request, Response, Status};
+use tower::util::MapRequestLayer;
 
-struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+use crate::quic_http_tunnel::{TunnelError, TunnelForwardingConfig};
+use crate::request_quality_monitor::RequestQualityMonitorConfig;
+use crate::runtime_state::{CurrentModelStats, PylonRuntimeState, gated_model_status};
+use crate::stats::PylonMetrics;
+use crate::test_support::{RecordedTracingEvent, RecordingTracingSubscriber};
 
-impl Drop for DropNotifier {
-    fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
+use super::discovery::*;
+use super::grpc_endpoint::*;
+use super::reverse_tunnel::*;
+use super::router_stream::*;
+use super::state::*;
+use super::topology::*;
+use super::types::RegistrationSessionConfig;
+use super::urls::infer_upstream_http_base_url;
+use super::*;
+
+const TEST_WAIT: Duration = Duration::from_secs(5);
+const TEST_ROUTER_AUTHORITY: &str = "router-0.router-headless.example.invalid:50071";
+const DEFAULT_ROOT_TEST_DIAL_URL_ENV: &str = "PYLON_DEFAULT_ROOT_TEST_DIAL_URL";
+const CUSTOM_ROOT_TEST_CA_PATH_ENV: &str = "PYLON_CUSTOM_ROOT_TEST_CA_PATH";
+
+type TestWatchStream =
+    Pin<Box<dyn Stream<Item = Result<WatchStargatesResponse, Status>> + Send + 'static>>;
+type TestRegistrationStream =
+    Pin<Box<dyn Stream<Item = Result<InferenceServerAck, Status>> + Send + 'static>>;
+
+struct TestCertificateAuthority {
+    cert: rcgen::Certificate,
+    key: KeyPair,
+}
+
+impl TestCertificateAuthority {
+    fn new(common_name: &str) -> Self {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        let key = KeyPair::generate().expect("test CA key should generate");
+        let cert = params
+            .self_signed(&key)
+            .expect("test CA certificate should generate");
+        Self { cert, key }
+    }
+
+    fn pem(&self) -> Vec<u8> {
+        self.cert.pem().into_bytes()
+    }
+
+    fn issue_server_identity(&self, dns_name: &str) -> Identity {
+        let params = CertificateParams::new(vec![dns_name.to_string()])
+            .expect("test server certificate params should build");
+        let key = KeyPair::generate().expect("test server key should generate");
+        let cert = params
+            .signed_by(&key, &self.cert, &self.key)
+            .expect("test server certificate should generate");
+        Identity::from_pem(cert.pem(), key.serialize_pem())
+    }
+}
+
+#[derive(Clone)]
+struct TestTlsControlPlaneService {
+    dial_url: String,
+    watch_authorities: mpsc::UnboundedSender<String>,
+    registration_authorities: mpsc::UnboundedSender<String>,
+    registrations: mpsc::UnboundedSender<InferenceServerRegistration>,
+}
+
+#[tonic::async_trait]
+impl StargateControlPlane for TestTlsControlPlaneService {
+    type WatchStargatesStream = TestWatchStream;
+    type RegisterInferenceServerStream = TestRegistrationStream;
+
+    async fn watch_stargates(
+        &self,
+        request: Request<WatchStargatesRequest>,
+    ) -> Result<Response<Self::WatchStargatesStream>, Status> {
+        let _ = self.watch_authorities.send(
+            request
+                .extensions()
+                .get::<http::uri::Authority>()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
+        let response = WatchStargatesResponse {
+            stargates: vec![stargate_info(
+                "stargate-0",
+                TEST_ROUTER_AUTHORITY,
+                &self.dial_url,
+            )],
+            watch_stargate_urls: Vec::new(),
+        };
+        Ok(Response::new(Box::pin(
+            tokio_stream::once(Ok(response)).chain(tokio_stream::pending()),
+        )))
+    }
+
+    async fn register_inference_server(
+        &self,
+        request: Request<tonic::Streaming<InferenceServerRegistration>>,
+    ) -> Result<Response<Self::RegisterInferenceServerStream>, Status> {
+        let _ = self.registration_authorities.send(
+            request
+                .extensions()
+                .get::<http::uri::Authority>()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
+        let mut stream = request.into_inner();
+        let registrations = self.registrations.clone();
+        tokio::spawn(async move {
+            if let Ok(Some(registration)) = stream.message().await {
+                let _ = registrations.send(registration);
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::once(Ok(InferenceServerAck::default())).chain(tokio_stream::pending()),
+        )))
+    }
+}
+
+struct TestTlsControlPlane {
+    dial_url: String,
+    watch_authorities: mpsc::UnboundedReceiver<String>,
+    registration_authorities: mpsc::UnboundedReceiver<String>,
+    registrations: mpsc::UnboundedReceiver<InferenceServerRegistration>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestTlsControlPlane {
+    async fn spawn(ca: &TestCertificateAuthority, dns_name: &str) -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test TLS server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test TLS server address should resolve");
+        let dial_url = format!("https://localhost:{}", addr.port());
+        let (watch_authorities, watch_authorities_rx) = mpsc::unbounded_channel();
+        let (registration_authorities, registration_authorities_rx) = mpsc::unbounded_channel();
+        let (registrations, registrations_rx) = mpsc::unbounded_channel();
+        let service = TestTlsControlPlaneService {
+            dial_url: dial_url.clone(),
+            watch_authorities,
+            registration_authorities,
+            registrations,
+        };
+        let identity = ca.issue_server_identity(dns_name);
+        let incoming = async_stream::stream! {
+            loop {
+                yield listener.accept().await.map(|(stream, _)| stream);
+            }
+        };
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .tls_config(ServerTlsConfig::new().identity(identity))
+                .expect("test TLS server config should build")
+                .layer(MapRequestLayer::new(|mut request: http::Request<_>| {
+                    if let Some(authority) = request.uri().authority().cloned() {
+                        request.extensions_mut().insert(authority);
+                    }
+                    request
+                }))
+                .add_service(StargateControlPlaneServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test TLS server should serve");
+        });
+        Self {
+            dial_url,
+            watch_authorities: watch_authorities_rx,
+            registration_authorities: registration_authorities_rx,
+            registrations: registrations_rx,
+            task,
         }
+    }
+
+    async fn first_registration(&mut self) -> InferenceServerRegistration {
+        tokio::time::timeout(TEST_WAIT, self.registrations.recv())
+            .await
+            .expect("worker registration should not time out")
+            .expect("worker registration channel should remain open")
+    }
+
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+async fn tls_connect_error(server: &TestTlsControlPlane, ca_cert_pem: Option<&[u8]>) -> String {
+    let endpoint =
+        StargateGrpcEndpoint::new(server.dial_url.clone(), "").expect("test endpoint should build");
+    let error = endpoint
+        .channel_endpoint(ca_cert_pem)
+        .expect("test channel endpoint should configure")
+        .connect()
+        .await
+        .expect_err("TLS connection should fail");
+    format!("{error:?}").to_lowercase()
+}
+
+async fn wait_for_registration_failure_event(
+    subscriber: &RecordingTracingSubscriber,
+) -> RecordedTracingEvent {
+    wait_for_tracing_event_count(subscriber, "Stargate gRPC connection failed", 1).await;
+    subscriber
+        .events()
+        .into_iter()
+        .find(|event| {
+            event.fields.get("message").map(String::as_str)
+                == Some("Stargate gRPC connection failed")
+        })
+        .expect("Stargate gRPC failure event should remain recorded")
+}
+
+async fn wait_for_tracing_event_count(
+    subscriber: &RecordingTracingSubscriber,
+    message: &str,
+    expected: usize,
+) {
+    tokio::time::timeout(TEST_WAIT, async {
+        loop {
+            let count = subscriber.event_count(message);
+            if count >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected {expected} {message:?} tracing events"));
+}
+
+fn assert_registration_failure_event(
+    event: &RecordedTracingEvent,
+    expected_operation: &str,
+    expected_kind: &str,
+    expected_reason: &str,
+    expected_action: &str,
+) {
+    assert_eq!(event.level, tracing::Level::ERROR);
+    for (field, expected) in [
+        ("transport", "grpc"),
+        ("operation", expected_operation),
+        ("failure_kind", expected_kind),
+        ("failure_reason", expected_reason),
+        ("dial_host", "localhost"),
+        ("authority_host", "localhost"),
+        ("tls", "true"),
+    ] {
+        assert_eq!(
+            event.fields.get(field).map(String::as_str),
+            Some(expected),
+            "unexpected {field} in recorded event: {event:?}"
+        );
+    }
+    assert!(
+        event
+            .fields
+            .get("corrective_action")
+            .is_some_and(|action| action.contains(expected_action)),
+        "failure should tell the operator how to correct certificate validation: {event:?}"
+    );
+    for secret_fragment in ["BEGIN CERTIFICATE", "PRIVATE KEY"] {
+        assert!(
+            event
+                .fields
+                .values()
+                .all(|value| !value.contains(secret_fragment)),
+            "failure event exposed certificate material: {event:?}"
+        );
     }
 }
 
 fn grpc_endpoint(authority_addr: &str) -> StargateGrpcEndpoint {
-    StargateGrpcEndpoint::new(authority_addr.to_string(), authority_addr.to_string())
+    StargateGrpcEndpoint::new(authority_addr.to_string(), "")
         .expect("test endpoint authority should be non-empty")
 }
 
 fn grpc_endpoint_with_dial(authority_addr: &str, dial_addr: &str) -> StargateGrpcEndpoint {
     StargateGrpcEndpoint::new(authority_addr.to_string(), dial_addr.to_string())
         .expect("test endpoint authority should be non-empty")
+}
+
+fn typed_tls_io_error(certificate_error: rustls::CertificateError) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        rustls::Error::InvalidCertificate(certificate_error),
+    )
+}
+
+fn stargate_info(
+    stargate_id: &str,
+    advertise_addr: &str,
+    grpc_pylon_dial_addr: &str,
+) -> StargateInfo {
+    StargateInfo {
+        stargate_id: stargate_id.to_string(),
+        advertise_addr: advertise_addr.to_string(),
+        http_advertise_addr: String::new(),
+        grpc_pylon_dial_addr: grpc_pylon_dial_addr.to_string(),
+    }
+}
+
+fn watch_snapshot(routers: &[&str], watch_urls: &[&str]) -> WatchEndpointSnapshot {
+    WatchEndpointSnapshot {
+        registration_routers: routers
+            .iter()
+            .map(|router| ((*router).to_string(), grpc_endpoint(router)))
+            .collect(),
+        watch_urls: watch_urls.iter().map(|url| (*url).to_string()).collect(),
+    }
+}
+
+fn test_registration_config() -> InferenceServerRegistrationConfig {
+    InferenceServerRegistrationConfig {
+        seeds: vec!["router-a".to_string()],
+        inference_server_id: "inst-a".to_string(),
+        cluster_id: "cluster-a".to_string(),
+        inference_server_url: "quic://127.0.0.1:8443".to_string(),
+        forwarding: TunnelForwardingConfig {
+            runtime_state: PylonRuntimeState::new(
+                InferenceServerStatus::Active,
+                &["model-a".to_string()],
+            ),
+            ..Default::default()
+        },
+        min_update_interval: Duration::from_secs(2),
+        reverse_tunnel: false,
+        tls_cert_pem: None,
+        grpc_tls_ca_cert_pem: None,
+        quic_insecure: true,
+        tunnel_protocol: TunnelTransportProtocol::RawQuic,
+        auth_token_provider: None,
+    }
+}
+
+fn registration_with_active_model(
+    reverse_tunnel: bool,
+    reverse_connected: bool,
+) -> InferenceServerRegistration {
+    let models = HashMap::from([(
+        "model-a".to_string(),
+        InferenceServerModelRegistration {
+            stats: Some(ModelStats {
+                last_mean_input_tps: 30.0,
+                ..ModelStats::default()
+            }),
+            status: InferenceServerStatus::Active.into(),
+        },
+    )]);
+    build_inference_server_registration(
+        "client-a",
+        "cluster-a",
+        "quic://127.0.0.1:9000",
+        &models,
+        reverse_tunnel,
+        reverse_connected,
+    )
+}
+
+fn assert_metrics(metrics: &PylonMetrics, samples: &[&str]) {
+    let body = metrics.gather_text().expect("metrics should encode");
+    for sample in samples {
+        assert!(body.contains(sample), "missing metric sample: {sample}");
+    }
+}
+
+fn assert_invalid_registration_config(
+    expected: &str,
+    mutate: impl FnOnce(&mut InferenceServerRegistrationConfig),
+) {
+    let mut config = test_registration_config();
+    mutate(&mut config);
+    assert!(
+        matches!(RegistrationSessionConfig::try_from(config), Err(ClientError::Config(message)) if message == expected),
+        "expected registration config error: {expected}"
+    );
+}
+
+async fn cancel_blocked_task<T>(
+    stop: CancellationToken,
+    task: tokio::task::JoinHandle<T>,
+    context: &str,
+) -> T {
+    tokio::task::yield_now().await;
+    stop.cancel();
+    tokio::time::timeout(TEST_WAIT, task)
+        .await
+        .expect(context)
+        .expect("blocked send task should not panic")
 }
 
 #[test]
@@ -79,1504 +450,1035 @@ fn reverse_tunnel_connectivity_only_overrides_router_local_advertisement() {
 }
 
 #[test]
-fn stargate_grpc_debug_target_parses_host_port_and_tls() {
-    let target = stargate_grpc_debug_target("https://stargate.example.svc:50051").unwrap();
+fn bringup_gates_active_status_until_model_is_advertising() {
+    for (bringup_ready, expected) in [
+        (false, InferenceServerStatus::Inactive),
+        (true, InferenceServerStatus::Active),
+    ] {
+        assert_eq!(
+            gated_model_status(InferenceServerStatus::Active, bringup_ready),
+            expected
+        );
+    }
+}
 
+#[test]
+fn registration_payload_keeps_every_runtime_model_and_gates_reverse_connectivity() {
+    let update = registration_with_active_model(true, false);
+
+    assert_eq!(update.cluster_id, "cluster-a");
+    assert_eq!(update.models.len(), 1);
     assert_eq!(
-        target,
-        StargateGrpcDebugTarget {
-            endpoint: "https://stargate.example.svc:50051".to_string(),
-            scheme: "https".to_string(),
-            host: "stargate.example.svc".to_string(),
-            port: 50051,
-        }
+        update.models["model-a"].status,
+        InferenceServerStatus::Inactive as i32
     );
 }
 
 #[test]
-fn stargate_grpc_debug_target_defaults_ports() {
-    let http_target = stargate_grpc_debug_target("http://router-a").unwrap();
-    let https_target = stargate_grpc_debug_target("https://router-a").unwrap();
+fn router_advertisement_metrics_are_cleared_when_tracker_drops() {
+    let metrics = PylonMetrics::new().expect("metrics should initialize");
+    let update = registration_with_active_model(false, false);
 
-    assert_eq!(http_target.port, 80);
-    assert_eq!(https_target.port, 443);
+    {
+        let mut tracker = RouterAdvertisedStatusTracker::new(Some(metrics.as_ref()), "router-a");
+        tracker.record_successful_advertisement(advertised_model_statuses(&update));
+        tracker.record_reverse_tunnel_connected(true);
+        assert_metrics(
+            &metrics,
+            &[
+                r#"pylon_model_advertised_status{model="model-a",router="router-a",status="active"} 1"#,
+                r#"pylon_registration_stream_connected{router="router-a"} 1"#,
+                r#"pylon_reverse_tunnel_connected{router="router-a"} 1"#,
+            ],
+        );
+    }
+
+    assert_metrics(
+        &metrics,
+        &[
+            r#"pylon_model_advertised_status{model="model-a",router="router-a",status="active"} 0"#,
+            r#"pylon_registration_stream_connected{router="router-a"} 0"#,
+            r#"pylon_reverse_tunnel_connected{router="router-a"} 0"#,
+        ],
+    );
+}
+
+#[test]
+fn router_advertisement_metrics_remove_models_omitted_from_next_snapshot() {
+    let metrics = PylonMetrics::new().expect("metrics should initialize");
+    let update = registration_with_active_model(false, false);
+    let mut tracker = RouterAdvertisedStatusTracker::new(Some(metrics.as_ref()), "router-a");
+
+    tracker.record_successful_advertisement(advertised_model_statuses(&update));
+    tracker.record_successful_advertisement(Vec::new());
+
+    let body = metrics.gather_text().expect("metrics should encode");
+    assert!(!body.contains(r#"pylon_model_advertised_status{model="model-a""#));
+}
+
+#[test]
+fn registration_session_config_normalizes_reverse_url_and_cluster_id() {
+    let mut config = test_registration_config();
+    config.cluster_id.clear();
+    config.inference_server_url = "http://127.0.0.1:8090/".to_string();
+    config.reverse_tunnel = true;
+
+    let session = RegistrationSessionConfig::try_from(config).expect("session should build");
+
+    assert_eq!(session.watch_seeds, ["router-a"]);
+    assert_eq!(session.cluster_id, "inst-a");
+    assert_eq!(session.inference_server_url, "http://127.0.0.1:8090");
+}
+
+#[test]
+fn registration_session_config_rejects_invalid_public_config() {
+    assert_invalid_registration_config("stargate seeds are empty", |config| config.seeds.clear());
+    assert_invalid_registration_config(
+        "direct registration inference_server_url must be quic://",
+        |config| config.inference_server_url = "http://127.0.0.1:8090".to_string(),
+    );
+    assert_invalid_registration_config(
+        "reverse registration inference_server_url must be http(s)",
+        |config| {
+            config.reverse_tunnel = true;
+            config.inference_server_url = "quic://127.0.0.1:8090".to_string();
+        },
+    );
+}
+
+#[test]
+fn registration_session_config_accepts_empty_runtime_membership() {
+    let mut config = test_registration_config();
+    config.forwarding.runtime_state = PylonRuntimeState::default();
+
+    let session = RegistrationSessionConfig::try_from(config)
+        .expect("an authoritative empty model snapshot should register");
+
+    assert!(
+        session
+            .forwarding
+            .runtime_state
+            .advertised_model_ids()
+            .is_empty()
+    );
+}
+
+#[test]
+fn registration_session_keeps_grpc_and_quic_trust_independent() {
+    let mut config = test_registration_config();
+    config.tls_cert_pem = Some(b"quic trust".to_vec());
+    config.grpc_tls_ca_cert_pem = Some(b"grpc trust".to_vec());
+
+    let session = RegistrationSessionConfig::try_from(config).expect("session should build");
+
+    assert_eq!(session.tls_cert_pem.as_deref(), Some(&b"quic trust"[..]));
+    assert_eq!(
+        session.grpc_tls_ca_cert_pem.as_deref(),
+        Some(&b"grpc trust"[..])
+    );
+}
+
+#[test]
+fn reverse_tunnel_config_uses_registration_upstream_and_preserves_forwarding() {
+    let metrics = PylonMetrics::new().expect("metrics should initialize");
+    let mut config = test_registration_config();
+    config.reverse_tunnel = true;
+    config.inference_server_url = "http://127.0.0.1:8090/".to_string();
+    config.forwarding.metrics = Some(metrics.clone());
+    let session = RegistrationSessionConfig::try_from(config).expect("session should build");
+    let endpoint = ReverseTunnelEndpoint {
+        routing_target_addr: "router-a:50072".to_string(),
+        pylon_dial_addr: "dial-a:50072".to_string(),
+        sni_override: Some("router-a".to_string()),
+    };
+
+    let tunnel = reverse_quic_tunnel_config(&endpoint, &session);
+
+    assert_eq!(tunnel.upstream_http_base_url, "http://127.0.0.1:8090");
+    assert!(Arc::ptr_eq(
+        tunnel.forwarding.metrics.as_ref().unwrap(),
+        &metrics
+    ));
 }
 
 #[test]
 fn stargate_grpc_endpoint_rejects_empty_authority_and_formats_dial_overrides() {
-    assert!(StargateGrpcEndpoint::new(" ", "stargate-grpc-lb:443").is_none());
-
+    assert!(StargateGrpcEndpoint::new(" ", "https://stargate-grpc-lb:443").is_none());
+    assert!(StargateGrpcEndpoint::new("router-a:50071", "stargate-grpc-lb:443").is_none());
     assert_eq!(
-        grpc_endpoint("router-a:50071").to_string(),
-        "router-a:50071"
-    );
-    assert_eq!(
-        grpc_endpoint_with_dial("router-a:50071", "stargate-grpc-lb:443").to_string(),
-        "router-a:50071 via stargate-grpc-lb:443"
+        grpc_endpoint_with_dial("router-a:50071", "https://stargate-grpc-lb:443").to_string(),
+        "router-a:50071 via https://stargate-grpc-lb:443"
     );
 }
 
 #[test]
-fn bringup_gates_active_status_until_model_is_advertising() {
-    assert_eq!(
-        gated_model_status(
-            InferenceServerStatus::Active,
-            ModelBringupState::ConnectingUnavailable
-        ),
-        InferenceServerStatus::Inactive
-    );
-    assert_eq!(
-        gated_model_status(InferenceServerStatus::Active, ModelBringupState::Recovering),
-        InferenceServerStatus::Inactive
-    );
-    assert_eq!(
-        gated_model_status(
-            InferenceServerStatus::Active,
-            ModelBringupState::AdvertisingActive
-        ),
-        InferenceServerStatus::Active
+fn stargate_grpc_endpoint_rejects_custom_ca_for_plaintext_http() {
+    let endpoint = grpc_endpoint_with_dial("router-a:50071", "http://stargate-grpc-lb:50071");
+
+    let error = endpoint
+        .channel_endpoint(Some(b"private CA contents must not be logged"))
+        .expect_err("custom CA with plaintext HTTP should be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("custom CA for stargate gRPC requires an HTTPS dial endpoint"),
+        "unexpected error: {error:#}"
     );
 }
 
 #[test]
-fn observes_router_advertised_status_from_registration_update() {
-    let metrics = PylonMetrics::new().expect("metrics should initialize");
-    let mut models = HashMap::new();
-    models.insert(
-        "model-a".to_string(),
-        InferenceServerModelRegistration {
-            stats: Some(ModelStats {
-                last_mean_input_tps: 30.0,
-                ..ModelStats::default()
-            }),
-            status: InferenceServerStatus::Active.into(),
-        },
-    );
+fn grpc_failure_log_omits_unsafe_endpoint_userinfo_and_query() {
+    let unsafe_user = "unsafe-user";
+    let unsafe_password = "unsafe-password";
+    let unsafe_token = "unsafe-token";
+    let unsafe_endpoint = [
+        "https://",
+        unsafe_user,
+        ":",
+        unsafe_password,
+        "@",
+        "authority.example:443",
+        "/private?",
+        "token=",
+        unsafe_token,
+    ]
+    .concat();
+    let target = grpc_endpoint_with_dial(&unsafe_endpoint, "https://dial.example:443");
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
 
-    let registration_update = build_inference_server_registration(
-        "client-a",
-        "cluster-a",
-        "quic://127.0.0.1:9000",
-        &models,
-        true,
-        false,
-        false,
-    );
-    let advertised = advertised_model_statuses(&registration_update);
-    observe_advertised_statuses(Some(metrics.as_ref()), "router-a", &advertised);
+    let error = typed_tls_io_error(rustls::CertificateError::UnknownIssuer);
+    log_stargate_grpc_certificate_failure(&target, "watch_stargates", &error, None);
 
-    let body = metrics.gather_text().expect("metrics should encode");
-    assert!(body.contains(
-        r#"pylon_model_advertised_status{model="model-a",router="router-a",status="inactive"} 1"#
-    ));
-    assert!(body.contains(
-        r#"pylon_model_advertised_status{model="model-a",router="router-a",status="active"} 0"#
-    ));
-}
-
-#[test]
-fn clears_router_advertised_status_when_tracker_drops() {
-    let metrics = PylonMetrics::new().expect("metrics should initialize");
-    let mut models = HashMap::new();
-    models.insert(
-        "model-a".to_string(),
-        InferenceServerModelRegistration {
-            stats: None,
-            status: InferenceServerStatus::Active.into(),
-        },
-    );
-    let registration_update = build_inference_server_registration(
-        "client-a",
-        "cluster-a",
-        "quic://127.0.0.1:9000",
-        &models,
-        false,
-        false,
-        false,
-    );
-
-    {
-        let mut tracker = RouterAdvertisedStatusTracker::new(Some(metrics.as_ref()), "router-a");
-        tracker.record_successful_advertisement(advertised_model_statuses(&registration_update));
-        let body = metrics.gather_text().expect("metrics should encode");
-        assert!(body.contains(
-            r#"pylon_model_advertised_status{model="model-a",router="router-a",status="active"} 1"#
-        ));
-        assert!(body.contains(r#"pylon_registration_stream_connected{router="router-a"} 1"#));
-        tracker.record_reverse_tunnel_connected(true);
-        let body = metrics.gather_text().expect("metrics should encode");
-        assert!(body.contains(r#"pylon_reverse_tunnel_connected{router="router-a"} 1"#));
-    }
-
-    let body = metrics.gather_text().expect("metrics should encode");
-    assert!(body.contains(
-        r#"pylon_model_advertised_status{model="model-a",router="router-a",status="active"} 0"#
-    ));
-    assert!(body.contains(
-        r#"pylon_model_advertised_status{model="model-a",router="router-a",status="inactive"} 1"#
-    ));
-    assert!(body.contains(r#"pylon_registration_stream_connected{router="router-a"} 0"#));
-    assert!(body.contains(r#"pylon_reverse_tunnel_connected{router="router-a"} 0"#));
-}
-
-#[test]
-fn infers_http_upstream_base_url_from_http_registration_url() {
-    assert_eq!(
-        infer_upstream_http_base_url("http://127.0.0.1:8000"),
-        Some("http://127.0.0.1:8000".to_string())
-    );
-    assert_eq!(infer_upstream_http_base_url("quic://127.0.0.1:8000"), None);
-}
-
-fn test_registration_config() -> InferenceServerRegistrationConfig {
-    InferenceServerRegistrationConfig {
-        seeds: vec!["router-a".to_string()],
-        inference_server_id: "inst-a".to_string(),
-        cluster_id: "cluster-a".to_string(),
-        inference_server_url: "quic://127.0.0.1:8443".to_string(),
-        upstream_http_base_url: Some("http://127.0.0.1:8090".to_string()),
-        min_update_interval: Duration::from_secs(2),
-        status: InferenceServerStatus::Active,
-        reverse_tunnel: false,
-        quic_insecure: true,
-        tunnel_protocol: TunnelTransportProtocol::Custom,
-        bringup: BringupConfig::default(),
-        output_token_parser_factory: OutputTokenParserFactory,
-        request_observation_tx: None,
-        request_quality_monitor: RequestQualityMonitorConfig::default(),
-        metrics: None,
-        retry: PylonRetryConfig::default(),
-        queue_mismatch_retry: PylonQueueMismatchRetryConfig::default(),
-        queue_tracker: QueueAdmissionTracker::default(),
-        auth_token_provider: None,
-    }
-}
-
-#[test]
-fn registration_start_plan_normalizes_config_before_orchestration() {
-    let mut config = test_registration_config();
-    config.cluster_id = String::new();
-    config.inference_server_url = "http://127.0.0.1:8090".to_string();
-    config.upstream_http_base_url = None;
-    config.reverse_tunnel = true;
-
-    let plan = RegistrationStartPlan::from_config(&config).expect("plan should build");
-
-    assert_eq!(plan.watch_seeds, vec!["router-a".to_string()]);
-    assert_eq!(plan.cluster_id, "inst-a");
-    assert_eq!(plan.upstream_http_base_url, "http://127.0.0.1:8090");
-}
-
-#[test]
-fn registration_start_plan_rejects_invalid_startup_config() {
-    let mut empty_seeds = test_registration_config();
-    empty_seeds.seeds.clear();
-    assert!(matches!(
-        RegistrationStartPlan::from_config(&empty_seeds),
-        Err(ClientError::Config(message)) if message == "stargate seeds are empty"
-    ));
-
-    let mut missing_upstream = test_registration_config();
-    missing_upstream.inference_server_url = "quic://127.0.0.1:8443".to_string();
-    missing_upstream.upstream_http_base_url = None;
-    assert!(matches!(
-        RegistrationStartPlan::from_config(&missing_upstream),
-        Err(ClientError::Config(message))
-            if message == "upstream_http_base_url is required when inference_server_url is not http(s)"
-    ));
-
-    let mut direct_http_url = test_registration_config();
-    direct_http_url.inference_server_url = "http://127.0.0.1:8090".to_string();
-    direct_http_url.upstream_http_base_url = None;
-    direct_http_url.reverse_tunnel = false;
-    assert!(matches!(
-        RegistrationStartPlan::from_config(&direct_http_url),
-        Err(ClientError::Config(message))
-            if message == "direct registration inference_server_url must be quic://"
-    ));
-}
-
-#[tokio::test]
-async fn cancelled_registration_join_wait_aborts_child_task() {
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-    let child = tokio::spawn(async move {
-        let _drop_notifier = DropNotifier(Some(dropped_tx));
-        let _ = entered_tx.send(());
-        std::future::pending::<()>().await;
-    });
-
-    entered_rx.await.expect("child should start");
-
-    {
-        let wait = await_named_join_handle(
-            NamedJoinHandle::new("pending registration child", child),
-            Duration::from_secs(30),
+    let event = subscriber
+        .events()
+        .into_iter()
+        .find(|event| {
+            event.fields.get("message").map(String::as_str)
+                == Some("Stargate gRPC connection failed")
+        })
+        .expect("failure should emit an event");
+    for unsafe_fragment in [unsafe_user, unsafe_password, unsafe_token, "/private"] {
+        assert!(
+            event
+                .fields
+                .values()
+                .all(|value| !value.contains(unsafe_fragment)),
+            "failure event exposed unsafe endpoint material: {event:?}"
         );
-        tokio::pin!(wait);
-        tokio::select! {
-            biased;
-            _ = &mut wait => panic!("pending child should not finish before cancellation"),
-            _ = tokio::task::yield_now() => {}
-        }
+    }
+}
+
+#[test]
+fn grpc_debug_log_omits_unsafe_endpoint_userinfo_and_query() {
+    let unsafe_user = "unsafe-debug-user";
+    let unsafe_password = "unsafe-debug-password";
+    let unsafe_token = "unsafe-debug-token";
+    let unsafe_path = "/private-debug";
+    let unsafe_endpoint = format!(
+        "https://{unsafe_user}:{unsafe_password}@authority.example:443{unsafe_path}?token={unsafe_token}"
+    );
+    let target = grpc_endpoint_with_dial(&unsafe_endpoint, "https://dial.example:443");
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+
+    log_stargate_grpc_connect_attempt(&target, "watch_stargates", "lazy");
+
+    let event = subscriber
+        .events()
+        .into_iter()
+        .find(|event| {
+            event.fields.get("message").map(String::as_str)
+                == Some("attempting Stargate gRPC connection")
+        })
+        .expect("connection attempt should emit a debug event");
+    for unsafe_fragment in [unsafe_user, unsafe_password, unsafe_token, unsafe_path] {
+        assert!(
+            event
+                .fields
+                .values()
+                .all(|value| !value.contains(unsafe_fragment)),
+            "debug event exposed unsafe endpoint material: {event:?}"
+        );
+    }
+}
+
+#[test]
+fn grpc_certificate_failure_log_emits_when_failure_kind_changes() {
+    let target = grpc_endpoint("router.example.test:50071");
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+    let unknown_issuer = typed_tls_io_error(rustls::CertificateError::UnknownIssuer);
+    let hostname_mismatch = typed_tls_io_error(rustls::CertificateError::NotValidForName);
+
+    let mut last_failure = None;
+    last_failure = log_stargate_grpc_certificate_failure(
+        &target,
+        "watch_stargates",
+        &unknown_issuer,
+        last_failure,
+    );
+    last_failure = log_stargate_grpc_certificate_failure(
+        &target,
+        "watch_stargates",
+        &unknown_issuer,
+        last_failure,
+    );
+    let _ = log_stargate_grpc_certificate_failure(
+        &target,
+        "watch_stargates",
+        &hostname_mismatch,
+        last_failure,
+    );
+
+    let failure_kinds = subscriber
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.fields.get("message").map(String::as_str)
+                == Some("Stargate gRPC connection failed")
+        })
+        .filter_map(|event| event.fields.get("failure_kind").cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failure_kinds,
+        ["tls_unknown_issuer", "tls_hostname_mismatch"]
+    );
+}
+
+#[test]
+fn grpc_certificate_failure_log_stays_suppressed_across_unclassified_errors() {
+    let target = grpc_endpoint("router.example.test:50071");
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+    let certificate_error = typed_tls_io_error(rustls::CertificateError::UnknownIssuer);
+    let transport_error = std::io::Error::other("ordinary transport failure");
+
+    let mut last_failure =
+        log_stargate_grpc_certificate_failure(&target, "watch_stargates", &certificate_error, None);
+    last_failure = log_stargate_grpc_certificate_failure(
+        &target,
+        "watch_stargates",
+        &transport_error,
+        last_failure,
+    );
+    let _ = log_stargate_grpc_certificate_failure(
+        &target,
+        "watch_stargates",
+        &certificate_error,
+        last_failure,
+    );
+
+    assert_eq!(
+        subscriber.event_count("Stargate gRPC connection failed"),
+        1,
+        "an unclassified retry error must not start a new certificate-failure episode"
+    );
+}
+
+#[test]
+fn grpc_failure_log_ignores_certificate_words_without_a_typed_tls_error() {
+    let target = grpc_endpoint("unknownissuer-router.example.test:50071");
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+
+    let error = std::io::Error::other("ordinary transport failure");
+    log_stargate_grpc_certificate_failure(&target, "watch_stargates", &error, None);
+
+    assert!(
+        subscriber.events().iter().all(|event| {
+            event.fields.get("message").map(String::as_str)
+                != Some("Stargate gRPC connection failed")
+        }),
+        "certificate words in a type or endpoint name must not create a TLS validation log"
+    );
+}
+
+#[test]
+fn grpc_failure_log_classifies_other_typed_certificate_errors() {
+    let target = grpc_endpoint("router.example.test:50071");
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+    let error = typed_tls_io_error(rustls::CertificateError::BadSignature);
+
+    log_stargate_grpc_certificate_failure(&target, "watch_stargates", &error, None);
+
+    let event = subscriber
+        .events()
+        .into_iter()
+        .find(|event| {
+            event.fields.get("message").map(String::as_str)
+                == Some("Stargate gRPC connection failed")
+        })
+        .expect("certificate failure should emit an event");
+    assert_eq!(
+        event.fields.get("failure_kind").map(String::as_str),
+        Some("tls_chain_validation"),
+        "specific certificate failure was not classified: {event:?}"
+    );
+}
+
+#[test]
+fn stargate_grpc_origin_keeps_dial_scheme_when_authority_scheme_differs() {
+    for (dial, authority, expected) in [
+        (
+            "https://public.example:443",
+            "http://router.internal:50071",
+            "https://router.internal:50071/",
+        ),
+        (
+            "http://public.example:80",
+            "https://router.internal:50071",
+            "http://router.internal:50071/",
+        ),
+    ] {
+        let dial_uri = dial.parse().expect("dial URI should parse");
+        let origin = grpc_origin_uri(&dial_uri, authority).expect("origin should build");
+
+        assert_eq!(origin.to_string(), expected);
+        assert_eq!(origin.scheme_str(), dial_uri.scheme_str());
+        assert_eq!(
+            origin.authority().unwrap().as_str(),
+            "router.internal:50071"
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_grpc_ca_completes_watch_and_registration_with_separate_authority() {
+    let ca = TestCertificateAuthority::new("registration-test-ca");
+    let mut server = TestTlsControlPlane::spawn(&ca, "localhost").await;
+    let mut config = test_registration_config();
+    config.seeds = vec![server.dial_url.clone()];
+    config.grpc_tls_ca_cert_pem = Some(ca.pem());
+    config.min_update_interval = Duration::from_millis(10);
+    let mut client = InferenceServerRegistrationClient::default();
+
+    client.start(config).expect("registration should start");
+    let registration = server.first_registration().await;
+    let watch_authority = tokio::time::timeout(TEST_WAIT, server.watch_authorities.recv())
+        .await
+        .expect("watch authority should not time out")
+        .expect("watch authority channel should remain open");
+    let registration_authority =
+        tokio::time::timeout(TEST_WAIT, server.registration_authorities.recv())
+            .await
+            .expect("registration authority should not time out")
+            .expect("registration authority channel should remain open");
+
+    assert_eq!(registration.inference_server_id, "inst-a");
+    assert_eq!(
+        watch_authority,
+        server
+            .dial_url
+            .strip_prefix("https://")
+            .expect("test dial URL should use HTTPS")
+    );
+    assert_eq!(registration_authority, TEST_ROUTER_AUTHORITY);
+
+    client.shutdown().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn https_without_custom_ca_uses_configured_native_roots() {
+    if let Ok(dial_url) = std::env::var(DEFAULT_ROOT_TEST_DIAL_URL_ENV) {
+        let endpoint = StargateGrpcEndpoint::new(dial_url, "")
+            .expect("default-root test endpoint should build");
+        endpoint
+            .channel_endpoint(None)
+            .expect("default-root test endpoint should configure")
+            .connect()
+            .await
+            .expect("native root should verify the test server");
+        return;
     }
 
-    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
-        .await
-        .expect("cancelled join wait should abort the child")
-        .expect("child drop notifier should send");
-}
+    let ca = TestCertificateAuthority::new("default-roots-test-ca");
+    let server = TestTlsControlPlane::spawn(&ca, "localhost").await;
+    let ca_file = tempfile::NamedTempFile::new().expect("CA file should be created");
+    std::fs::write(ca_file.path(), ca.pem()).expect("CA file should be written");
+    let test_binary = std::env::current_exe().expect("test binary path should resolve");
+    let dial_url = server.dial_url.clone();
+    let ca_path = ca_file.path().to_path_buf();
 
-#[tokio::test]
-async fn registration_retry_sleep_wakes_on_parent_stop() {
-    let (parent_tx, parent_rx) = watch::channel(false);
-    let (_local_tx, local_rx) = watch::channel(false);
-    let cancel_token = CancellationToken::new();
-    let task_cancel_token = cancel_token.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(test_binary)
+            .args([
+                "--exact",
+                "registration::tests::https_without_custom_ca_uses_configured_native_roots",
+                "--nocapture",
+            ])
+            .env(DEFAULT_ROOT_TEST_DIAL_URL_ENV, dial_url)
+            .env("SSL_CERT_FILE", ca_path)
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("default-root child test should run")
+    })
+    .await
+    .expect("default-root child test should join");
 
-    let task = tokio::spawn(async move {
-        let mut parent_rx = parent_rx;
-        let mut local_rx = local_rx;
-        sleep_until_registration_stop(
-            &mut parent_rx,
-            &mut local_rx,
-            &task_cancel_token,
-            Duration::from_secs(30),
-        )
-        .await
-    });
-
-    tokio::task::yield_now().await;
-    parent_tx
-        .send(true)
-        .expect("parent stop signal should send");
-
-    let stopped = tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .expect("retry sleep should wake on parent stop")
-        .expect("retry task should not panic");
-    assert!(stopped);
-}
-
-#[tokio::test]
-async fn registration_retry_sleep_wakes_when_parent_stop_channel_closes() {
-    let (parent_tx, parent_rx) = watch::channel(false);
-    let (_local_tx, local_rx) = watch::channel(false);
-    let cancel_token = CancellationToken::new();
-    let task_cancel_token = cancel_token.clone();
-
-    let task = tokio::spawn(async move {
-        let mut parent_rx = parent_rx;
-        let mut local_rx = local_rx;
-        sleep_until_registration_stop(
-            &mut parent_rx,
-            &mut local_rx,
-            &task_cancel_token,
-            Duration::from_secs(30),
-        )
-        .await
-    });
-
-    tokio::task::yield_now().await;
-    // Close the parent stop channel to verify closed watch senders stop retry sleeps.
-    drop(parent_tx);
-
-    let stopped = tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .expect("retry sleep should wake when parent stop channel closes")
-        .expect("retry task should not panic");
-    assert!(stopped);
-}
-
-#[tokio::test]
-async fn registration_retry_sleep_wakes_on_cancel_token() {
-    let (_parent_tx, parent_rx) = watch::channel(false);
-    let (_local_tx, local_rx) = watch::channel(false);
-    let cancel_token = CancellationToken::new();
-    let task_cancel_token = cancel_token.clone();
-
-    let task = tokio::spawn(async move {
-        let mut parent_rx = parent_rx;
-        let mut local_rx = local_rx;
-        sleep_until_registration_stop(
-            &mut parent_rx,
-            &mut local_rx,
-            &task_cancel_token,
-            Duration::from_secs(30),
-        )
-        .await
-    });
-
-    tokio::task::yield_now().await;
-    cancel_token.cancel();
-
-    let stopped = tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .expect("retry sleep should wake on cancel token")
-        .expect("retry task should not panic");
-    assert!(stopped);
-}
-
-#[test]
-fn reverse_tunnel_registration_advertises_upstream_http_url() {
-    let register_config = InferenceServerRegistrationConfig {
-        seeds: vec!["router-a".to_string()],
-        inference_server_id: "inst-a".to_string(),
-        cluster_id: "cluster-a".to_string(),
-        inference_server_url: "quic://127.0.0.1:8443".to_string(),
-        upstream_http_base_url: Some("http://127.0.0.1:8090".to_string()),
-        min_update_interval: Duration::from_secs(2),
-        status: InferenceServerStatus::Active,
-        reverse_tunnel: true,
-        quic_insecure: true,
-        tunnel_protocol: TunnelTransportProtocol::Custom,
-        bringup: BringupConfig::default(),
-        output_token_parser_factory: OutputTokenParserFactory,
-        request_observation_tx: None,
-        request_quality_monitor: RequestQualityMonitorConfig::default(),
-        metrics: None,
-        retry: PylonRetryConfig::default(),
-        queue_mismatch_retry: PylonQueueMismatchRetryConfig::default(),
-        queue_tracker: QueueAdmissionTracker::default(),
-        auth_token_provider: None,
-    };
-    let cancel_token = CancellationToken::new();
-    let (cluster_calibration_directive_tx, _cluster_calibration_directive_rx) = flume::bounded(1);
-
-    let task_template = RouterRegistrationTaskTemplate::from_registration_config(
-        &register_config,
-        &register_config.cluster_id,
-        register_config
-            .upstream_http_base_url
-            .as_deref()
-            .expect("test config includes upstream HTTP base URL"),
-        cluster_calibration_directive_tx,
-        &cancel_token,
+    assert!(
+        output.status.success(),
+        "default-root child test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "default-root child test did not run exactly one test:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.shutdown().await;
+}
 
-    let task_config = task_template.build_for_router(grpc_endpoint("router-a"));
-    assert_eq!(task_config.inference_server_url, "http://127.0.0.1:8090");
+#[tokio::test]
+async fn custom_grpc_ca_augments_configured_native_roots() {
+    if let (Ok(dial_url), Ok(custom_ca_path)) = (
+        std::env::var(DEFAULT_ROOT_TEST_DIAL_URL_ENV),
+        std::env::var(CUSTOM_ROOT_TEST_CA_PATH_ENV),
+    ) {
+        let custom_ca = std::fs::read(custom_ca_path).expect("custom CA file should be readable");
+        let endpoint = StargateGrpcEndpoint::new(dial_url, "")
+            .expect("default-root test endpoint should build");
+        endpoint
+            .channel_endpoint(Some(&custom_ca))
+            .expect("augmented-root test endpoint should configure")
+            .connect()
+            .await
+            .expect("native root should remain enabled beside the custom CA");
+        return;
+    }
+
+    let server_ca = TestCertificateAuthority::new("default-roots-test-ca");
+    let custom_ca = TestCertificateAuthority::new("custom-roots-test-ca");
+    let server = TestTlsControlPlane::spawn(&server_ca, "localhost").await;
+    let server_ca_file = tempfile::NamedTempFile::new().expect("CA file should be created");
+    std::fs::write(server_ca_file.path(), server_ca.pem()).expect("CA file should be written");
+    let custom_ca_file = tempfile::NamedTempFile::new().expect("CA file should be created");
+    std::fs::write(custom_ca_file.path(), custom_ca.pem()).expect("CA file should be written");
+    let test_binary = std::env::current_exe().expect("test binary path should resolve");
+    let dial_url = server.dial_url.clone();
+    let server_ca_path = server_ca_file.path().to_path_buf();
+    let custom_ca_path = custom_ca_file.path().to_path_buf();
+
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(test_binary)
+            .args([
+                "--exact",
+                "registration::tests::custom_grpc_ca_augments_configured_native_roots",
+                "--nocapture",
+            ])
+            .env(DEFAULT_ROOT_TEST_DIAL_URL_ENV, dial_url)
+            .env(CUSTOM_ROOT_TEST_CA_PATH_ENV, custom_ca_path)
+            .env("SSL_CERT_FILE", server_ca_path)
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("augmented-root child test should run")
+    })
+    .await
+    .expect("augmented-root child test should join");
+
+    assert!(
+        output.status.success(),
+        "augmented-root child test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "augmented-root child test did not run exactly one test:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn grpc_endpoint_rejects_ca_signed_by_untrusted_issuer() {
+    let server_ca = TestCertificateAuthority::new("server-ca");
+    let wrong_ca = TestCertificateAuthority::new("wrong-ca");
+    let server = TestTlsControlPlane::spawn(&server_ca, "localhost").await;
+    let wrong_ca_pem = wrong_ca.pem();
+
+    let error = tls_connect_error(&server, Some(&wrong_ca_pem)).await;
+
+    assert!(
+        error.contains("unknownissuer") || error.contains("unknown issuer"),
+        "unexpected TLS failure: {error}"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn grpc_endpoint_rejects_leaf_without_external_dial_hostname() {
+    let ca = TestCertificateAuthority::new("hostname-test-ca");
+    let server = TestTlsControlPlane::spawn(&ca, "not-localhost.invalid").await;
+    let ca_pem = ca.pem();
+
+    let error = tls_connect_error(&server, Some(&ca_pem)).await;
+
+    assert!(
+        error.contains("notvalidforname") || error.contains("not valid for name"),
+        "unexpected TLS failure: {error}"
+    );
+    server.shutdown().await;
+}
+
+async fn watch_tls_failure_event(
+    server: &mut TestTlsControlPlane,
+    ca_cert_pem: Vec<u8>,
+) -> RecordedTracingEvent {
+    let (topology_tx, topology_rx) = watch::channel(RegistrationRouterTopology::default());
+    let stop = CancellationToken::new();
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+    let watch_task = tokio::spawn(run_watch_stargate_discovery(
+        vec![server.dial_url.clone()],
+        Some(ca_cert_pem),
+        topology_tx,
+        stop.clone(),
+    ));
+
+    let event = wait_for_registration_failure_event(&subscriber).await;
+    wait_for_tracing_event_count(&subscriber, "attempting Stargate gRPC connection", 3).await;
     assert_eq!(
-        task_config.forwarding.upstream_http_base_url,
-        "http://127.0.0.1:8090"
+        subscriber.event_count("Stargate gRPC connection failed"),
+        1,
+        "continuous certificate failures should be logged once until recovery"
     );
-}
-
-#[test]
-fn build_inference_server_registration_includes_cluster_id() {
-    let models = HashMap::new();
-
-    let registration = build_inference_server_registration(
-        "client-a",
-        "cluster-shared",
-        "quic://127.0.0.1:9000",
-        &models,
-        false,
-        true,
-        false,
+    assert!(
+        topology_rx.borrow().published_routers().is_none(),
+        "a certificate validation failure must not publish a registration router"
+    );
+    assert!(
+        server.watch_authorities.try_recv().is_err(),
+        "a certificate validation failure must not reach WatchStargates"
     );
 
-    assert_eq!(registration.inference_server_id, "client-a");
-    assert_eq!(registration.cluster_id, "cluster-shared");
-    assert!(registration.coordinated_calibration);
+    stop.cancel();
+    tokio::time::timeout(TEST_WAIT, watch_task)
+        .await
+        .expect("failed WatchStargates task should stop promptly")
+        .expect("failed WatchStargates task should not panic");
+    event
 }
 
-#[test]
-fn coordinated_calibration_registers_with_every_local_state_owner() {
-    let active_routers = BTreeSet::from([
-        grpc_endpoint("http://router-b"),
-        grpc_endpoint("http://router-a"),
-        grpc_endpoint("http://router-c"),
-    ]);
+#[tokio::test]
+async fn watch_discovery_logs_unknown_issuer_and_remains_fail_closed() {
+    let server_ca = TestCertificateAuthority::new("server-ca");
+    let wrong_ca = TestCertificateAuthority::new("unrelated-ca");
+    let mut server = TestTlsControlPlane::spawn(&server_ca, "localhost").await;
 
+    let event = watch_tls_failure_event(&mut server, wrong_ca.pem()).await;
+
+    assert_registration_failure_event(
+        &event,
+        "watch_stargates",
+        "tls_unknown_issuer",
+        "server certificate has an unknown issuer",
+        "configured gRPC CA",
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn registration_stream_logs_unknown_issuer_and_remains_fail_closed() {
+    let server_ca = TestCertificateAuthority::new("server-ca");
+    let wrong_ca = TestCertificateAuthority::new("unrelated-ca");
+    let mut server = TestTlsControlPlane::spawn(&server_ca, "localhost").await;
+    let router_endpoint = StargateGrpcEndpoint::new(server.dial_url.clone(), "")
+        .expect("test registration endpoint should build");
+    let mut config = test_registration_config();
+    config.grpc_tls_ca_cert_pem = Some(wrong_ca.pem());
+    config.min_update_interval = Duration::from_millis(10);
+    let config = Arc::new(
+        RegistrationSessionConfig::try_from(config)
+            .expect("test registration session should build"),
+    );
+    let stop = CancellationToken::new();
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+    let registration_task = tokio::spawn(run_router_registration_stream(
+        router_endpoint,
+        config,
+        stop.clone(),
+    ));
+
+    let event = wait_for_registration_failure_event(&subscriber).await;
+    wait_for_tracing_event_count(&subscriber, "attempting Stargate gRPC connection", 3).await;
+
+    assert_registration_failure_event(
+        &event,
+        "register_inference_server",
+        "tls_unknown_issuer",
+        "server certificate has an unknown issuer",
+        "configured gRPC CA",
+    );
+    assert!(
+        server.registrations.try_recv().is_err(),
+        "a certificate validation failure must not reach registration"
+    );
     assert_eq!(
-        desired_registration_routers(&active_routers),
-        active_routers
+        subscriber.event_count("Stargate gRPC connection failed"),
+        1,
+        "continuous registration certificate failures should be logged once until recovery"
     );
+    stop.cancel();
+    tokio::time::timeout(TEST_WAIT, registration_task)
+        .await
+        .expect("failed registration task should stop promptly")
+        .expect("failed registration task should not panic");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn watch_discovery_accepts_a_trusted_ca_and_matching_san_without_failure_log() {
+    let ca = TestCertificateAuthority::new("trusted-ca");
+    let mut server = TestTlsControlPlane::spawn(&ca, "localhost").await;
+    let (topology_tx, mut topology_rx) = watch::channel(RegistrationRouterTopology::default());
+    let stop = CancellationToken::new();
+    let subscriber = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(subscriber.clone());
+    let _default_guard = tracing::dispatcher::set_default(&dispatch);
+    let watch_task = tokio::spawn(run_watch_stargate_discovery(
+        vec![server.dial_url.clone()],
+        Some(ca.pem()),
+        topology_tx,
+        stop.clone(),
+    ));
+
+    tokio::time::timeout(TEST_WAIT, server.watch_authorities.recv())
+        .await
+        .expect("trusted WatchStargates request should not time out")
+        .expect("trusted WatchStargates request channel should remain open");
+    tokio::time::timeout(TEST_WAIT, topology_rx.changed())
+        .await
+        .expect("trusted WatchStargates topology should publish")
+        .expect("trusted WatchStargates topology channel should remain open");
+    assert!(
+        topology_rx.borrow().published_routers().is_some(),
+        "trusted WatchStargates response should publish registration routers"
+    );
+    assert!(
+        subscriber.events().iter().all(|event| {
+            event.fields.get("message").map(String::as_str)
+                != Some("Stargate gRPC connection failed")
+        }),
+        "trusted WatchStargates connection should not emit a failure event"
+    );
+
+    stop.cancel();
+    tokio::time::timeout(TEST_WAIT, watch_task)
+        .await
+        .expect("trusted WatchStargates task should stop promptly")
+        .expect("trusted WatchStargates task should not panic");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn watch_discovery_logs_certificate_san_mismatch_and_remains_fail_closed() {
+    let ca = TestCertificateAuthority::new("trusted-ca");
+    let mut server = TestTlsControlPlane::spawn(&ca, "not-localhost.invalid").await;
+
+    let event = watch_tls_failure_event(&mut server, ca.pem()).await;
+
+    assert_registration_failure_event(
+        &event,
+        "watch_stargates",
+        "tls_hostname_mismatch",
+        "server certificate SAN does not match the dial hostname",
+        "certificate SAN",
+    );
+    server.shutdown().await;
 }
 
 #[test]
-fn watch_stargate_urls_are_discovery_seeds_not_registration_routers() {
+fn watch_response_separates_registration_routers_from_recursive_seeds() {
     let snapshot = watch_endpoint_snapshot_from_response(
         "seed-a",
-        stargate_proto::pb::WatchStargatesResponse {
-            stargates: vec![stargate_proto::pb::StargateInfo {
-                stargate_id: "stargate-0".to_string(),
-                advertise_addr: "stargate-0.region-a:50071".to_string(),
-                http_advertise_addr: "stargate-0.region-a:8000".to_string(),
-                grpc_pylon_dial_addr: "lb.region-a:443".to_string(),
-            }],
-            watch_stargate_urls: vec!["stargate.region-b:50071".to_string()],
+        WatchStargatesResponse {
+            stargates: vec![stargate_info(
+                "stargate-0",
+                "stargate-0.region-a:50071",
+                "https://lb.region-a:443",
+            )],
+            watch_stargate_urls: vec!["https://stargate.region-b:50071".to_string()],
         },
     );
 
     assert_eq!(
         snapshot.registration_routers,
-        BTreeSet::from([grpc_endpoint_with_dial(
-            "stargate-0.region-a:50071",
-            "lb.region-a:443"
+        BTreeMap::from([(
+            "stargate-0".to_string(),
+            grpc_endpoint_with_dial("stargate-0.region-a:50071", "https://lb.region-a:443")
         )])
     );
     assert_eq!(
         snapshot.watch_urls,
-        BTreeSet::from(["stargate.region-b:50071".to_string()])
+        BTreeSet::from(["https://stargate.region-b:50071".to_string()])
     );
 }
 
 #[test]
-fn watch_stargate_snapshot_uses_advertise_addr_as_direct_dial_fallback() {
+fn watch_response_rejects_non_uri_recursive_seeds() {
     let snapshot = watch_endpoint_snapshot_from_response(
         "seed-a",
-        stargate_proto::pb::WatchStargatesResponse {
-            stargates: vec![stargate_proto::pb::StargateInfo {
-                stargate_id: "stargate-0".to_string(),
-                advertise_addr: "stargate-0.region-a:50071".to_string(),
-                http_advertise_addr: String::new(),
-                grpc_pylon_dial_addr: String::new(),
-            }],
-            watch_stargate_urls: Vec::new(),
+        WatchStargatesResponse {
+            stargates: vec![],
+            watch_stargate_urls: vec![
+                "https://stargate.region-b:50071".to_string(),
+                " http://127.0.0.1:50071 ".to_string(),
+                "stargate.region-c:50071".to_string(),
+                "ftp://stargate.region-d:50071".to_string(),
+                "https://".to_string(),
+            ],
         },
     );
 
     assert_eq!(
-        snapshot.registration_routers,
-        BTreeSet::from([grpc_endpoint("stargate-0.region-a:50071")])
+        snapshot.watch_urls,
+        BTreeSet::from([
+            "http://127.0.0.1:50071".to_string(),
+            "https://stargate.region-b:50071".to_string(),
+        ])
     );
 }
 
 #[test]
-fn watch_stargate_snapshot_uses_stargate_id_when_advertise_addr_is_empty() {
-    let snapshot = watch_endpoint_snapshot_from_response(
-        "seed-a",
-        stargate_proto::pb::WatchStargatesResponse {
-            stargates: vec![stargate_proto::pb::StargateInfo {
-                stargate_id: "stargate-0.region-a:50071".to_string(),
-                advertise_addr: " ".to_string(),
-                http_advertise_addr: String::new(),
-                grpc_pylon_dial_addr: String::new(),
-            }],
-            watch_stargate_urls: Vec::new(),
-        },
-    );
-
-    assert_eq!(
-        snapshot.registration_routers,
-        BTreeSet::from([grpc_endpoint("stargate-0.region-a:50071")])
-    );
-}
-
-#[test]
-fn grpc_connect_target_dials_lb_and_overrides_authority() {
-    let endpoint = grpc_endpoint_with_dial(
-        "stargate-0.region-a:50071",
-        "https://stargate-grpc-lb.region-a:443",
-    );
-
-    let target = stargate_grpc_connect_target(&endpoint);
-
-    assert_eq!(
-        target.dial_endpoint,
-        "https://stargate-grpc-lb.region-a:443"
-    );
-    assert_eq!(
-        target.authority_endpoint,
-        "https://stargate-0.region-a:50071"
-    );
-    assert!(target.override_authority);
-    stargate_grpc_channel_endpoint(&target).expect("endpoint should be valid");
-}
-
-#[test]
-fn recursive_watch_discovery_waits_for_remote_snapshots_before_registration_publish() {
+fn recursive_discovery_publishes_the_union_after_all_snapshots_arrive() {
     let seeds = BTreeSet::from(["stargate.region-a:50071".to_string()]);
     let mut snapshots = HashMap::from([(
         "stargate.region-a:50071".to_string(),
-        WatchEndpointSnapshot {
-            registration_routers: BTreeSet::from([
-                grpc_endpoint("stargate-0.region-a:50071"),
-                grpc_endpoint("stargate-1.region-a:50071"),
-            ]),
-            watch_urls: BTreeSet::from(["stargate.region-b:50071".to_string()]),
-        },
+        watch_snapshot(&["stargate-0.region-a:50071"], &["stargate.region-b:50071"]),
     )]);
-
-    let desired_urls = desired_watch_urls_from_snapshots(&seeds, &snapshots);
-    assert_eq!(
-        desired_urls,
-        BTreeSet::from([
-            "stargate.region-a:50071".to_string(),
-            "stargate.region-b:50071".to_string(),
-        ])
-    );
-    assert!(!all_desired_watch_urls_have_snapshots(
-        &desired_urls,
-        |watch_url| snapshots.contains_key(watch_url)
-    ));
+    let desired = desired_watch_urls_from_snapshots(&seeds, &snapshots);
+    assert!(!all_desired_watch_urls_have_snapshots(&desired, |url| {
+        snapshots.contains_key(url)
+    }));
 
     snapshots.insert(
         "stargate.region-b:50071".to_string(),
-        WatchEndpointSnapshot {
-            registration_routers: BTreeSet::from([
-                grpc_endpoint("stargate-0.region-b:50071"),
-                grpc_endpoint("stargate-1.region-b:50071"),
-            ]),
-            watch_urls: BTreeSet::from(["stargate.region-a:50071".to_string()]),
-        },
+        watch_snapshot(&["stargate-0.region-b:50071"], &[]),
     );
-    let desired_urls = desired_watch_urls_from_snapshots(&seeds, &snapshots);
-    assert!(all_desired_watch_urls_have_snapshots(
-        &desired_urls,
-        |watch_url| snapshots.contains_key(watch_url)
-    ));
+    let desired = desired_watch_urls_from_snapshots(&seeds, &snapshots);
+
+    assert!(all_desired_watch_urls_have_snapshots(&desired, |url| {
+        snapshots.contains_key(url)
+    }));
     assert_eq!(
         active_registration_routers(snapshots.values()),
         BTreeSet::from([
             grpc_endpoint("stargate-0.region-a:50071"),
             grpc_endpoint("stargate-0.region-b:50071"),
-            grpc_endpoint("stargate-1.region-a:50071"),
-            grpc_endpoint("stargate-1.region-b:50071"),
         ])
     );
 }
 
-#[test]
-fn recursive_watch_discovery_ignores_disconnected_snapshot_cycles() {
-    let seeds = BTreeSet::from(["stargate.region-a:50071".to_string()]);
-    let snapshots = HashMap::from([
-        (
-            "stargate.region-a:50071".to_string(),
-            WatchEndpointSnapshot {
-                registration_routers: BTreeSet::from([grpc_endpoint("stargate-0.region-a:50071")]),
-                watch_urls: BTreeSet::new(),
-            },
-        ),
-        (
-            "stargate.region-b:50071".to_string(),
-            WatchEndpointSnapshot {
-                registration_routers: BTreeSet::from([grpc_endpoint("stargate-0.region-b:50071")]),
-                watch_urls: BTreeSet::from(["stargate.region-c:50071".to_string()]),
-            },
-        ),
-        (
-            "stargate.region-c:50071".to_string(),
-            WatchEndpointSnapshot {
-                registration_routers: BTreeSet::from([grpc_endpoint("stargate-0.region-c:50071")]),
-                watch_urls: BTreeSet::from(["stargate.region-b:50071".to_string()]),
-            },
-        ),
-    ]);
-
-    assert_eq!(
-        desired_watch_urls_from_snapshots(&seeds, &snapshots),
-        BTreeSet::from(["stargate.region-a:50071".to_string()])
-    );
-}
-
 #[tokio::test]
-async fn stop_watched_endpoint_signals_and_awaits_task() {
-    let (stop_tx, mut stop_rx) = watch::channel(false);
-    let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        loop {
-            if *stop_rx.borrow() {
-                break;
-            }
-            if stop_rx.changed().await.is_err() {
-                break;
-            }
-        }
-        let _ = exited_tx.send(());
-    });
-    let endpoint = WatchedEndpoint {
-        generation: 0,
-        stop_tx,
-        task,
-        state: WatchEndpointState::Connecting,
-    };
-
-    tokio::time::timeout(Duration::from_secs(1), stop_watched_endpoint(endpoint))
-        .await
-        .expect("watched endpoint should stop cooperatively");
-    exited_rx
-        .await
-        .expect("watched endpoint task should publish exit");
-}
-
-#[tokio::test]
-async fn watch_endpoint_update_send_wakes_on_local_stop_when_channel_is_full() {
-    let update = |generation| WatchEndpointUpdate {
-        watch_url: "stargate.region-b:50071".to_string(),
-        generation,
-        event: WatchEndpointEvent::Disconnected,
-    };
-    let (updates_tx, mut updates_rx) = mpsc::channel(1);
-    updates_tx
-        .send(update(1))
-        .await
-        .expect("seed update should fill channel");
-    let (_parent_tx, mut parent_rx) = watch::channel(false);
-    let (local_tx, mut local_rx) = watch::channel(false);
-
-    let task = tokio::spawn(async move {
-        send_watch_endpoint_update(&updates_tx, update(2), &mut parent_rx, &mut local_rx).await
-    });
-    tokio::task::yield_now().await;
-    local_tx.send(true).expect("local stop should send");
-
-    let sent = tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .expect("send wait should wake on local stop")
-        .expect("send task should not panic");
-    assert!(!sent, "stopped endpoint should not enqueue an update");
-    assert_eq!(
-        updates_rx
-            .recv()
-            .await
-            .expect("first update should still be queued")
-            .generation,
-        1
-    );
-    assert!(updates_rx.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn watch_endpoint_updates_ignore_removed_or_replaced_generations() {
-    let snapshot = |router: &str| WatchEndpointSnapshot {
-        registration_routers: BTreeSet::from([grpc_endpoint(router)]),
-        watch_urls: BTreeSet::new(),
-    };
-    let watch_url = "stargate.region-b:50071".to_string();
-    let mut watched = HashMap::<String, WatchedEndpoint>::new();
-
-    assert!(!apply_watch_endpoint_update(
-        &mut watched,
-        WatchEndpointUpdate {
-            watch_url: watch_url.clone(),
-            generation: 0,
-            event: WatchEndpointEvent::Snapshot(snapshot("stale-router")),
-        }
-    ));
-    assert!(active_registration_routers(watched_endpoint_snapshots(&watched)).is_empty());
-
-    let (stop_tx, _stop_rx) = watch::channel(false);
-    let task = tokio::spawn(async {
-        std::future::pending::<()>().await;
-    });
-    watched.insert(
-        watch_url.clone(),
-        WatchedEndpoint {
-            generation: 1,
-            stop_tx,
-            task,
-            state: WatchEndpointState::Connecting,
-        },
-    );
-
-    assert!(!apply_watch_endpoint_update(
-        &mut watched,
-        WatchEndpointUpdate {
-            watch_url: watch_url.clone(),
-            generation: 0,
-            event: WatchEndpointEvent::Snapshot(snapshot("stale-router")),
-        }
-    ));
-    assert!(!all_desired_watch_urls_have_snapshots(
-        &BTreeSet::from([watch_url.clone()]),
-        |watch_url| watched
-            .get(watch_url)
-            .is_some_and(|endpoint| endpoint.state.has_snapshot())
-    ));
-    assert!(active_registration_routers(watched_endpoint_snapshots(&watched)).is_empty());
-
-    assert!(apply_watch_endpoint_update(
-        &mut watched,
-        WatchEndpointUpdate {
-            watch_url: watch_url.clone(),
-            generation: 1,
-            event: WatchEndpointEvent::Snapshot(snapshot("current-router")),
-        }
-    ));
-    assert_eq!(
-        active_registration_routers(watched_endpoint_snapshots(&watched)),
-        BTreeSet::from([grpc_endpoint("current-router")])
-    );
-
-    assert!(apply_watch_endpoint_update(
-        &mut watched,
-        WatchEndpointUpdate {
-            watch_url: watch_url.clone(),
-            generation: 1,
-            event: WatchEndpointEvent::Disconnected,
-        }
-    ));
-    assert!(matches!(
-        watched.get(&watch_url).map(|endpoint| &endpoint.state),
-        Some(WatchEndpointState::Disconnected)
-    ));
-    assert!(active_registration_routers(watched_endpoint_snapshots(&watched)).is_empty());
-
-    for endpoint in watched.into_values() {
-        endpoint.task.abort();
-    }
-}
-
-#[test]
-fn watch_router_publish_gate_waits_for_initial_complete_or_timeout_then_allows_removal() {
-    let empty = BTreeSet::new();
-    let seed_router = BTreeSet::from([grpc_endpoint("stargate-0.region-a:50071")]);
-    let global_routers = BTreeSet::from([
+async fn registration_router_topology_publishes_every_discovered_router() {
+    let routers = BTreeSet::from([
         grpc_endpoint("stargate-0.region-a:50071"),
         grpc_endpoint("stargate-0.region-b:50071"),
     ]);
+    let (topology_tx, mut topology_rx) = watch::channel(RegistrationRouterTopology::default());
 
-    assert!(!should_publish_watch_routers(
-        &seed_router,
-        &empty,
-        false,
-        false,
-        false
-    ));
-    assert!(should_publish_watch_routers(
-        &seed_router,
-        &empty,
-        false,
-        true,
-        false
-    ));
-    assert!(!should_publish_watch_routers(
-        &empty, &empty, false, true, false
-    ));
-    assert!(should_publish_watch_routers(
-        &global_routers,
-        &empty,
-        true,
-        false,
-        false
-    ));
-    assert!(should_publish_watch_routers(
-        &seed_router,
-        &global_routers,
-        false,
-        false,
+    assert!(publish_registration_router_topology(
+        &topology_tx,
+        &routers,
         true
     ));
-    assert!(!should_publish_watch_routers(
-        &seed_router,
-        &seed_router,
-        false,
-        false,
-        true
-    ));
-}
-
-#[tokio::test]
-async fn coordinated_submission_attempt_times_out_without_waiting_forever() {
-    let error = await_cluster_calibration_submission(
-        Duration::from_millis(1),
-        std::future::pending::<anyhow::Result<()>>(),
-    )
-    .await
-    .expect_err("stalled calibration submission should time out");
-
-    assert!(
-        error
-            .to_string()
-            .contains("cluster calibration submission timed out")
-    );
-}
-
-#[test]
-fn successful_calibration_submission_keeps_non_retryable_assignment_token() {
-    let key = (grpc_endpoint("http://router-a"), "model-a".to_string());
-    let mut work = HashMap::from([(
-        key.clone(),
-        RouterCalibrationWork::PendingSubmission {
-            result: PendingRouterCalibration {
-                assignment_token: "token-a".to_string(),
-                measured_last_mean_input_tps: 123.0,
-            },
-            task: None,
-        },
-    )]);
-
-    finish_pending_cluster_calibration_submission(
-        &mut work,
-        CompletedCalibrationSubmission {
-            key: key.clone(),
-            assignment_token: "token-a".to_string(),
-            result: Ok(()),
-        },
-    );
-
-    assert!(
-        matches!(
-            work.get(&key),
-            Some(RouterCalibrationWork::Submitted { assignment_token })
-                if assignment_token == "token-a"
-        ),
-        "accepted calibration result must keep only assignment provenance"
-    );
-    let retry_keys = work
-        .iter()
-        .filter_map(|(key, state)| match state {
-            RouterCalibrationWork::PendingSubmission { task: None, .. } => Some(key.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        retry_keys.is_empty(),
-        "accepted calibration result must not remain retryable"
-    );
-    assert!(
-        work.get(&key)
-            .is_some_and(|state| state.assignment_token() == "token-a"),
-        "stale RUN for an accepted assignment must not start a second sweep"
-    );
-}
-
-#[tokio::test]
-async fn failed_calibration_submission_remains_retryable() {
-    let key = (grpc_endpoint("http://router-a"), "model-a".to_string());
-    let mut submission_tasks = JoinSet::<CompletedCalibrationSubmission>::new();
-    let abort_handle = submission_tasks
-        .spawn(async { std::future::pending::<CompletedCalibrationSubmission>().await });
-    let mut work = HashMap::from([(
-        key.clone(),
-        RouterCalibrationWork::PendingSubmission {
-            result: PendingRouterCalibration {
-                assignment_token: "token-a".to_string(),
-                measured_last_mean_input_tps: 123.0,
-            },
-            task: Some(OwnedCalibrationTask::new(abort_handle)),
-        },
-    )]);
-
-    finish_pending_cluster_calibration_submission(
-        &mut work,
-        CompletedCalibrationSubmission {
-            key: key.clone(),
-            assignment_token: "token-a".to_string(),
-            result: Err(anyhow::anyhow!("temporary submission failure")),
-        },
-    );
-
-    assert!(
-        matches!(
-            work.get(&key),
-            Some(RouterCalibrationWork::PendingSubmission { task: None, .. })
-        ),
-        "failed calibration result should remain pending for retry"
-    );
-    submission_tasks.abort_all();
-}
-
-#[derive(Clone)]
-struct BlockedCalibrationUpstream {
-    entered_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    dropped_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-}
-
-async fn spawn_blocked_calibration_upstream()
--> (String, oneshot::Receiver<()>, oneshot::Receiver<()>) {
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (dropped_tx, dropped_rx) = oneshot::channel();
-    let listener = TcpListener::bind("127.0.0.1:0")
+    topology_rx
+        .changed()
         .await
-        .expect("test upstream should bind");
-    let addr = listener.local_addr().expect("bound listener has address");
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/v1/chat/completions", post(block_calibration_completion))
-        .with_state(BlockedCalibrationUpstream {
-            entered_tx: Arc::new(TokioMutex::new(Some(entered_tx))),
-            dropped_tx: Arc::new(TokioMutex::new(Some(dropped_tx))),
-        });
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("test upstream should serve");
+        .expect("topology should publish");
+
+    assert_eq!(topology_rx.borrow().published_routers(), Some(&routers));
+}
+
+#[tokio::test]
+async fn watch_endpoint_and_registration_sends_wake_on_cancellation() {
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    let (updates_tx, _updates_rx) = mpsc::channel(1);
+    updates_tx
+        .send(InferenceServerRegistration::default())
+        .await
+        .expect("seed update should fill channel");
+    let task = tokio::spawn(async move {
+        send_registration_update(
+            &updates_tx,
+            InferenceServerRegistration::default(),
+            &task_stop,
+        )
+        .await
     });
-    (format!("http://{addr}"), entered_rx, dropped_rx)
-}
+    assert!(!cancel_blocked_task(stop, task, "send should stop").await);
 
-async fn block_calibration_completion(State(state): State<BlockedCalibrationUpstream>) -> Response {
-    let _drop_notifier = DropNotifier(state.dropped_tx.lock().await.take());
-    if let Some(entered_tx) = state.entered_tx.lock().await.take() {
-        let _ = entered_tx.send(());
-    }
-    std::future::pending::<Response>().await
-}
-
-#[tokio::test]
-async fn assigned_sweep_does_not_block_directive_consumption() {
-    let (upstream_http_base_url, sweep_entered_rx, _sweep_dropped_rx) =
-        spawn_blocked_calibration_upstream().await;
-    let cancel_token = CancellationToken::new();
-    let (directive_tx, directive_rx) = flume::bounded(1);
-    let router_endpoint = grpc_endpoint("http://router-a");
-    let (_active_router_tx, active_router_rx) =
-        watch::channel(BTreeSet::from([router_endpoint.clone()]));
-    let executor = tokio::spawn(run_cluster_calibration_executor(
-        ClusterCalibrationExecutorTaskConfig {
-            inference_server_id: "pylon-a".to_string(),
-            cluster_id: "cluster-a".to_string(),
-            retry_interval: Duration::from_secs(30),
-            upstream_http_base_url,
-            bringup: BringupConfig {
-                calibration_requests: 1,
-                calibration_timeout: Duration::from_secs(30),
-                canary_timeout: Duration::from_secs(1),
-                ..BringupConfig::default()
-            },
-            metrics: None,
-            auth_token_provider: None,
-            cancel_token: cancel_token.clone(),
-        },
-        directive_rx,
-        active_router_rx,
-    ));
-    let directive = |model_id: &str, state, assignment_token: &str| ClusterCalibrationDirective {
-        router_endpoint: router_endpoint.clone(),
-        model_id: model_id.to_string(),
-        state,
-        assignment_token: assignment_token.to_string(),
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    let (updates_tx, _updates_rx) = mpsc::channel(1);
+    let update = WatchEndpointUpdate {
+        watch_url: "seed-a".to_string(),
+        generation: 1,
+        snapshot: None,
     };
-
-    directive_tx
-        .send_async(directive(
-            "model-a",
-            ClusterCalibrationDirectiveState::Run,
-            "token-a",
-        ))
+    updates_tx
+        .send(update)
         .await
-        .expect("run directive should be accepted");
-    tokio::time::timeout(Duration::from_secs(1), sweep_entered_rx)
-        .await
-        .expect("calibration sweep should begin before queue probe")
-        .expect("calibration sweep should begin before queue probe");
-    directive_tx
-        .send_async(directive(
-            "model-a",
-            ClusterCalibrationDirectiveState::Complete,
-            "",
-        ))
-        .await
-        .expect("completion directive should fill the bounded queue");
-
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        directive_tx.send_async(directive(
-            "model-b",
-            ClusterCalibrationDirectiveState::Waiting,
-            "",
-        )),
-    )
-    .await
-    .expect("executor must continue draining directives during a slow sweep")
-    .expect("waiting directive should enqueue after draining completion");
-
-    cancel_token.cancel();
-    executor
-        .await
-        .expect("cancelled calibration executor should exit cleanly");
-}
-
-#[tokio::test]
-async fn router_removal_aborts_assigned_sweep() {
-    let (upstream_http_base_url, sweep_entered_rx, sweep_dropped_rx) =
-        spawn_blocked_calibration_upstream().await;
-    let cancel_token = CancellationToken::new();
-    let (directive_tx, directive_rx) = flume::bounded(1);
-    let router_endpoint = grpc_endpoint("http://router-a");
-    let (active_router_tx, active_router_rx) =
-        watch::channel(BTreeSet::from([router_endpoint.clone()]));
-    let executor = tokio::spawn(run_cluster_calibration_executor(
-        ClusterCalibrationExecutorTaskConfig {
-            inference_server_id: "pylon-a".to_string(),
-            cluster_id: "cluster-a".to_string(),
-            retry_interval: Duration::from_secs(30),
-            upstream_http_base_url,
-            bringup: BringupConfig {
-                calibration_requests: 1,
-                calibration_timeout: Duration::from_secs(30),
-                canary_timeout: Duration::from_secs(1),
-                ..BringupConfig::default()
+        .expect("seed update should fill channel");
+    let task = tokio::spawn(async move {
+        send_watch_endpoint_update(
+            &updates_tx,
+            WatchEndpointUpdate {
+                watch_url: "seed-a".to_string(),
+                generation: 2,
+                snapshot: None,
             },
-            metrics: None,
-            auth_token_provider: None,
-            cancel_token: cancel_token.clone(),
-        },
-        directive_rx,
-        active_router_rx,
-    ));
-
-    directive_tx
-        .send_async(ClusterCalibrationDirective {
-            router_endpoint,
-            model_id: "model-a".to_string(),
-            state: ClusterCalibrationDirectiveState::Run,
-            assignment_token: "token-a".to_string(),
-        })
+            &task_stop,
+        )
         .await
-        .expect("run directive should be accepted");
-    tokio::time::timeout(Duration::from_secs(1), sweep_entered_rx)
-        .await
-        .expect("calibration sweep should begin before router removal")
-        .expect("calibration sweep should begin before router removal");
-
-    active_router_tx.send_replace(BTreeSet::new());
-    tokio::time::timeout(Duration::from_secs(1), sweep_dropped_rx)
-        .await
-        .expect("router removal should abort the running calibration sweep")
-        .expect("blocked calibration request should be dropped");
-
-    cancel_token.cancel();
-    executor
-        .await
-        .expect("cancelled calibration executor should exit cleanly");
+    });
+    assert!(!cancel_blocked_task(stop, task, "watch send should stop").await);
 }
 
 #[test]
-fn snapshot_forwards_collected_model_stats_exactly() {
-    let (_status_tx, status_rx) = flume::bounded(1);
-    let (stats_tx, stats_rx) = flume::bounded(1);
-    let (bringup_state_tx, bringup_state_rx) = flume::bounded(1);
-    let shared_state = SharedInstState::new(
-        InferenceServerStatus::Active,
-        &["model-a".to_string()],
-        SharedInstStateChannels {
-            status_rx,
-            stats_rx,
-            bringup_state_rx,
+fn runtime_snapshot_forwards_bootstrap_and_collected_stats_exactly() {
+    let runtime_state =
+        PylonRuntimeState::new(InferenceServerStatus::Active, &["model-a".to_string()]);
+    runtime_state.set_model_bringup_ready("model-a", true);
+    let queue_time_estimate_ms_by_priority = HashMap::from([(0, 11), (2, 7)]);
+    runtime_state.set_model_stats(
+        "model-a",
+        CurrentModelStats {
+            last_mean_input_tps: 3.5,
+            output_tps: 2.5,
+            queue_size: 4,
+            queued_input_size: 5,
+            max_output_tps: 6.5,
+            kv_cache_capacity_tokens: 7,
+            kv_cache_used_tokens: 8,
+            kv_cache_free_tokens: 9,
+            num_running_queries: 10,
+            max_engine_concurrency: Some(11),
+            total_query_input_size: 12,
+            input_processing_queries: 13,
+            output_generation_queries: 14,
+            stats_observed_at_unix_ms: 15,
+            stats_capabilities: vec!["request.output.chunk_usage".to_string()],
+            stats_sources: vec!["chunk_usage".to_string()],
+            queue_time_estimate_ms_by_priority: Some(queue_time_estimate_ms_by_priority.clone()),
+            ..CurrentModelStats::default()
         },
-        false,
     );
 
-    let queue_time_estimate_ms_by_priority = HashMap::from([(0, 11), (2, 7)]);
-    stats_tx
-        .send((
-            "model-a".to_string(),
-            CurrentModelStats {
-                output_tps: 2.5,
-                embedding_item_tps: 0.0,
-                last_mean_input_tps: 3.5,
-                queue_size: 4,
-                queued_input_size: 5,
-                max_output_tps: 6.5,
-                max_embedding_item_tps: 0.0,
-                kv_cache_capacity_tokens: 7,
-                kv_cache_used_tokens: 8,
-                kv_cache_free_tokens: 9,
-                num_running_queries: 10,
-                max_engine_concurrency: Some(11),
-                total_query_input_size: 12,
-                input_processing_queries: 13,
-                output_generation_queries: 14,
-                stats_observed_at_unix_ms: 15,
-                stats_capabilities: vec!["request.output.chunk_usage".to_string()],
-                stats_sources: vec!["chunk_usage".to_string()],
-                queue_time_estimate_ms_by_priority: Some(
-                    queue_time_estimate_ms_by_priority.clone(),
-                ),
-            },
-        ))
-        .unwrap();
-    bringup_state_tx
-        .send(BringupModelUpdate {
-            model_id: "model-a".to_string(),
-            state: ModelBringupState::AdvertisingActive,
-        })
-        .unwrap();
-    shared_state.drain_updates();
-
-    let snapshot = shared_state.snapshot();
+    let snapshot = runtime_state.advertised_models();
     let model = &snapshot["model-a"];
     assert_eq!(model.status, InferenceServerStatus::Active as i32);
     let stats = model.stats.as_ref().expect("stats should be present");
-    assert_eq!(stats.output_tps, 2.5);
     assert_eq!(stats.last_mean_input_tps, 3.5);
-    assert_eq!(stats.queue_size, 4);
-    assert_eq!(stats.queued_input_size, 5);
-    assert_eq!(stats.max_output_tps, 6.5);
-    assert_eq!(stats.kv_cache_capacity_tokens, 7);
-    assert_eq!(stats.kv_cache_used_tokens, 8);
-    assert_eq!(stats.kv_cache_free_tokens, 9);
-    assert_eq!(stats.num_running_queries, 10);
-    assert_eq!(stats.max_engine_concurrency, 11);
-    assert_eq!(stats.total_query_input_size, 12);
+    assert_eq!(stats.output_tps, 2.5);
     assert_eq!(
         stats.queue_time_estimate_ms_by_priority,
         queue_time_estimate_ms_by_priority
     );
-    assert_eq!(stats.input_processing_queries, 13);
-    assert_eq!(stats.output_generation_queries, 14);
-    assert_eq!(stats.stats_observed_at_unix_ms, 15);
-    assert_eq!(
-        stats.stats_capabilities,
-        vec!["request.output.chunk_usage".to_string()]
-    );
-    assert_eq!(stats.stats_sources, vec!["chunk_usage".to_string()]);
 }
 
 #[test]
-fn merge_current_model_stats_preserves_existing_kv_metrics_when_incoming_has_none() {
-    let existing = CurrentModelStats {
-        kv_cache_capacity_tokens: 4096,
-        kv_cache_used_tokens: 1024,
-        kv_cache_free_tokens: 3072,
-        ..CurrentModelStats::default()
-    };
-    let incoming = CurrentModelStats {
-        output_tps: 20.0,
-        last_mean_input_tps: 30.0,
-        max_output_tps: 40.0,
-        queue_size: 5,
-        queued_input_size: 6,
-        ..CurrentModelStats::default()
-    };
-
-    let merged = merge_current_model_stats(&existing, &incoming);
-    assert_eq!(merged.last_mean_input_tps, 30.0);
-    assert_eq!(merged.queue_size, 5);
-    assert_eq!(merged.kv_cache_capacity_tokens, 4096);
-    assert_eq!(merged.kv_cache_used_tokens, 1024);
-    assert_eq!(merged.kv_cache_free_tokens, 3072);
-}
-
-#[test]
-fn merge_current_model_stats_preserves_existing_backend_only_metrics_when_incoming_has_none() {
-    let existing = CurrentModelStats {
-        max_engine_concurrency: Some(8),
-        queue_time_estimate_ms_by_priority: Some(HashMap::from([(4, 120)])),
-        ..CurrentModelStats::default()
-    };
-    let incoming = CurrentModelStats {
-        output_tps: 20.0,
-        last_mean_input_tps: 30.0,
-        max_output_tps: 40.0,
-        queue_size: 5,
-        queued_input_size: 6,
-        ..CurrentModelStats::default()
-    };
-
-    let merged = merge_current_model_stats(&existing, &incoming);
-    assert_eq!(merged.last_mean_input_tps, 30.0);
-    assert_eq!(merged.queue_size, 5);
-    assert_eq!(merged.max_engine_concurrency, Some(8));
-    assert_eq!(
-        merged.queue_time_estimate_ms_by_priority,
-        Some(HashMap::from([(4, 120)]))
-    );
-}
-
-#[test]
-fn merge_current_model_stats_accepts_explicit_backend_only_metric_clears() {
-    let existing = CurrentModelStats {
-        max_engine_concurrency: Some(8),
-        queue_time_estimate_ms_by_priority: Some(HashMap::from([(4, 120)])),
-        ..CurrentModelStats::default()
-    };
-    let incoming = CurrentModelStats {
-        max_engine_concurrency: Some(0),
-        queue_time_estimate_ms_by_priority: Some(HashMap::new()),
-        ..CurrentModelStats::default()
-    };
-
-    let merged = merge_current_model_stats(&existing, &incoming);
-    assert_eq!(merged.max_engine_concurrency, Some(0));
-    assert_eq!(
-        merged.queue_time_estimate_ms_by_priority,
-        Some(HashMap::new())
-    );
-}
-
-#[test]
-fn merge_current_model_stats_accepts_non_zero_incoming_kv_metrics() {
-    let existing = CurrentModelStats {
-        kv_cache_capacity_tokens: 4096,
-        kv_cache_used_tokens: 1024,
-        kv_cache_free_tokens: 3072,
-        ..CurrentModelStats::default()
-    };
-    let incoming = CurrentModelStats {
-        kv_cache_capacity_tokens: 8192,
-        kv_cache_used_tokens: 2048,
-        kv_cache_free_tokens: 6144,
-        ..CurrentModelStats::default()
-    };
-
-    let merged = merge_current_model_stats(&existing, &incoming);
-    assert_eq!(merged.kv_cache_capacity_tokens, 8192);
-    assert_eq!(merged.kv_cache_used_tokens, 2048);
-    assert_eq!(merged.kv_cache_free_tokens, 6144);
-}
-
-#[test]
-fn reverse_tunnel_config_propagates_metrics() {
-    let metrics = PylonMetrics::new().expect("metrics should initialize");
-    let mut forwarding = TunnelForwardingConfig::new("http://127.0.0.1:8090/".to_string());
-    forwarding.metrics = Some(metrics.clone());
-    let config = build_reverse_quic_tunnel_config(ReverseQuicTunnelConfigParams {
-        dial_addr: "127.0.0.1:12345".to_string(),
-        sni_override: None,
-        inference_server_id: "inst-a".to_string(),
-        quic_insecure: true,
-        tunnel_protocol: TunnelTransportProtocol::Http3,
-        forwarding,
-        auth_token_provider: None,
-    });
-
-    assert!(
-        Arc::ptr_eq(config.metrics.as_ref().unwrap(), &metrics),
-        "reverse tunnel config should carry pylon metrics"
-    );
-    assert_eq!(config.tunnel_protocol, TunnelTransportProtocol::Http3);
-}
-
-#[test]
-fn reverse_tunnel_endpoint_from_ack_uses_pylon_dial_addr_and_preserves_routing_sni() {
+fn reverse_tunnel_endpoint_uses_dial_address_and_preserves_routing_sni() {
     let endpoint = reverse_tunnel_endpoint_from_ack(&InferenceServerAck {
-        reverse_tunnel_target: "stargate-0.stargate-headless.stargate.svc.cluster.local:50072"
-            .to_string(),
-        reverse_tunnel_pylon_dial_addr: "stargate-quic-lb.stargate.svc.cluster.local:50072"
-            .to_string(),
-        model_calibration_directives: Vec::new(),
+        reverse_tunnel_target: "stargate-0.stargate-headless:50072".to_string(),
+        reverse_tunnel_pylon_dial_addr: "stargate-quic-lb:50072".to_string(),
     })
     .expect("ack should contain reverse tunnel endpoint");
 
-    assert_eq!(
-        endpoint.pylon_dial_addr,
-        "stargate-quic-lb.stargate.svc.cluster.local:50072"
-    );
+    assert_eq!(endpoint.pylon_dial_addr, "stargate-quic-lb:50072");
     assert_eq!(
         endpoint.routing_target_addr,
-        "stargate-0.stargate-headless.stargate.svc.cluster.local:50072"
+        "stargate-0.stargate-headless:50072"
     );
     assert_eq!(
         endpoint.sni_override.as_deref(),
-        Some("stargate-0.stargate-headless.stargate.svc.cluster.local")
+        Some("stargate-0.stargate-headless")
     );
-}
-
-#[test]
-fn reverse_tunnel_endpoint_from_ack_rejects_empty_pylon_dial_addr() {
-    let endpoint = reverse_tunnel_endpoint_from_ack(&InferenceServerAck {
-        reverse_tunnel_target: "stargate-0.stargate-headless.stargate.svc.cluster.local:50072"
-            .to_string(),
-        reverse_tunnel_pylon_dial_addr: String::new(),
-        model_calibration_directives: Vec::new(),
-    });
-
-    assert!(endpoint.is_none());
 }
 
 #[tokio::test]
 async fn reverse_tunnel_connect_attempt_times_out() {
     let result = reverse_tunnel_connect_with_timeout(
         Duration::from_millis(1),
-        std::future::pending::<Result<ReverseQuicTunnelHandle, TunnelError>>(),
+        std::future::pending::<Result<crate::ReverseQuicTunnelHandle, TunnelError>>(),
     )
     .await;
 
-    assert!(
-        matches!(result, Err(TunnelError::ConnectTimeout { timeout_ms: 1 })),
-        "expected timeout connect error"
-    );
+    assert!(matches!(
+        result,
+        Err(TunnelError::ConnectTimeout { timeout_ms: 1 })
+    ));
 }
 
 #[test]
-fn reverse_tunnel_config_propagates_request_quality_monitor() {
-    let request_quality_monitor = RequestQualityMonitorConfig {
+fn registration_session_preserves_request_quality_configuration() {
+    let quality = RequestQualityMonitorConfig {
         collect_quality_metrics: true,
         collect_quality_metrics_min_tokens: 7,
         output_tokens_threshold_min: Some(9),
-        output_compression_threshold_max: Some(0.4),
-        output_degeneracy_threshold_min: Some(0.5),
-        output_repetition_1gram_threshold_min: Some(0.6),
-        output_repetition_2gram_threshold_min: Some(0.7),
-        output_repetition_3gram_threshold_min: Some(0.8),
-        median_logprob_threshold_max: Some(-6.5),
+        ..RequestQualityMonitorConfig::default()
     };
+    let mut config = test_registration_config();
+    config.forwarding.request_quality_monitor = quality;
 
-    let mut forwarding = TunnelForwardingConfig::new("http://127.0.0.1:8090/".to_string());
-    forwarding.request_quality_monitor = request_quality_monitor.clone();
-    let config = build_reverse_quic_tunnel_config(ReverseQuicTunnelConfigParams {
-        dial_addr: "127.0.0.1:12345".to_string(),
-        sni_override: None,
-        inference_server_id: "inst-a".to_string(),
-        quic_insecure: true,
-        tunnel_protocol: TunnelTransportProtocol::Custom,
-        forwarding,
-        auth_token_provider: None,
-    });
+    let session = RegistrationSessionConfig::try_from(config).expect("session should build");
 
-    assert!(config.request_quality_monitor.collect_quality_metrics);
+    assert!(
+        session
+            .forwarding
+            .request_quality_monitor
+            .collect_quality_metrics
+    );
     assert_eq!(
-        config
+        session
+            .forwarding
             .request_quality_monitor
             .collect_quality_metrics_min_tokens,
         7
     );
-    assert_eq!(
-        config.request_quality_monitor.output_tokens_threshold_min,
-        Some(9)
-    );
-    assert_eq!(
-        config
-            .request_quality_monitor
-            .output_compression_threshold_max,
-        Some(0.4)
-    );
-    assert_eq!(
-        config
-            .request_quality_monitor
-            .output_degeneracy_threshold_min,
-        Some(0.5)
-    );
-    assert_eq!(
-        config
-            .request_quality_monitor
-            .output_repetition_1gram_threshold_min,
-        Some(0.6)
-    );
-    assert_eq!(
-        config
-            .request_quality_monitor
-            .output_repetition_2gram_threshold_min,
-        Some(0.7)
-    );
-    assert_eq!(
-        config
-            .request_quality_monitor
-            .output_repetition_3gram_threshold_min,
-        Some(0.8)
-    );
-    assert_eq!(
-        config.request_quality_monitor.median_logprob_threshold_max,
-        Some(-6.5)
-    );
 }
 
 #[test]
-fn router_registration_task_harness_propagates_request_quality_monitor_to_each_router() {
-    let request_quality_monitor = RequestQualityMonitorConfig {
-        collect_quality_metrics: true,
-        collect_quality_metrics_min_tokens: 7,
-        output_tokens_threshold_min: Some(9),
-        output_compression_threshold_max: Some(0.4),
-        output_degeneracy_threshold_min: Some(0.5),
-        output_repetition_1gram_threshold_min: Some(0.6),
-        output_repetition_2gram_threshold_min: Some(0.7),
-        output_repetition_3gram_threshold_min: Some(0.8),
-        median_logprob_threshold_max: Some(-6.5),
-    };
-    let register_config = InferenceServerRegistrationConfig {
-        seeds: vec!["router-a".to_string(), "router-b".to_string()],
-        inference_server_id: "inst-a".to_string(),
-        cluster_id: "cluster-a".to_string(),
-        inference_server_url: "quic://127.0.0.1:8443".to_string(),
-        upstream_http_base_url: Some("http://127.0.0.1:8090".to_string()),
-        min_update_interval: Duration::from_secs(2),
-        status: InferenceServerStatus::Active,
-        reverse_tunnel: true,
-        quic_insecure: true,
-        tunnel_protocol: TunnelTransportProtocol::Http3,
-        bringup: BringupConfig::default(),
-        output_token_parser_factory: OutputTokenParserFactory,
-        request_observation_tx: None,
-        request_quality_monitor: request_quality_monitor.clone(),
-        metrics: None,
-        retry: PylonRetryConfig::default(),
-        queue_mismatch_retry: PylonQueueMismatchRetryConfig::default(),
-        queue_tracker: QueueAdmissionTracker::default(),
-        auth_token_provider: None,
-    };
-    let cancel_token = CancellationToken::new();
-    let (cluster_calibration_directive_tx, _cluster_calibration_directive_rx) = flume::bounded(1);
-    let task_template = RouterRegistrationTaskTemplate::from_registration_config(
-        &register_config,
-        &register_config.cluster_id,
-        register_config.upstream_http_base_url.as_deref().unwrap(),
-        cluster_calibration_directive_tx,
-        &cancel_token,
+fn infers_only_http_upstream_registration_urls() {
+    assert_eq!(
+        infer_upstream_http_base_url("http://127.0.0.1:8000/"),
+        Some("http://127.0.0.1:8000".to_string())
     );
+    assert_eq!(infer_upstream_http_base_url("http://"), None);
+    assert_eq!(infer_upstream_http_base_url("quic://127.0.0.1:8000"), None);
+}
 
-    for router in ["router-a", "router-b"] {
-        let task_config = task_template.build_for_router(grpc_endpoint(router));
-        assert_eq!(task_config.router_endpoint.authority_addr(), router);
-        assert_eq!(task_config.inference_server_id, "inst-a");
-        assert_eq!(task_config.cluster_id, "cluster-a");
-        assert_eq!(task_config.inference_server_url, "http://127.0.0.1:8090");
-        assert_eq!(task_config.min_update_interval, Duration::from_secs(2));
-        assert!(task_config.reverse_tunnel);
-        assert!(task_config.coordinated_calibration);
-        assert!(task_config.quic_insecure);
-        assert_eq!(task_config.tunnel_protocol, TunnelTransportProtocol::Http3);
-        assert_eq!(
-            task_config.forwarding.upstream_http_base_url,
-            "http://127.0.0.1:8090"
-        );
-        assert!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .collect_quality_metrics
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .collect_quality_metrics_min_tokens,
-            7
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .output_tokens_threshold_min,
-            Some(9)
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .output_compression_threshold_max,
-            Some(0.4)
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .output_degeneracy_threshold_min,
-            Some(0.5)
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .output_repetition_1gram_threshold_min,
-            Some(0.6)
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .output_repetition_2gram_threshold_min,
-            Some(0.7)
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .output_repetition_3gram_threshold_min,
-            Some(0.8)
-        );
-        assert_eq!(
-            task_config
-                .forwarding
-                .request_quality_monitor
-                .median_logprob_threshold_max,
-            Some(-6.5)
-        );
-    }
+#[tokio::test]
+async fn stop_watched_endpoint_signals_and_awaits_task() {
+    let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+    let task = OwnedTask::spawn("watch stargate endpoint", move |stop| async move {
+        stop.cancelled().await;
+        let _ = exited_tx.send(());
+    });
+    let endpoint = WatchedEndpoint {
+        generation: 0,
+        task,
+        snapshot: None,
+    };
+
+    stop_watched_endpoint(endpoint).await;
+
+    exited_rx.await.expect("watched endpoint task should exit");
 }

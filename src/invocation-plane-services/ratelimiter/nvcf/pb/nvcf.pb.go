@@ -565,7 +565,7 @@ type WorkerInvokeFunctionRequest struct {
 	RequestId string                 `protobuf:"bytes,1,opt,name=requestId,proto3" json:"requestId,omitempty"`
 	// nca id of the invoking client.
 	NcaId string `protobuf:"bytes,2,opt,name=ncaId,proto3" json:"ncaId,omitempty"`
-	// subject of the invoking client. may be ssa client id, nca id, some user id.
+	// subject of the invoking client. may be oauth2 client id, cloud account id, some user id.
 	Subject string `protobuf:"bytes,3,opt,name=subject,proto3" json:"subject,omitempty"`
 	// may expire, only valid for pexec and exec, not TLB
 	LargeResponseUrl string `protobuf:"bytes,4,opt,name=largeResponseUrl,proto3" json:"largeResponseUrl,omitempty"`
@@ -3701,8 +3701,13 @@ type RateLimitPolicyResponse_RateLimitConfig struct {
 	// per nca id rates
 	// If exists, PerNcaIdConfig is preferred over the "global" rate limit config above
 	PerNcaIdConfigs []*RateLimitPolicyResponse_RateLimitConfig_PerNcaIdConfigs `protobuf:"bytes,3,rep,name=perNcaIdConfigs,proto3" json:"perNcaIdConfigs,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Per-user rate. When set, this single rate is enforced individually against
+	// every unique caller (clientAuthSubject) in addition to the NCA-tier limit
+	// (both tiers must allow). Intended for traffic authenticated with an
+	// invocation delegation token (InvocationToken).
+	PerUserRate   *string `protobuf:"bytes,4,opt,name=perUserRate,proto3,oneof" json:"perUserRate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RateLimitPolicyResponse_RateLimitConfig) Reset() {
@@ -3754,6 +3759,13 @@ func (x *RateLimitPolicyResponse_RateLimitConfig) GetPerNcaIdConfigs() []*RateLi
 		return x.PerNcaIdConfigs
 	}
 	return nil
+}
+
+func (x *RateLimitPolicyResponse_RateLimitConfig) GetPerUserRate() string {
+	if x != nil && x.PerUserRate != nil {
+		return *x.PerUserRate
+	}
+	return ""
 }
 
 type RateLimitPolicyResponse_RateLimitConfig_PerNcaIdConfigs struct {
@@ -4100,17 +4112,19 @@ const file_nvcf_proto_rawDesc = "" +
 	"\n" +
 	"functionId\x18\x01 \x01(\tR\n" +
 	"functionId\x12,\n" +
-	"\x11functionVersionId\x18\x02 \x01(\tR\x11functionVersionId\"\xe4\x02\n" +
+	"\x11functionVersionId\x18\x02 \x01(\tR\x11functionVersionId\"\x9b\x03\n" +
 	"\x17RateLimitPolicyResponse\x12E\n" +
-	"\x06config\x18\x01 \x01(\v2-.nvcf.RateLimitPolicyResponse.RateLimitConfigR\x06config\x1a\x81\x02\n" +
+	"\x06config\x18\x01 \x01(\v2-.nvcf.RateLimitPolicyResponse.RateLimitConfigR\x06config\x1a\xb8\x02\n" +
 	"\x0fRateLimitConfig\x12\x17\n" +
 	"\x04rate\x18\x01 \x01(\tH\x00R\x04rate\x88\x01\x01\x12&\n" +
 	"\x0eexcludedNcaIds\x18\x02 \x03(\tR\x0eexcludedNcaIds\x12g\n" +
-	"\x0fperNcaIdConfigs\x18\x03 \x03(\v2=.nvcf.RateLimitPolicyResponse.RateLimitConfig.PerNcaIdConfigsR\x0fperNcaIdConfigs\x1a;\n" +
+	"\x0fperNcaIdConfigs\x18\x03 \x03(\v2=.nvcf.RateLimitPolicyResponse.RateLimitConfig.PerNcaIdConfigsR\x0fperNcaIdConfigs\x12%\n" +
+	"\vperUserRate\x18\x04 \x01(\tH\x01R\vperUserRate\x88\x01\x01\x1a;\n" +
 	"\x0fPerNcaIdConfigs\x12\x14\n" +
 	"\x05ncaId\x18\x01 \x01(\tR\x05ncaId\x12\x12\n" +
 	"\x04rate\x18\x02 \x01(\tR\x04rateB\a\n" +
-	"\x05_rate\"n\n" +
+	"\x05_rateB\x0e\n" +
+	"\f_perUserRate\"n\n" +
 	"\x1eDeploymentConfigurationRequest\x12\x1e\n" +
 	"\n" +
 	"functionId\x18\x01 \x01(\tR\n" +

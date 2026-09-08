@@ -14,9 +14,10 @@
 // limitations under the License.
 
 mod artifacts;
+mod command;
 mod config;
-mod custom;
 mod http3;
+mod raw_quic;
 mod report;
 mod summary;
 #[cfg(test)]
@@ -25,6 +26,7 @@ mod tls;
 mod trials;
 mod webtransport;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,11 +34,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use stargate_protocol::TunnelTransportProtocol;
 use tokio::sync::oneshot;
 
 use crate::statistics::{DistributionStats, NoiseClassification};
 
 pub use artifacts::write_transport_benchmark_artifacts;
+pub use command::run_transport_benchmark_command;
 pub use config::TransportBenchConfig;
 pub use report::render_transport_benchmark_report;
 pub use trials::run_transport_benchmark;
@@ -90,7 +94,7 @@ pub struct TransportComparisonSummary {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportKind {
-    CustomProtocol,
+    RawQuic,
     Http3H3Quinn,
     WebTransportH3Quinn,
 }
@@ -98,7 +102,7 @@ pub enum TransportKind {
 impl TransportKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::CustomProtocol => "custom-protocol",
+            Self::RawQuic => "raw-quic",
             Self::Http3H3Quinn => "http3-h3-quinn",
             Self::WebTransportH3Quinn => "webtransport-h3-quinn",
         }
@@ -160,6 +164,51 @@ pub(super) struct RunningServer {
     pub(super) shutdown_tx: oneshot::Sender<()>,
     pub(super) task: tokio::task::JoinHandle<Result<()>>,
 }
+
+pub(super) fn start_quic_server<H, F>(
+    config: TransportBenchConfig,
+    protocol: TunnelTransportProtocol,
+    response_chunks: Arc<Vec<Bytes>>,
+    bind_context: &'static str,
+    address_context: &'static str,
+    handle_connection: H,
+) -> Result<RunningServer>
+where
+    H: Fn(quinn::Connection, TransportBenchConfig, Arc<Vec<Bytes>>) -> F + Copy + Send + 'static,
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    let generated = tls::server_config(config, protocol.alpn_protocols())?;
+    let endpoint = quinn::Endpoint::server(generated.server_config, "127.0.0.1:0".parse()?)
+        .context(bind_context)?;
+    let addr = endpoint.local_addr().context(address_context)?;
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        loop {
+            let Some(incoming) = (tokio::select! {
+                _ = &mut shutdown_rx => None,
+                incoming = endpoint.accept() => incoming,
+            }) else {
+                break;
+            };
+            let response_chunks = response_chunks.clone();
+            tokio::spawn(async move {
+                if let Ok(connection) = incoming.await {
+                    let _ = handle_connection(connection, config, response_chunks).await;
+                }
+            });
+        }
+        endpoint.close(0_u32.into(), b"benchmark shutdown");
+        endpoint.wait_idle().await;
+        Ok(())
+    });
+    Ok(RunningServer {
+        addr,
+        cert_pem: generated.cert_pem,
+        shutdown_tx,
+        task,
+    })
+}
+
 impl RunningServer {
     pub(super) async fn shutdown(self) -> Result<()> {
         let _ = self.shutdown_tx.send(());

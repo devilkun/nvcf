@@ -28,6 +28,7 @@ import (
 
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	"github.com/go-logr/logr"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -41,6 +42,23 @@ const (
 	DefaultSyncRequestStatusInterval      = 15 * time.Second
 	DefaultPeriodicInstanceStatusInterval = 5 * time.Minute
 )
+
+func TestSetDefaultsDoesNotBackfillDefaultStargateAddress(t *testing.T) {
+	cfg := nvcaconfig.Config{}
+
+	require.NoError(t, setDefaults(&cfg))
+
+	assert.Empty(t, cfg.Workload.DefaultStargateAddress)
+}
+
+func TestSetDefaultsPreservesConfiguredDefaultStargateAddress(t *testing.T) {
+	cfg := nvcaconfig.Config{}
+	cfg.Workload.DefaultStargateAddress = "llm-router.example.test:50071"
+
+	require.NoError(t, setDefaults(&cfg))
+
+	assert.Equal(t, "llm-router.example.test:50071", cfg.Workload.DefaultStargateAddress)
+}
 
 func TestNewCommand(t *testing.T) {
 	newAgentFunc := func(a cliAgent) func(ctx context.Context, opts *AgentOptions) (cliAgent, error) {
@@ -86,8 +104,12 @@ func TestNewCommand(t *testing.T) {
 	// With empty config, should pass.
 	t.Run("empty config file", func(t *testing.T) {
 		a, block := newMockCLIAgent()
+		var gotOpts *AgentOptions
 		cmd := newCobraCommand(
-			newAgentFunc(a),
+			func(ctx context.Context, opts *AgentOptions) (cliAgent, error) {
+				gotOpts = opts
+				return a, nil
+			},
 			setFlag,
 			initLogger,
 		)
@@ -113,7 +135,51 @@ agent:
 		case err = <-errCh:
 			cancel()
 		}
-		assert.NoError(t, err)
+		require.NoError(t, err)
+		require.NotNil(t, gotOpts)
+		assert.False(t, gotOpts.Config.Agent.BYOOLogChunking.Enabled)
+		assert.Zero(t, gotOpts.Config.Agent.BYOOLogChunking.MaxPayloadBytes)
+	})
+
+	t.Run("enabled BYOO log chunking config preserves collector default handoff", func(t *testing.T) {
+		a, block := newMockCLIAgent()
+		var gotOpts *AgentOptions
+		cmd := newCobraCommand(
+			func(ctx context.Context, opts *AgentOptions) (cliAgent, error) {
+				gotOpts = opts
+				return a, nil
+			},
+			setFlag,
+			initLogger,
+		)
+
+		cfgFilePath := filepath.Join(t.TempDir(), "config.yaml")
+		err := os.WriteFile(cfgFilePath, []byte(`
+agent:
+  icmsURL: https://test.example.com
+  byooLogChunking:
+    enabled: true
+`), 0600)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		errCh := make(chan error)
+		go func() {
+			cmd.SetArgs([]string{"--config=" + cfgFilePath})
+			errCh <- cmd.ExecuteContext(ctx)
+		}()
+
+		select {
+		case <-block:
+			cancel()
+			err = <-errCh
+		case err = <-errCh:
+			cancel()
+		}
+		require.NoError(t, err)
+		require.NotNil(t, gotOpts)
+		assert.True(t, gotOpts.Config.Agent.BYOOLogChunking.Enabled)
+		assert.Zero(t, gotOpts.Config.Agent.BYOOLogChunking.MaxPayloadBytes)
 	})
 
 	t.Run("configured control plane endpoints populate agent options", func(t *testing.T) {
@@ -267,6 +333,23 @@ func TestMaintenanceModeMutualExclusivityLogic(t *testing.T) {
 	assert.Contains(t, actualError.Error(), "CordonMaintenance")
 	assert.Contains(t, actualError.Error(), "CordonAndDrainMaintenance")
 	assert.Contains(t, actualError.Error(), "mutually exclusive")
+}
+
+func TestConfigureAndCheckCLI_SelfHostedRequiresClusterID(t *testing.T) {
+	require.NoError(t, (&featureflag.CLIFlag{}).Set(featureflag.SelfHosted.Key))
+	t.Cleanup(func() {
+		require.NoError(t, (&featureflag.CLIFlag{}).Set("-"+featureflag.SelfHosted.Key))
+	})
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	err := configureAndCheckCLI(logrus.NewEntry(logger), &AgentOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "clusterID is required")
+
+	err = configureAndCheckCLI(logrus.NewEntry(logger), &AgentOptions{ClusterID: "registered-cluster-id"})
+	require.NoError(t, err)
 }
 
 func newMockCLIAgent() (cliAgent, chan struct{}) {

@@ -54,7 +54,7 @@ rectangle "pylon" #e8f4fd {
   rectangle "Registration Client" as RegCli
   rectangle "QUIC Tunnel\n(forward or reverse)" as TunnelCli
   rectangle "Bringup Supervisor\n(health + canary)" as Bringup
-  rectangle "Calibration Executor\n(per-Stargate assignment)" as Calibration
+  rectangle "Input-TPS Bootstrap\n(local calibration XOR\noperator initial value)" as Bootstrap
   rectangle "Stats Collector\n(request observation +\nengine stats stream)" as Stats
 }
 
@@ -88,15 +88,15 @@ ControlPlane --> Forwarding : check if request is for a peer
 Forwarding --> Discovery : resolve peer via\nheadless Service DNS
 ControlPlane --> NVCF : AuthLlmWorker(bearer token)\n-> routing_key
 ControlPlane --> State : routing updates\n(routing_key from auth)
-RegCli --> Calibration : RUN / WAITING / COMPLETE\n(no capacity values)
-Calibration --> ControlPlane : SubmitClusterCalibration\n(owner token + result)
 ControlPlane --> Quic : preconnect / reverse wait
 Quic --> NVCF : reverse tunnel handshake auth\n(verify routing_key matches)
 
 ' client-internal
 Bringup --> Upstream : health + canary\n(local HTTP)
-Calibration --> Upstream : assigned calibration sweep\n(local HTTP)
-Stats --> RegCli : model stats
+Bootstrap --> Upstream : generation-owned calibration ramp\n(local HTTP; expected timeout completes)
+Upstream --> Stats : exact-generation calibration observations\npopulate runtime windows once
+Bootstrap --> Stats : snapshot current stats for logging\n(no reinjection)
+Stats --> RegCli : start registration only\nafter local startup
 Stats --> Upstream : engine stats side channel
 
 ' discovery

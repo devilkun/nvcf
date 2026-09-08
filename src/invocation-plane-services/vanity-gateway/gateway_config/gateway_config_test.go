@@ -60,6 +60,20 @@ func TestNotifySharedReloadDropsPendingNotification(t *testing.T) {
 	}
 }
 
+func TestGatewayConfigValidateRejectsVanityHostMatchingOpenAIHost(t *testing.T) {
+	cfg := &GatewayConfig{}
+	cfg.OpenAI.Host = "api.example.com"
+	cfg.Vanity = map[string]VanityEntry{
+		"example": {
+			Host: "api.example.com",
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `vanity.example.host "api.example.com" conflicts with openai.host`)
+}
+
 func TestGatewayConfigValidateAcceptsOpenAIShadowDefaults(t *testing.T) {
 	cfg := &GatewayConfig{}
 	cfg.OpenAI.ChatCompletions = map[string]ModelFunctionDetails{
@@ -136,6 +150,30 @@ v2config:
 	assert.Equal(t, []string{"private/facebook/opt-125m-shadow-b"}, primary.ShadowModelNames)
 }
 
+func TestGatewayConfigLoadAcceptsShadowSamplingMethod(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	err := os.WriteFile(configPath, []byte(`
+v2config:
+  openai:
+    chatCompletions:
+      primary:
+        modelName: facebook/opt-125m
+        functionID: func-id
+        shadowModelName: private/facebook/opt-125m-shadow
+        shadowSamplingMethod: perBearerKey
+      shadow:
+        modelName: private/facebook/opt-125m-shadow
+        functionID: shadow-func-id
+`), 0600)
+	require.NoError(t, err)
+
+	reloadable, err := SetupConfigWithConfigPath(configPath)
+	require.NoError(t, err)
+
+	cfg := reloadable.Get()
+	assert.Equal(t, ShadowSamplingMethodPerBearerKey, cfg.OpenAI.ChatCompletions["primary"].ShadowSamplingMethod)
+}
+
 func TestGatewayConfigLoadAcceptsSessionTimeout(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	err := os.WriteFile(configPath, []byte(`
@@ -159,6 +197,189 @@ v2config:
 	cfg := reloadable.Get()
 	assert.Equal(t, SessionTimeoutSeconds(900), cfg.OpenAI.ChatCompletions["primary"].SessionTimeout)
 	assert.Equal(t, SessionTimeoutSeconds(0), cfg.OpenAI.ChatCompletions["zero"].SessionTimeout)
+}
+
+func TestGatewayConfigLoadAcceptsCustomHeaders(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	err := os.WriteFile(configPath, []byte(`
+v2config:
+  openai:
+    chatCompletions:
+      primary:
+        modelName: facebook/opt-125m
+        functionID: func-id
+        customHeaders:
+          X-Provider-Feature: enabled
+          X-Request-Source: vanity-gateway
+  vanity:
+    example:
+      host: ai.example.com
+      paths:
+        sample:
+          path: /v1/example/infer
+          functionID: vanity-func-id
+          customHeaders:
+            X-Provider-Feature: enabled
+`), 0600)
+	require.NoError(t, err)
+
+	reloadable, err := SetupConfigWithConfigPath(configPath)
+	require.NoError(t, err)
+
+	cfg := reloadable.Get()
+	assert.Equal(t, CustomHeaders{
+		"X-Provider-Feature": "enabled",
+		"X-Request-Source":   "vanity-gateway",
+	}, cfg.OpenAI.ChatCompletions["primary"].CustomHeaders)
+	assert.Equal(t, CustomHeaders{
+		"X-Provider-Feature": "enabled",
+	}, cfg.Vanity["example"].Paths["sample"].CustomHeaders)
+}
+
+func TestGatewayConfigLoadAcceptsNullCustomHeaders(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	err := os.WriteFile(configPath, []byte(`
+v2config:
+  openai:
+    chatCompletions:
+      primary:
+        modelName: facebook/opt-125m
+        functionID: func-id
+        customHeaders: null
+  vanity:
+    example:
+      host: ai.example.com
+      paths:
+        sample:
+          path: /v1/example/infer
+          functionID: vanity-func-id
+          customHeaders: null
+`), 0600)
+	require.NoError(t, err)
+
+	reloadable, err := SetupConfigWithConfigPath(configPath)
+	require.NoError(t, err)
+
+	cfg := reloadable.Get()
+	assert.Nil(t, cfg.OpenAI.ChatCompletions["primary"].CustomHeaders)
+	assert.Nil(t, cfg.Vanity["example"].Paths["sample"].CustomHeaders)
+}
+
+func TestGatewayConfigLoadRejectsNonStringCustomHeaderValues(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	err := os.WriteFile(configPath, []byte(`
+v2config:
+  openai:
+    chatCompletions:
+      primary:
+        modelName: facebook/opt-125m
+        functionID: func-id
+        customHeaders:
+          X-Provider-Feature: true
+`), 0600)
+	require.NoError(t, err)
+
+	_, err = SetupConfigWithConfigPath(configPath)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "customHeaders.X-Provider-Feature must be a string")
+}
+
+func TestGatewayConfigValidateRejectsInvalidCustomHeaders(t *testing.T) {
+	tests := []struct {
+		name          string
+		headers       CustomHeaders
+		vanity        bool
+		errorContains string
+	}{
+		{
+			name:          "empty name",
+			headers:       CustomHeaders{"": "value"},
+			errorContains: "customHeaders cannot contain empty header names",
+		},
+		{
+			name:          "malformed name",
+			headers:       CustomHeaders{"Bad Header": "value"},
+			errorContains: "invalid HTTP field name",
+		},
+		{
+			name:          "duplicate name",
+			headers:       CustomHeaders{"X-Foo": "first", "x-foo": "second"},
+			errorContains: "duplicate header names",
+		},
+		{
+			name:          "nvcf managed header",
+			headers:       CustomHeaders{"NVCF-POLL-SECONDS": "value"},
+			errorContains: "NVCF-managed header",
+		},
+		{
+			name:          "reserved vanity host",
+			headers:       CustomHeaders{"Host": "value"},
+			vanity:        true,
+			errorContains: "reserved header",
+		},
+		{
+			name:          "reserved authorization",
+			headers:       CustomHeaders{"Authorization": "value"},
+			errorContains: "reserved header",
+		},
+		{
+			name:          "reserved function id",
+			headers:       CustomHeaders{"function-id": "value"},
+			errorContains: "reserved header",
+		},
+		{
+			name:          "reserved function version id",
+			headers:       CustomHeaders{"function-version-id": "value"},
+			errorContains: "reserved header",
+		},
+		{
+			name:          "reserved content length",
+			headers:       CustomHeaders{"Content-Length": "value"},
+			errorContains: "reserved header",
+		},
+		{
+			name:          "reserved connection",
+			headers:       CustomHeaders{"Connection": "value"},
+			errorContains: "reserved header",
+		},
+		{
+			name:          "reserved proxy header",
+			headers:       CustomHeaders{"Proxy-Authorization": "value"},
+			errorContains: "reserved header",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &GatewayConfig{}
+			if tc.vanity {
+				cfg.Vanity = map[string]VanityEntry{
+					"example": {
+						Host: "ai.example.com",
+						Paths: map[string]PathFunctionDetails{
+							"sample": {
+								Path:          "/v1/example/infer",
+								FunctionID:    "func-id",
+								CustomHeaders: tc.headers,
+							},
+						},
+					},
+				}
+			} else {
+				cfg.OpenAI.ChatCompletions = map[string]ModelFunctionDetails{
+					"primary": {
+						ModelName:     "facebook/opt-125m",
+						FunctionID:    "func-id",
+						CustomHeaders: tc.headers,
+					},
+				}
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.errorContains)
+		})
+	}
 }
 
 func TestGatewayConfigValidateRejectsNegativeSessionTimeout(t *testing.T) {
@@ -295,6 +516,72 @@ func TestGatewayConfigValidateRejectsInvalidOpenAIShadowPercentage(t *testing.T)
 			assert.ErrorContains(t, err, "shadowPercentage must be between 1 and 100")
 		})
 	}
+}
+
+func TestGatewayConfigValidateAcceptsShadowSamplingMethod(t *testing.T) {
+	tests := []struct {
+		name   string
+		method ShadowSamplingMethod
+	}{
+		{name: "omitted", method: ""},
+		{name: "random", method: ShadowSamplingMethodRandom},
+		{name: "per bearer key", method: ShadowSamplingMethodPerBearerKey},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &GatewayConfig{}
+			cfg.OpenAI.ChatCompletions = map[string]ModelFunctionDetails{
+				"primary": {
+					ModelName:            "facebook/opt-125m",
+					FunctionID:           "func-id",
+					ShadowModelName:      "private/facebook/opt-125m-shadow",
+					ShadowSamplingMethod: tc.method,
+				},
+				"shadow": {
+					ModelName:  "private/facebook/opt-125m-shadow",
+					FunctionID: "shadow-func-id",
+				},
+			}
+
+			require.NoError(t, cfg.Validate())
+		})
+	}
+}
+
+func TestGatewayConfigValidateRejectsInvalidShadowSamplingMethod(t *testing.T) {
+	cfg := &GatewayConfig{}
+	cfg.OpenAI.ChatCompletions = map[string]ModelFunctionDetails{
+		"primary": {
+			ModelName:            "facebook/opt-125m",
+			FunctionID:           "func-id",
+			ShadowModelName:      "private/facebook/opt-125m-shadow",
+			ShadowSamplingMethod: ShadowSamplingMethod("weighted"),
+		},
+		"shadow": {
+			ModelName:  "private/facebook/opt-125m-shadow",
+			FunctionID: "shadow-func-id",
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "shadowSamplingMethod")
+}
+
+func TestGatewayConfigValidateRejectsShadowSamplingMethodWithoutShadowTarget(t *testing.T) {
+	cfg := &GatewayConfig{}
+	cfg.OpenAI.ChatCompletions = map[string]ModelFunctionDetails{
+		"primary": {
+			ModelName:            "facebook/opt-125m",
+			FunctionID:           "func-id",
+			ShadowSamplingMethod: ShadowSamplingMethodPerBearerKey,
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "shadowSamplingMethod requires at least one shadow target")
 }
 
 func TestGatewayConfigValidateRejectsShadowPercentageWithoutShadowModel(t *testing.T) {
@@ -500,6 +787,30 @@ func TestGatewayConfigValidateRejectsShadowOnMultipartImageSections(t *testing.T
 				}
 			},
 		},
+		{
+			name: "imageEdits shadowSamplingMethod",
+			applyTo: func(cfg *GatewayConfig) {
+				cfg.OpenAI.ImageEdits = map[string]ModelFunctionDetails{
+					"edit": {
+						ModelName:            "qwen/qwen-image-edit-2511",
+						FunctionID:           "edit-id",
+						ShadowSamplingMethod: ShadowSamplingMethodPerBearerKey,
+					},
+				}
+			},
+		},
+		{
+			name: "imageVariations shadowSamplingMethod",
+			applyTo: func(cfg *GatewayConfig) {
+				cfg.OpenAI.ImageVariations = map[string]ModelFunctionDetails{
+					"var": {
+						ModelName:            "qwen/qwen-image-var",
+						FunctionID:           "var-id",
+						ShadowSamplingMethod: ShadowSamplingMethodPerBearerKey,
+					},
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -549,4 +860,146 @@ func TestGatewayConfigValidateRejectsVanityShadowConfig(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "shadow config is unsupported for vanity routes")
+}
+
+func TestGatewayConfigValidateRejectsVanityShadowSamplingMethod(t *testing.T) {
+	cfg := &GatewayConfig{}
+	cfg.Vanity = map[string]VanityEntry{
+		"test": {
+			Host: "test.host",
+			Paths: map[string]PathFunctionDetails{
+				"path": {
+					Path:                 "/v1/test",
+					FunctionID:           "func-id",
+					ShadowSamplingMethod: ShadowSamplingMethodPerBearerKey,
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "shadow config is unsupported for vanity routes")
+}
+
+func llmModelConfig(section string, entry ModelFunctionDetails) *GatewayConfig {
+	cfg := &GatewayConfig{}
+	cfg.OpenAI.Host = "api.example.com"
+	entries := map[string]ModelFunctionDetails{"m": entry}
+	switch section {
+	case "chatCompletions":
+		cfg.OpenAI.ChatCompletions = entries
+	case "responses":
+		cfg.OpenAI.Responses = entries
+	case "embeddings":
+		cfg.OpenAI.Embeddings = entries
+	case "completions":
+		cfg.OpenAI.Completions = entries
+	case "imageGenerations":
+		cfg.OpenAI.ImageGenerations = entries
+	}
+	return cfg
+}
+
+func llmModel() ModelFunctionDetails {
+	return ModelFunctionDetails{ModelName: "meta/llama", FunctionID: "func-id", FunctionType: FunctionTypeLLM}
+}
+
+func TestGatewayConfigValidateAcceptsLLMFunctionTypeInSupportedSections(t *testing.T) {
+	for _, section := range llmGatewaySections {
+		t.Run(section, func(t *testing.T) {
+			cfg := llmModelConfig(section, llmModel())
+			require.NoError(t, cfg.Validate())
+			assert.True(t, cfg.HasLLMGatewayRoute())
+		})
+	}
+}
+
+func TestGatewayConfigValidateRejectsLLMFunctionTypeInUnsupportedSections(t *testing.T) {
+	for _, section := range []string{"completions", "imageGenerations"} {
+		t.Run(section, func(t *testing.T) {
+			err := llmModelConfig(section, llmModel()).Validate()
+			require.Error(t, err)
+			assert.ErrorContains(t, err, `functionType "LLM" is only supported in`)
+		})
+	}
+}
+
+func TestGatewayConfigValidateRejectsUnknownFunctionType(t *testing.T) {
+	entry := llmModel()
+	entry.FunctionType = FunctionType("llmGateway")
+	err := llmModelConfig("chatCompletions", entry).Validate()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `functionType must be "LLM" when set`)
+}
+
+func TestGatewayConfigValidateRejectsInvocationOnlyFieldsOnLLMModels(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(e *ModelFunctionDetails)
+		wantErr string
+	}{
+		{"functionID missing", func(e *ModelFunctionDetails) { e.FunctionID = "" }, "functionID is required"},
+		{"usePexec", func(e *ModelFunctionDetails) { e.UsePexec = true }, "usePexec is unsupported"},
+		{"outgoingPathOverride", func(e *ModelFunctionDetails) { e.OutgoingPathOverride = "/x" }, "outgoingPathOverride is unsupported"},
+		{"sessionTimeout", func(e *ModelFunctionDetails) { e.SessionTimeout = 900 }, "sessionTimeout is unsupported"},
+		{"X-Priority header", func(e *ModelFunctionDetails) { e.CustomHeaders = CustomHeaders{"X-Priority": "5"} }, "the LLM Gateway rejects requests carrying it"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := llmModel()
+			tc.mutate(&entry)
+			err := llmModelConfig("chatCompletions", entry).Validate()
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestGatewayConfigValidateAcceptsShadowTrafficOnLLMModels(t *testing.T) {
+	pct := 50
+	primary := llmModel()
+	primary.ShadowModelNames = []string{"meta/llama-shadow"}
+	primary.ShadowPercentage = &pct
+
+	shadow := llmModel()
+	shadow.ModelName = "meta/llama-shadow"
+
+	cfg := &GatewayConfig{}
+	cfg.OpenAI.Host = "api.example.com"
+	cfg.OpenAI.ChatCompletions = map[string]ModelFunctionDetails{"m": primary, "shadow": shadow}
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestGatewayConfigValidateAllowsInvocationFieldsOnDefaultModels(t *testing.T) {
+	entry := ModelFunctionDetails{ModelName: "meta/llama", FunctionID: "func-id", UsePexec: true, SessionTimeout: 900}
+	cfg := llmModelConfig("chatCompletions", entry)
+	require.NoError(t, cfg.Validate())
+	assert.False(t, cfg.HasLLMGatewayRoute())
+}
+
+func TestGatewayConfigLoadAcceptsLLMFunctionType(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	err := os.WriteFile(configPath, []byte(`
+v2config:
+  openai:
+    host: api.example.com
+    chatCompletions:
+      llama:
+        modelName: meta/llama-3.3-70b
+        functionID: func-id
+        functionType: LLM
+      phi:
+        modelName: microsoft/phi-2
+        functionID: other-id
+`), 0600)
+	require.NoError(t, err)
+
+	loaded, err := SetupConfigWithConfigPath(configPath)
+	require.NoError(t, err)
+	cfg := loaded.Get()
+	assert.True(t, cfg.HasLLMGatewayRoute())
+	assert.True(t, cfg.OpenAI.ChatCompletions["llama"].TargetsLLMGateway())
+	assert.False(t, cfg.OpenAI.ChatCompletions["phi"].TargetsLLMGateway())
 }

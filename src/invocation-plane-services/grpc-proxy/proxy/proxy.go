@@ -34,11 +34,11 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/NVIDIA/nvcf-go/pkg/nvkit/auth"
-	"github.com/NVIDIA/nvcf-go/pkg/nvkit/clients"
-	"github.com/NVIDIA/nvcf-go/pkg/nvkit/logs"
-	"github.com/NVIDIA/nvcf-go/pkg/nvkit/servers"
-	"github.com/NVIDIA/nvcf-go/pkg/nvkit/tracing"
+	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/auth"
+	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/clients"
+	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
+	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/servers"
+	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
 
 	"nvcf-grpc-proxy/nvcf/pb"
 	"nvcf-grpc-proxy/proxy/consts"
@@ -295,8 +295,16 @@ func NewNVCFProxy(logger *logs.ZapLogger, config Config) (*NVCFProxy, error) {
 	}, nil
 }
 
+// version is injected at link time via x_defs in the root BUILD.bazel when
+// building with --stamp. Unstamped builds leave the placeholder or an empty
+// string, so getVersion falls through to versioninfo.
+var version string
+
 func getVersion() string {
-	if version := os.Getenv("VERSION"); version != "" {
+	if v := os.Getenv("VERSION"); v != "" {
+		return v
+	}
+	if version != "" && !strings.Contains(version, "{") {
 		return version
 	}
 	return versioninfo.Revision
@@ -305,7 +313,13 @@ func getVersion() string {
 func getConnectPaths(config Config) (invocation.ConnectPaths, error) {
 	proxyPaths := invocation.ConnectPaths{}
 	if config.EnableHTTP1Connect {
-		if config.PodIP != "" {
+		if config.SelfWorkerFqdn != "" {
+			workerProxyPath, err := proxyPath(config.SelfWorkerFqdn)
+			if err != nil {
+				return proxyPaths, err
+			}
+			proxyPaths.HTTP1 = workerProxyPath
+		} else if config.PodIP != "" {
 			proxyPaths.HTTP1 = fmt.Sprintf("http://%s:10086/v1/proxy", config.PodIP)
 		}
 	}
@@ -334,6 +348,17 @@ func getConnectPaths(config Config) (invocation.ConnectPaths, error) {
 		return proxyPaths, fmt.Errorf("no proxy paths configured")
 	}
 	return proxyPaths, nil
+}
+
+func proxyPath(baseURL string) (string, error) {
+	parsedURL, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return "", fmt.Errorf("proxy URL must include scheme and host: %s", baseURL)
+	}
+	return url.JoinPath(parsedURL.String(), "/v1/proxy")
 }
 
 func setupTLS(config Config) (*tls.Config, error) {

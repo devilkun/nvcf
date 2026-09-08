@@ -18,6 +18,8 @@ limitations under the License.
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -54,6 +56,37 @@ func TestLoadFromEnvReadsMetricsPort(t *testing.T) {
 
 	if cfg.Telemetry.MetricsPort != 0 {
 		t.Fatalf("metrics port = %d, want 0", cfg.Telemetry.MetricsPort)
+	}
+}
+
+func TestLoadFromEnvReadsTracingAccessToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets.json")
+	if err := os.WriteFile(path, []byte(`{"id":"x","secret":"y","tracingAccessToken":"tok-123"}`), 0o600); err != nil {
+		t.Fatalf("write secrets: %v", err)
+	}
+	t.Setenv("SECRETS_PATH", path)
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+
+	if cfg.Telemetry.TracingAccessToken != "tok-123" {
+		t.Fatalf("tracing access token = %q, want tok-123", cfg.Telemetry.TracingAccessToken)
+	}
+}
+
+func TestLoadFromEnvTracingAccessTokenBestEffort(t *testing.T) {
+	// Missing secrets file must leave the token empty, not fail startup.
+	t.Setenv("SECRETS_PATH", filepath.Join(t.TempDir(), "does-not-exist.json"))
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+
+	if cfg.Telemetry.TracingAccessToken != "" {
+		t.Fatalf("tracing access token = %q, want empty", cfg.Telemetry.TracingAccessToken)
 	}
 }
 

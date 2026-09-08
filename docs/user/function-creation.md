@@ -35,7 +35,7 @@ For LLM functions, see [LLM Gateway](./llm-gateway.md#function-configuration) fo
 ### Container Versioning
 
 - Ensure that any resources that you tag for deployment into production environments are not simply using "latest" and are following a standard version control convention.
-  - During autoscaling, a function scaling any additional instances will pull the same specificed container image and version. If version is set to "latest", and the "latest" container image is updated between instance scaling, this can lead to undefined behavior.
+  - During autoscaling, a function scaling any additional instances will pull the same specified container image and version. If version is set to "latest", and the "latest" container image is updated between instance scaling, this can lead to undefined behavior.
 
 - Function versions created are immutable, this means that the container image and version cannot be updated for a function without creating a new version of the function.
 
@@ -48,7 +48,7 @@ For LLM functions, see [LLM Gateway](./llm-gateway.md#function-configuration) fo
 
 The following is a reference of available variables via the headers of the invocation message (auto-populated by Cloud Functions), accessible within the container.
 
-For examples of how to extract and use some of these variables, see [NVCF Container Helper Functions](https://github.com/NVIDIA/nv-cloud-function-helpers/tree/main).
+For examples of how to extract and use some of these variables, see [NVCF Container Helper Functions](https://github.com/NVIDIA/nvcf/tree/main/src/libraries/python/nv-cloud-function-helpers).
 
 | Name                         | Description                                             |
 | ---------------------------- | ------------------------------------------------------- |
@@ -64,6 +64,7 @@ For examples of how to extract and use some of these variables, see [NVCF Contai
 | NVCF-BACKEND                 | Backend or "Cluster Group" the function is deployed on. |
 | NVCF-INSTANCETYPE            | Instance type the function is deployed on.              |
 | NVCF-REGION                  | Region or zone the function is deployed in.             |
+| NVCF-INVOCATION-REGION       | Region of the invocation service that accepted the request. Client values are replaced. |
 | NVCF-ENV                     | Spot environment if deployed on spot instances.         |
 
 #### Environment Variables

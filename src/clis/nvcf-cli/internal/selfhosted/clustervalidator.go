@@ -270,6 +270,14 @@ func sweepManagedPullSecrets(ctx context.Context, client kubernetes.Interface) {
 // reused. VALIDATOR_CONFIG_NAME is empty so the validator skips the
 // configurable reachability/network-policy sections (ConfigMap support is a
 // follow-up).
+//
+// VALIDATOR_PREFLIGHT=true puts the validator in preflight mode: it runs the
+// readiness checks and exits, but does NOT write its summary ConfigMap. The
+// ConfigMap exists for the metrics path (the NVCA agent watches it and
+// republishes on /metrics), which is meaningless here because preflight runs
+// before NVCA is installed and our RBAC bootstrap grants no configmaps
+// create/update. Tagging the invocation keeps preflight a clean no-op rather
+// than emitting a confusing "failed to create summary ConfigMap" warning.
 func buildClusterValidatorJob(name, image, pullSecret string, noCleanup bool) *batchv1.Job {
 	backoff := int32(0)
 	podSpec := corev1.PodSpec{
@@ -282,6 +290,7 @@ func buildClusterValidatorJob(name, image, pullSecret string, noCleanup bool) *b
 			Env: []corev1.EnvVar{
 				{Name: "VALIDATOR_CONFIG_NAMESPACE", Value: clusterValidatorNamespace},
 				{Name: "VALIDATOR_CONFIG_NAME", Value: ""},
+				{Name: "VALIDATOR_PREFLIGHT", Value: "true"},
 			},
 		}},
 	}

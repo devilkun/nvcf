@@ -41,7 +41,8 @@ and 'install --compute-plane' explicitly.`,
 
 // Persistent flags shared by all self-hosted subcommands.
 var (
-	selfHostedStack               string
+	selfHostedControlPlaneStack    string
+	selfHostedComputePlaneStack    string
 	selfHostedEnv                 string
 	selfHostedNoApply             bool
 	selfHostedNonInter            bool
@@ -90,8 +91,10 @@ const (
 func init() {
 	rootCmd.AddCommand(selfHostedCmd)
 
-	selfHostedCmd.PersistentFlags().StringVar(&selfHostedStack, "stack", "",
-		"Bundle source: local path, git URL, or oci:// URL (default: built-in OCI URL pinned to this CLI version)")
+	selfHostedCmd.PersistentFlags().StringVar(&selfHostedControlPlaneStack, "control-plane-stack", "",
+		"Control-plane stack source: local path, git URL, or oci:// URL (default: built-in OCI URL pinned to this CLI version)")
+	selfHostedCmd.PersistentFlags().StringVar(&selfHostedComputePlaneStack, "compute-plane-stack", "",
+		"Compute-plane stack source: local path, git URL, or oci:// URL (default: built-in OCI URL pinned to this CLI version)")
 	selfHostedCmd.PersistentFlags().StringVar(&selfHostedEnv, "env", "local",
 		"Helmfile environment (e.g. local, prd)")
 	selfHostedCmd.PersistentFlags().BoolVar(&selfHostedNoApply, "no-apply", false,

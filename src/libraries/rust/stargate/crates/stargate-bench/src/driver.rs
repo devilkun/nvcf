@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,6 +59,39 @@ pub struct RequestResult {
     pub error: Option<String>,
 }
 
+impl RequestResult {
+    fn pending(request: ManifestRequest) -> Self {
+        Self {
+            request_index: request.request_index,
+            request_id: request.request_id,
+            routing_key: request.routing_key,
+            cache_affinity_key: request.cache_affinity_key,
+            input_tokens: request.input_tokens,
+            output_tokens: request.output_tokens,
+            scheduled_offset_ms: request.scheduled_offset_ms,
+            status_code: 0,
+            selected_backend_id: None,
+            dispatch_offset_ms: 0,
+            response_headers_ms: None,
+            first_output_ms: None,
+            completion_ms: 0,
+            kv_cache_hit: None,
+            kv_cache_reused_input_tokens: None,
+            kv_cache_uncached_input_tokens: None,
+            kv_cache_evicted_entries: None,
+            kv_cache_evicted_tokens: None,
+            ok: false,
+            error: None,
+        }
+    }
+
+    fn finish(mut self, dispatch_time: Instant, error: Option<reqwest::Error>) -> Self {
+        self.completion_ms = duration_ms(dispatch_time.elapsed());
+        self.error = error.map(|error| error.to_string());
+        self
+    }
+}
+
 pub fn load_manifest(path: &Path) -> anyhow::Result<Manifest> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;
@@ -76,34 +110,31 @@ pub async fn drive_manifest(
     let client = reqwest::Client::new();
     let start = Instant::now();
     let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
+    let endpoint: Arc<str> = config.endpoint.into();
+    let model: Arc<str> = manifest.model.into();
     let mut tasks = Vec::with_capacity(manifest.requests.len());
 
     for request in manifest.requests {
         let client = client.clone();
         let semaphore = semaphore.clone();
-        let endpoint = config.endpoint.clone();
-        let model = manifest.model.clone();
-        let task = tokio::spawn(async move {
+        let endpoint = endpoint.clone();
+        let model = model.clone();
+        tasks.push(tokio::spawn(async move {
             let target = start + Duration::from_millis(request.scheduled_offset_ms);
-            let now = Instant::now();
-            if target > now {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(target)).await;
-            }
+            tokio::time::sleep_until(target.into()).await;
 
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("semaphore should remain open");
 
-            execute_request(&client, &endpoint, &model, &request, start).await
-        });
-        tasks.push(task);
+            execute_request(&client, &endpoint, &model, request, start).await
+        }));
     }
 
-    let mut results = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        results.push(task.await.context("request task failed to join")??);
-    }
+    let mut results = futures::future::try_join_all(tasks)
+        .await
+        .context("request task failed to join")?;
     results.sort_by_key(|result| result.request_index);
     write_results_jsonl(&config.output_path, &results)?;
     Ok(results)
@@ -113,165 +144,81 @@ async fn execute_request(
     client: &reqwest::Client,
     endpoint: &str,
     model: &str,
-    request: &ManifestRequest,
+    request: ManifestRequest,
     start: Instant,
-) -> anyhow::Result<RequestResult> {
+) -> RequestResult {
+    let mut result = RequestResult::pending(request);
+    let Ok(input_tokens) = usize::try_from(result.input_tokens) else {
+        result.error = Some("input token count does not fit usize".to_string());
+        return result;
+    };
     let dispatch_time = Instant::now();
     let mut builder = client
         .post(endpoint)
-        .header("x-request-id", request.request_id.clone())
+        .header("x-request-id", &result.request_id)
         .header("x-model", model)
-        .header("x-input-tokens", request.input_tokens.to_string())
-        .header("x-output-tokens", request.output_tokens.to_string())
+        .header("x-input-tokens", result.input_tokens.to_string())
+        .header("x-output-tokens", result.output_tokens.to_string())
         .header("content-type", "application/json");
-    if let Some(routing_key) = &request.routing_key {
+    if let Some(routing_key) = &result.routing_key {
         builder = builder.header("x-routing-key", routing_key);
     }
-    if let Some(cache_affinity_key) = &request.cache_affinity_key {
+    if let Some(cache_affinity_key) = &result.cache_affinity_key {
         builder = builder.header("x-cache-affinity-key", cache_affinity_key);
     }
 
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": "benchmark"}],
-        "max_tokens": request.output_tokens,
+        "messages": [{"role": "user", "content": "x".repeat(input_tokens)}],
+        "max_tokens": result.output_tokens,
         "stream": true,
     });
 
-    let response = builder.json(&body).send().await;
     // Dispatch timestamps are taken from the same monotonic clock; clamp only to keep malformed
     // test harness inputs from producing negative report offsets.
-    let dispatch_offset_ms = duration_ms(dispatch_time.saturating_duration_since(start));
-    match response {
-        Ok(response) => {
-            let status_code = response.status().as_u16();
-            let selected_backend_id = response
-                .headers()
-                .get("x-inference-server-id")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let kv_cache_hit = bool_header(response.headers(), "x-kv-cache-hit");
-            let kv_cache_reused_input_tokens =
-                u64_header(response.headers(), "x-kv-cache-reused-input-tokens");
-            let kv_cache_uncached_input_tokens =
-                u64_header(response.headers(), "x-kv-cache-uncached-input-tokens");
-            let kv_cache_evicted_entries =
-                u64_header(response.headers(), "x-kv-cache-evicted-entries");
-            let kv_cache_evicted_tokens =
-                u64_header(response.headers(), "x-kv-cache-evicted-tokens");
-            let response_headers_ms = duration_ms(dispatch_time.elapsed());
-            let mut first_output_ms = None;
-            let mut stream = response.bytes_stream();
-            let mut stream_text = String::new();
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        if !bytes.is_empty() {
-                            stream_text.push_str(&String::from_utf8_lossy(&bytes));
-                        }
-                        if first_output_ms.is_none() && saw_content_delta(&stream_text) {
-                            first_output_ms = Some(duration_ms(dispatch_time.elapsed()));
-                        }
-                    }
-                    Err(error) => {
-                        return Ok(RequestResult {
-                            request_index: request.request_index,
-                            request_id: request.request_id.clone(),
-                            routing_key: request.routing_key.clone(),
-                            cache_affinity_key: request.cache_affinity_key.clone(),
-                            input_tokens: request.input_tokens,
-                            output_tokens: request.output_tokens,
-                            scheduled_offset_ms: request.scheduled_offset_ms,
-                            status_code,
-                            selected_backend_id,
-                            dispatch_offset_ms,
-                            response_headers_ms: Some(response_headers_ms),
-                            first_output_ms,
-                            completion_ms: duration_ms(dispatch_time.elapsed()),
-                            kv_cache_hit,
-                            kv_cache_reused_input_tokens,
-                            kv_cache_uncached_input_tokens,
-                            kv_cache_evicted_entries,
-                            kv_cache_evicted_tokens,
-                            ok: false,
-                            error: Some(error.to_string()),
-                        });
-                    }
-                }
-            }
+    let response = builder.json(&body).send().await;
+    result.dispatch_offset_ms = duration_ms(dispatch_time.saturating_duration_since(start));
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return result.finish(dispatch_time, Some(error)),
+    };
 
-            Ok(RequestResult {
-                request_index: request.request_index,
-                request_id: request.request_id.clone(),
-                routing_key: request.routing_key.clone(),
-                cache_affinity_key: request.cache_affinity_key.clone(),
-                input_tokens: request.input_tokens,
-                output_tokens: request.output_tokens,
-                scheduled_offset_ms: request.scheduled_offset_ms,
-                status_code,
-                selected_backend_id,
-                dispatch_offset_ms,
-                response_headers_ms: Some(response_headers_ms),
-                first_output_ms,
-                completion_ms: duration_ms(dispatch_time.elapsed()),
-                kv_cache_hit,
-                kv_cache_reused_input_tokens,
-                kv_cache_uncached_input_tokens,
-                kv_cache_evicted_entries,
-                kv_cache_evicted_tokens,
-                ok: (200..300).contains(&status_code),
-                error: None,
-            })
+    result.status_code = response.status().as_u16();
+    result.selected_backend_id = header(response.headers(), "x-inference-server-id");
+    result.kv_cache_hit = header(response.headers(), "x-kv-cache-hit");
+    result.kv_cache_reused_input_tokens =
+        header(response.headers(), "x-kv-cache-reused-input-tokens");
+    result.kv_cache_uncached_input_tokens =
+        header(response.headers(), "x-kv-cache-uncached-input-tokens");
+    result.kv_cache_evicted_entries = header(response.headers(), "x-kv-cache-evicted-entries");
+    result.kv_cache_evicted_tokens = header(response.headers(), "x-kv-cache-evicted-tokens");
+    result.response_headers_ms = Some(duration_ms(dispatch_time.elapsed()));
+
+    let mut stream = response.bytes_stream();
+    let mut stream_text = String::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => return result.finish(dispatch_time, Some(error)),
+        };
+        if result.first_output_ms.is_none() && !bytes.is_empty() {
+            stream_text.push_str(&String::from_utf8_lossy(&bytes));
+            if stream_text.contains("\"content\":\"") {
+                result.first_output_ms = Some(duration_ms(dispatch_time.elapsed()));
+            }
         }
-        Err(error) => Ok(RequestResult {
-            request_index: request.request_index,
-            request_id: request.request_id.clone(),
-            routing_key: request.routing_key.clone(),
-            cache_affinity_key: request.cache_affinity_key.clone(),
-            input_tokens: request.input_tokens,
-            output_tokens: request.output_tokens,
-            scheduled_offset_ms: request.scheduled_offset_ms,
-            status_code: 0,
-            selected_backend_id: None,
-            dispatch_offset_ms,
-            response_headers_ms: None,
-            first_output_ms: None,
-            completion_ms: duration_ms(dispatch_time.elapsed()),
-            kv_cache_hit: None,
-            kv_cache_reused_input_tokens: None,
-            kv_cache_uncached_input_tokens: None,
-            kv_cache_evicted_entries: None,
-            kv_cache_evicted_tokens: None,
-            ok: false,
-            error: Some(error.to_string()),
-        }),
     }
+
+    result.ok = (200..300).contains(&result.status_code);
+    result.finish(dispatch_time, None)
 }
 
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn saw_content_delta(stream_text: &str) -> bool {
-    stream_text.contains("\"content\":\"")
-}
-
-fn bool_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<bool> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| match value {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        })
-}
-
-fn u64_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
+fn header<T: FromStr>(headers: &reqwest::header::HeaderMap, name: &str) -> Option<T> {
+    headers.get(name)?.to_str().ok()?.parse().ok()
 }
 
 pub fn write_results_jsonl(path: &Path, results: &[RequestResult]) -> anyhow::Result<()> {
@@ -289,7 +236,6 @@ pub fn write_results_jsonl(path: &Path, results: &[RequestResult]) -> anyhow::Re
 mod tests {
     use super::*;
     use crate::manifest::Manifest;
-    use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -306,6 +252,23 @@ mod tests {
         }
     }
 
+    fn manifest(requests: Vec<ManifestRequest>) -> Manifest {
+        Manifest {
+            manifest_version: 1,
+            benchmark_name: "driver-test".to_string(),
+            metadata: Default::default(),
+            model: "dummy-model".to_string(),
+            seed: 1,
+            request_count: requests.len(),
+            max_concurrency: 2,
+            stargate_count: 1,
+            backend_count: 1,
+            cluster_count: 1,
+            pylons_per_cluster: 1,
+            requests,
+        }
+    }
+
     #[tokio::test]
     async fn scheduled_sleep_does_not_hold_concurrency_permit() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -316,10 +279,8 @@ mod tests {
             listener.local_addr().expect("local addr should exist")
         );
         let server = tokio::spawn(async move {
-            let delays = BTreeMap::from([("req-0".to_string(), Duration::from_millis(250))]);
             for _ in 0..3 {
                 let (mut socket, _) = listener.accept().await.expect("request should connect");
-                let delays = delays.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let mut buffer = [0u8; 1024];
@@ -343,13 +304,13 @@ mod tests {
                                 .then(|| value.trim().to_string())
                         })
                         .expect("request id header should be present");
-                    if let Some(delay) = delays.get(&request_id) {
-                        tokio::time::sleep(*delay).await;
+                    if request_id == "req-0" {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                     }
 
                     socket
                         .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\nx-inference-server-id: backend-0\r\n\r\n",
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\nx-inference-server-id: backend-0\r\nx-kv-cache-hit: true\r\nx-kv-cache-reused-input-tokens: 1\r\nx-kv-cache-uncached-input-tokens: 0\r\n\r\n",
                         )
                         .await
                         .expect("response should write");
@@ -359,20 +320,7 @@ mod tests {
 
         let tempdir = tempfile::tempdir().expect("tempdir should create");
         let output_path = tempdir.path().join("requests.jsonl");
-        let manifest = Manifest {
-            manifest_version: 1,
-            benchmark_name: "schedule".to_string(),
-            metadata: Default::default(),
-            model: "dummy-model".to_string(),
-            seed: 1,
-            request_count: 3,
-            max_concurrency: 2,
-            stargate_count: 1,
-            backend_count: 1,
-            cluster_count: 1,
-            pylons_per_cluster: 1,
-            requests: vec![request(0, 0), request(1, 300), request(2, 50)],
-        };
+        let manifest = manifest(vec![request(0, 0), request(1, 300), request(2, 50)]);
 
         let results = drive_manifest(
             DriveConfig {
@@ -395,25 +343,25 @@ mod tests {
             "req-2 dispatched at {}ms, indicating a future sleeping request held the permit",
             request_two.dispatch_offset_ms
         );
+        assert!(matches!(
+            request_two,
+            RequestResult {
+                status_code: 200,
+                selected_backend_id: Some(id),
+                response_headers_ms: Some(_),
+                kv_cache_hit: Some(true),
+                kv_cache_reused_input_tokens: Some(1),
+                kv_cache_uncached_input_tokens: Some(0),
+                ok: true,
+                error: None,
+                ..
+            } if id == "backend-0"
+        ));
     }
 
     #[tokio::test]
     async fn zero_concurrency_limit_is_rejected() {
         let tempdir = tempfile::tempdir().expect("tempdir should create");
-        let manifest = Manifest {
-            manifest_version: 1,
-            benchmark_name: "zero-concurrency".to_string(),
-            metadata: Default::default(),
-            model: "dummy-model".to_string(),
-            seed: 1,
-            request_count: 0,
-            max_concurrency: 0,
-            stargate_count: 1,
-            backend_count: 1,
-            cluster_count: 1,
-            pylons_per_cluster: 1,
-            requests: Vec::new(),
-        };
 
         let err = drive_manifest(
             DriveConfig {
@@ -421,7 +369,7 @@ mod tests {
                 output_path: tempdir.path().join("requests.jsonl"),
                 concurrency_limit: 0,
             },
-            manifest,
+            manifest(Vec::new()),
         )
         .await
         .expect_err("zero concurrency limit should fail validation");

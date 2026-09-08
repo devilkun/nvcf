@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 
 	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
 	"github.com/hashicorp/go-retryablehttp"
@@ -41,6 +42,19 @@ type ReValClient interface {
 
 type tokenFetcher interface {
 	FetchToken(ctx context.Context) (string, error)
+}
+
+// redactedHelmChartURL strips userinfo and the query string from a Helm
+// chart URL so it is safe to log; neither is needed to identify the chart.
+func redactedHelmChartURL(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return "<unparseable>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 type revalClient struct {
@@ -81,7 +95,8 @@ func NewReValClient(
 }
 
 func (c *revalClient) Render(ctx context.Context, input HelmReValRenderInput) (HelmReValRenderOutput, error) {
-	url := fmt.Sprintf("%s/v1/render", c.endpoint)
+	const revalEndpoint = "/v1/render"
+	url := fmt.Sprintf("%s%s", c.endpoint, revalEndpoint)
 	method := http.MethodPost
 
 	log := logf.FromContext(ctx).WithValues(
@@ -91,10 +106,27 @@ func (c *revalClient) Render(ctx context.Context, input HelmReValRenderInput) (H
 	)
 
 	log.V(1).Info("Do ReVal request")
-	log.V(2).WithValues("input", input).Info("Payload")
+	// input.APIKey, input.HelmRegistryAuthConfig, and input.ImageRegistryAuthConfig
+	// carry credentials and must not be logged. HelmChartURL is redacted too, in
+	// case it embeds userinfo or a signed query string.
+	log.V(2).WithValues(
+		"helmChart", redactedHelmChartURL(input.HelmChartURL),
+		"releaseName", input.ReleaseName,
+		"instanceType", input.InstanceType,
+		"gpu", input.GPUName,
+		"k8sVersion", input.K8sVersion,
+	).Info("Payload")
+
+	// httpCode tracks the label value for the metric. It defaults to "error" (network failure),
+	// is set to stage-specific values on pre-call failures, and to the HTTP status code on success.
+	httpCode := "error"
+	defer func() {
+		c.metrics.RecordMiniServiceReValRequest(input.NCAID, revalEndpoint, httpCode)
+	}()
 
 	apiKey, err := c.tokenFetcher.FetchToken(ctx)
 	if err != nil {
+		httpCode = "token_fetch_error"
 		if hce := core.HTTPCodeError(0); errors.As(err, &hce) && hce >= 400 && hce < 500 {
 			log.Error(err, "Failed to fetch token")
 			err = reconcile.TerminalError(err)
@@ -102,8 +134,10 @@ func (c *revalClient) Render(ctx context.Context, input HelmReValRenderInput) (H
 		return HelmReValRenderOutput{}, err
 	}
 
+	//nolint:gosec // input.APIKey belongs in this request body, sent to the ReVal service itself
 	payload, err := json.Marshal(input)
 	if err != nil {
+		httpCode = "marshal_error"
 		log.Error(err, "Failed to encode input as JSON")
 		return HelmReValRenderOutput{}, err
 	}
@@ -111,6 +145,7 @@ func (c *revalClient) Render(ctx context.Context, input HelmReValRenderInput) (H
 	body := bytes.NewReader(payload)
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
+		httpCode = "build_error"
 		log.Error(err, "Failed to create request")
 		return HelmReValRenderOutput{}, err
 	}
@@ -123,16 +158,14 @@ func (c *revalClient) Render(ctx context.Context, input HelmReValRenderInput) (H
 	// Add trace parent and state from context.
 	propagation.TraceContext{}.Inject(ctx, propagation.HeaderCarrier(req.Header))
 
-	var statusCode int
 	resp, err := c.httpClient.Do(req)
 	if resp != nil {
-		statusCode = resp.StatusCode
+		httpCode = fmt.Sprint(resp.StatusCode)
 		defer resp.Body.Close()
 	}
 
-	c.metrics.RecordMiniServiceReValRequest(input.NCAID, req.URL.Path, fmt.Sprint(statusCode))
-
 	if err != nil && resp == nil {
+		// httpCode stays "error" — no HTTP response received.
 		log.Error(err, "Do request failed")
 		return HelmReValRenderOutput{}, reconcile.TerminalError(err)
 	}

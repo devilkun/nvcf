@@ -1,7 +1,7 @@
 # Go Lib
 
-This subproject hosts common NVCF components shared by both `egx/cloud` and
-`egx/edge`, including:
+This subproject hosts common NVCF components shared across NVCF services,
+including:
 
 - API definitions
 - Authentication components (OAuth, JWT, token fetching)
@@ -85,7 +85,7 @@ To view coverage results locally:
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) - Comprehensive development guide including architecture, testing, security, and commit conventions
-- [CONTRIBUTING.md](CONTRIBUTING.md) - Contribution guidelines and code contribution process
-- [SECURITY.md](SECURITY.md) - Security policies and vulnerability reporting
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - Community guidelines
+- [CONTRIBUTING.md](../../../../CONTRIBUTING.md) - Contribution guidelines and code contribution process
+- [SECURITY.md](../../../../SECURITY.md) - Security policies and vulnerability reporting
+- [CODE_OF_CONDUCT.md](../../../../CODE_OF_CONDUCT.md) - Community guidelines
 - BYOO-facing otelconfig commands and fixtures now live in [`tools/byoo`](../../../../tools/byoo)

@@ -22,6 +22,33 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	// cacheOptOutEnvName is the environment variable a function sets to opt out
+	// of the proxy cache. When present with cacheOptOutEnvValue, the DNS redirect
+	// is not injected, so the pod uses normal cluster DNS and its traffic never
+	// reaches the cache. Must be a literal env value; valueFrom is not resolvable
+	// at admission. Kept in sync with the Kyverno add-unbound-dns precondition.
+	cacheOptOutEnvName  = "NVCF_DISABLE_PROXY_CACHE"
+	cacheOptOutEnvValue = "true"
+)
+
+// cacheOptedOut reports whether any container or init container requests the
+// per-function proxy-cache opt-out.
+func cacheOptedOut(pod *corev1.Pod) bool {
+	containers := append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
+	for i := range containers {
+		for _, e := range containers[i].Env {
+			// Opt out if ANY container sets it to the canonical value. Keep
+			// scanning on a non-matching value so an earlier container with a
+			// different value does not mask a later container's opt-out.
+			if e.Name == cacheOptOutEnvName && e.Value == cacheOptOutEnvValue {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // mutateDNS overrides DNS configuration for all containers
 func mutateDNS(pod *corev1.Pod) []JSONPatch {
 	patches := []JSONPatch{}
@@ -29,6 +56,13 @@ func mutateDNS(pod *corev1.Pod) []JSONPatch {
 	// Check if DNS is already configured
 	if pod.Spec.DNSPolicy == corev1.DNSNone && pod.Spec.DNSConfig != nil {
 		klog.V(4).InfoS("Pod already has custom DNS configuration, skipping", "pod", pod.Name)
+		return patches
+	}
+
+	// Honor the per-function cache opt-out: leave DNS untouched so the pod uses
+	// normal cluster DNS and bypasses the proxy cache entirely.
+	if cacheOptedOut(pod) {
+		klog.V(4).InfoS("Pod opted out of proxy cache, skipping DNS mutation", "pod", pod.Name)
 		return patches
 	}
 

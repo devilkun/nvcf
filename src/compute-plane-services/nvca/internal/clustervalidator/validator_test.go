@@ -38,6 +38,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,6 +49,53 @@ func testLog() *logrus.Entry {
 	l := logrus.New()
 	l.SetLevel(logrus.DebugLevel)
 	return logrus.NewEntry(l)
+}
+
+func TestRun_EmitMetricsGatesSummaryWrite(t *testing.T) {
+	// The summary-ConfigMap write is the metrics pipeline's entry point. It
+	// must happen only for in-cluster post-install runs (emitMetrics=true),
+	// not for one-shot preflight (emitMetrics=false): preflight has no agent
+	// to read it and no RBAC to write it. probeDNSFn/probeAPIServiceIPFn are
+	// stubbed package-wide by TestMain, so Run() needs no real network here.
+	// configName points at a ConfigMap that doesn't exist, so the configurable
+	// checks are skipped and the verdict is irrelevant — we assert only on the
+	// summary write.
+	const ns = "nvca-operator"
+
+	t.Run("preflight (emitMetrics=false) does not write the summary", func(t *testing.T) {
+		client := fake.NewSimpleClientset()
+		_ = Run(context.Background(), client, ns, "cluster-validator-network-checks", ns, false)
+		_, err := client.CoreV1().ConfigMaps(ns).Get(
+			context.Background(), SummaryConfigMapName, metav1.GetOptions{})
+		assert.True(t, apierrors.IsNotFound(err),
+			"summary ConfigMap must NOT be written in preflight (emitMetrics=false)")
+	})
+
+	t.Run("post-install (emitMetrics=true) writes the summary", func(t *testing.T) {
+		client := fake.NewSimpleClientset()
+		_ = Run(context.Background(), client, ns, "cluster-validator-network-checks", ns, true)
+		cm, err := client.CoreV1().ConfigMaps(ns).Get(
+			context.Background(), SummaryConfigMapName, metav1.GetOptions{})
+		require.NoError(t, err, "summary ConfigMap must be written when emitMetrics=true")
+		assert.Contains(t, cm.Data[SummaryConfigMapKey], "schemaVersion",
+			"written ConfigMap must contain the summary payload")
+	})
+
+	t.Run("summary is written to summaryNamespace, not configNamespace", func(t *testing.T) {
+		// Guards the decoupling: a non-operator config namespace must NOT
+		// redirect the summary away from the namespace the agent watches.
+		client := fake.NewSimpleClientset()
+		_ = Run(context.Background(), client, "some-config-ns", "cluster-validator-network-checks", ns, true)
+
+		_, err := client.CoreV1().ConfigMaps(ns).Get(
+			context.Background(), SummaryConfigMapName, metav1.GetOptions{})
+		require.NoError(t, err, "summary must be written to summaryNamespace")
+
+		_, err = client.CoreV1().ConfigMaps("some-config-ns").Get(
+			context.Background(), SummaryConfigMapName, metav1.GetOptions{})
+		assert.True(t, apierrors.IsNotFound(err),
+			"summary must NOT be written to the (different) config namespace")
+	})
 }
 
 func TestVersionGTE(t *testing.T) {
@@ -97,6 +145,7 @@ func TestCheckControlPlaneHealth(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("all healthy", func(t *testing.T) {
+		stubProbes(t, true, true)
 		client := fake.NewSimpleClientset(
 			makeNode("node-1", true, 0),
 			makePod("kube-apiserver-node-1", "kube-system", corev1.PodRunning),
@@ -113,7 +162,8 @@ func TestCheckControlPlaneHealth(t *testing.T) {
 
 	t.Run("not-ready node alone is non-blocking", func(t *testing.T) {
 		// NotReady worker nodes emit a Warning but do not flip the cluster
-		// verdict. Only control-plane pod failures cause Critical.
+		// verdict. With capability probes passing, the verdict stays healthy.
+		stubProbes(t, true, true)
 		client := fake.NewSimpleClientset(
 			makeNode("node-1", true, 0),
 			makeNode("node-2", false, 0),

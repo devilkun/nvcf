@@ -25,53 +25,54 @@ use tracing::info;
 
 use crate::AppState;
 use crate::kv_cache::{KvCacheAccess, KvCacheStats, insert_kv_cache_headers};
-use crate::stats_stream::emit_request_stats_event;
+use crate::stats_stream::StatsStreamEvent;
+use crate::test_control::{TestEndpoint, TestRequestClass, is_canary_request, request_class};
 use crate::timing::{
-    embedding_item_count, jitter_ms, non_streaming_delay, optional_header, prefill_delay,
-    request_embedding_tokens, request_input_tokens, request_output_tokens, response_input_tokens,
-    response_output_tokens, token_delay,
+    bounded_output_tokens, embedding_item_count, jitter_ms, non_streaming_delay, optional_header,
+    prefill_delay, request_embedding_tokens, request_input_tokens, response_input_tokens,
+    select_output_tokens, token_delay,
 };
 
+#[derive(Serialize)]
+pub(crate) struct ModelList {
+    object: &'static str,
+    data: Vec<ModelListEntry>,
+}
+
+#[derive(Serialize)]
+struct ModelListEntry {
+    id: String,
+    object: &'static str,
+}
+
+pub(crate) async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
+    Json(ModelList {
+        object: "list",
+        data: state
+            .test_control
+            .record_model_discovery_request()
+            .await
+            .into_iter()
+            .map(|id| ModelListEntry {
+                id,
+                object: "model",
+            })
+            .collect(),
+    })
+}
+
+#[rustfmt::skip]
 const DUMMY_TOKENS: &[&str] = &[
-    "Hello",
-    ",",
-    " how",
-    " can",
-    " I",
-    " help",
-    " you",
-    " today",
-    "?",
-    " I",
-    " am",
-    " a",
-    " helpful",
-    " AI",
-    " assistant",
-    ".",
-    " Let",
-    " me",
-    " know",
-    " what",
-    " you",
-    " need",
-    ".",
-    " I",
-    "'m",
-    " here",
-    " to",
-    " assist",
-    " you",
-    "!",
+    "Hello", ",", " how", " can", " I", " help", " you", " today", "?", " I", " am", " a",
+    " helpful", " AI", " assistant", ".", " Let", " me", " know", " what", " you", " need", ".",
+    " I", "'m", " here", " to", " assist", " you", "!",
 ];
+const CANARY_ANSWER: &str = "2";
 
 #[derive(Deserialize)]
 pub(crate) struct ChatRequest {
-    #[serde(default)]
     pub(crate) stream: Option<bool>,
-    #[serde(default)]
     pub(crate) model: Option<String>,
-    #[serde(default)]
     pub(crate) max_tokens: Option<usize>,
     #[serde(default)]
     pub(crate) messages: Vec<serde_json::Value>,
@@ -79,22 +80,16 @@ pub(crate) struct ChatRequest {
 
 #[derive(Deserialize)]
 pub(crate) struct ResponsesRequest {
-    #[serde(default)]
     pub(crate) stream: Option<bool>,
-    #[serde(default)]
     pub(crate) model: Option<String>,
-    #[serde(default)]
     pub(crate) max_output_tokens: Option<usize>,
-    #[serde(default)]
     pub(crate) input: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct EmbeddingsRequest {
     input: serde_json::Value,
-    #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
     encoding_format: Option<EmbeddingEncodingFormat>,
 }
 
@@ -106,119 +101,62 @@ pub(crate) enum EmbeddingEncodingFormat {
 }
 
 #[derive(Serialize)]
-struct ChatCompletionChunk {
-    id: String,
+struct ChatCompletionChunk<'a> {
+    id: &'a str,
     object: &'static str,
-    model: String,
-    choices: Vec<ChunkChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<Usage>,
+    model: &'a str,
+    choices: [ChunkChoice<'a>; 1],
 }
 
 #[derive(Serialize)]
-struct ChunkChoice {
-    index: u32,
-    delta: Delta,
+struct ChunkChoice<'a> {
+    index: u8,
+    delta: Delta<'a>,
     finish_reason: Option<&'static str>,
 }
 
 #[derive(Serialize)]
-struct Delta {
+struct Delta<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<&'a str>,
 }
 
 #[derive(Serialize)]
-struct ChatCompletion {
-    id: String,
+struct ChatCompletion<'a> {
+    id: &'a str,
     object: &'static str,
-    model: String,
-    choices: Vec<NonStreamChoice>,
-    usage: Usage,
+    model: &'a str,
+    choices: [ChatCompletionChoice<'a>; 1],
+    usage: ChatUsage,
 }
 
 #[derive(Serialize)]
-struct NonStreamChoice {
-    index: u32,
-    message: Message,
+struct ChatCompletionChoice<'a> {
+    index: u8,
+    message: AssistantMessage<'a>,
     finish_reason: &'static str,
 }
 
 #[derive(Serialize)]
-struct Message {
+struct AssistantMessage<'a> {
     role: &'static str,
-    content: String,
+    content: &'a str,
 }
 
 #[derive(Serialize)]
-struct ResponsesApiResponse {
-    id: String,
-    object: &'static str,
-    created_at: u64,
-    status: &'static str,
-    model: String,
-    output: Vec<ResponseOutputMessage>,
-    usage: ResponsesUsage,
-}
-
-#[derive(Serialize)]
-struct ResponseOutputMessage {
-    id: String,
-    r#type: &'static str,
-    status: &'static str,
-    role: &'static str,
-    content: Vec<ResponseOutputContent>,
-}
-
-#[derive(Serialize)]
-struct ResponseOutputContent {
-    r#type: &'static str,
-    text: String,
-    annotations: Vec<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct ResponsesUsage {
-    input_tokens: usize,
-    output_tokens: usize,
-    total_tokens: usize,
-}
-
-#[derive(Serialize)]
-struct Usage {
+struct ChatUsage {
     prompt_tokens: usize,
     completion_tokens: usize,
     total_tokens: usize,
 }
 
 #[derive(Serialize)]
-struct EmbeddingsResponse {
-    object: &'static str,
-    data: Vec<EmbeddingItem>,
-    model: String,
-    usage: EmbeddingsUsage,
-}
-
-#[derive(Serialize)]
-struct EmbeddingItem {
-    object: &'static str,
-    embedding: EmbeddingValue,
-    index: usize,
-}
-
-#[derive(Serialize)]
 #[serde(untagged)]
 pub(crate) enum EmbeddingValue {
-    Float(Vec<f32>),
+    Float([f32; 3]),
     Base64(&'static str),
-}
-
-#[derive(Serialize)]
-struct EmbeddingsUsage {
-    prompt_tokens: usize,
-    total_tokens: usize,
 }
 
 struct StreamResponseConfig {
@@ -231,39 +169,64 @@ struct StreamResponseConfig {
     output_tokens: usize,
     kv_cache_access: KvCacheAccess,
     request_slot: Option<OwnedSemaphorePermit>,
+    kind: StreamKind,
 }
 
-struct ResponsesStreamConfig {
-    state: AppState,
-    model: String,
-    id: String,
-    request_id: String,
-    input_tokens: usize,
-    first_token_delay: Duration,
-    output_tokens: usize,
-    kv_cache_access: KvCacheAccess,
-    request_slot: Option<OwnedSemaphorePermit>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Chat { canary: bool },
+    Responses { created_at: u64 },
 }
 
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ChatRequest>,
+    Json(mut req): Json<ChatRequest>,
 ) -> Response {
-    let request_slot = acquire_request_slot(&state).await;
+    let model = req.model.take().unwrap_or_else(|| state.model_name.clone());
+    state
+        .record_request(&headers, TestEndpoint::ChatCompletions, &model)
+        .await;
+    if state.test_control.chat_failure_enabled(&model).await {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "message": format!("mock chat failure enabled for model {model}"),
+            }),
+        );
+    }
     let input_tokens = request_input_tokens(&headers, &req);
-    let output_tokens = request_output_tokens(&headers, &req, state.num_tokens);
-    let model = req.model.clone().unwrap_or(state.model_name.clone());
-    let stream = req.stream == Some(true);
+    let canary = is_canary_request(&headers);
     let id = format!("chatcmpl-mock-{}", rand_id());
-    info!(id = %id, model = %model, stream = stream, "received chat/completions request");
     let request_id = optional_header(&headers, "x-request-id").unwrap_or_else(|| id.clone());
+    let selected_output_tokens = if canary {
+        1
+    } else {
+        select_output_tokens(&headers, &request_id, state.output_tokens, req.max_tokens)
+    };
+    let Some(output_tokens) = bounded_output_tokens(
+        input_tokens,
+        selected_output_tokens,
+        state.context_length_tokens,
+    ) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "input token count {input_tokens} leaves no output capacity within the context length of {} tokens",
+                state.context_length_tokens
+            ),
+        );
+    };
+    let request_slot = state.acquire_request_slot().await;
+    let stream = req.stream == Some(true);
+    info!(id = %id, model = %model, stream = stream, "received chat/completions request");
     let cache_affinity_key = optional_header(&headers, "x-cache-affinity-key");
     if stream {
-        emit_request_stats_event(&state, &request_id, &model, Some(0), Some(0), false);
+        state.emit_counters(&request_id, &model, 0, 0, false);
     }
-    let kv_cache_access =
-        process_input_with_cache(&state, cache_affinity_key.as_deref(), input_tokens).await;
+    let kv_cache_access = state
+        .process_input_with_cache(cache_affinity_key.as_deref(), input_tokens)
+        .await;
     let first_token_delay =
         state.ttft + Duration::from_millis(jitter_ms(&request_id, "ttft", state.ttft_jitter_ms));
     info!(
@@ -288,8 +251,8 @@ pub(crate) async fn chat_completions(
             output_tokens,
             kv_cache_access,
             request_slot,
-        })
-        .await;
+            kind: StreamKind::Chat { canary },
+        });
     }
 
     tokio::time::sleep(non_streaming_delay(
@@ -300,38 +263,35 @@ pub(crate) async fn chat_completions(
     ))
     .await;
 
-    let content: String = DUMMY_TOKENS
-        .iter()
-        .cycle()
-        .take(output_tokens)
-        .copied()
-        .collect();
+    let content = if canary {
+        CANARY_ANSWER.to_string()
+    } else {
+        DUMMY_TOKENS
+            .iter()
+            .cycle()
+            .take(output_tokens)
+            .copied()
+            .collect()
+    };
 
     info!(id = %id, status = 200, "responding with JSON");
-    emit_request_stats_event(
-        &state,
-        &request_id,
-        &model,
-        Some(input_tokens),
-        Some(output_tokens),
-        true,
-    );
+    state.emit_counters(&request_id, &model, input_tokens, output_tokens, true);
     let mut response = Json(ChatCompletion {
-        id,
+        id: &id,
         object: "chat.completion",
-        model,
-        choices: vec![NonStreamChoice {
+        model: &model,
+        choices: [ChatCompletionChoice {
             index: 0,
-            message: Message {
+            message: AssistantMessage {
                 role: "assistant",
-                content,
+                content: &content,
             },
             finish_reason: "stop",
         }],
-        usage: Usage {
+        usage: ChatUsage {
             prompt_tokens: input_tokens,
             completion_tokens: output_tokens,
-            total_tokens: input_tokens + output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
         },
     })
     .into_response();
@@ -342,51 +302,52 @@ pub(crate) async fn chat_completions(
 pub(crate) async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ResponsesRequest>,
+    Json(mut req): Json<ResponsesRequest>,
 ) -> Response {
     if req.stream != Some(true) {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "mock-dynamo /v1/responses requires stream=true",
-            })),
-        )
-            .into_response();
+            "mock-dynamo /v1/responses requires stream=true",
+        );
     }
 
-    let request_slot = acquire_request_slot(&state).await;
+    let model = req.model.take().unwrap_or_else(|| state.model_name.clone());
+    state
+        .record_request(&headers, TestEndpoint::Responses, &model)
+        .await;
     let input_tokens = response_input_tokens(&headers, &req);
-    let output_tokens = response_output_tokens(&headers, &req, state.num_tokens);
-    let model = req.model.clone().unwrap_or(state.model_name.clone());
     let id = format!("resp-mock-{}", rand_id());
-    info!(id = %id, model = %model, "received responses request");
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    let cache_affinity_key = optional_header(&headers, "x-cache-affinity-key");
-    emit_request_stats_event(&state, request_id, &model, Some(0), Some(0), false);
-    let kv_cache_access =
-        process_input_with_cache(&state, cache_affinity_key.as_deref(), input_tokens).await;
-    let first_token_delay =
-        state.ttft + Duration::from_millis(jitter_ms(request_id, "ttft", state.ttft_jitter_ms));
-
-    stream_responses_response(ResponsesStreamConfig {
-        state,
-        model,
-        id,
-        request_id: request_id.to_string(),
+    let request_id = optional_header(&headers, "x-request-id").unwrap_or_else(|| id.clone());
+    let selected_output_tokens = select_output_tokens(
+        &headers,
+        &request_id,
+        state.output_tokens,
+        req.max_output_tokens,
+    );
+    let Some(output_tokens) = bounded_output_tokens(
         input_tokens,
-        first_token_delay,
-        output_tokens,
-        kv_cache_access,
-        request_slot,
-    })
-    .await
-}
+        selected_output_tokens,
+        state.context_length_tokens,
+    ) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "input token count {input_tokens} leaves no output capacity within the context length of {} tokens",
+                state.context_length_tokens
+            ),
+        );
+    };
+    let request_slot = state.acquire_request_slot().await;
+    info!(id = %id, model = %model, "received responses request");
+    let cache_affinity_key = optional_header(&headers, "x-cache-affinity-key");
+    state.emit_counters(&request_id, &model, 0, 0, false);
+    let kv_cache_access = state
+        .process_input_with_cache(cache_affinity_key.as_deref(), input_tokens)
+        .await;
+    let first_token_delay =
+        state.ttft + Duration::from_millis(jitter_ms(&request_id, "ttft", state.ttft_jitter_ms));
 
-async fn stream_responses_response(config: ResponsesStreamConfig) -> Response {
-    let ResponsesStreamConfig {
+    stream_response(StreamResponseConfig {
         state,
         model,
         id,
@@ -396,100 +357,10 @@ async fn stream_responses_response(config: ResponsesStreamConfig) -> Response {
         output_tokens,
         kv_cache_access,
         request_slot,
-    } = config;
-    let created_at = current_unix_timestamp();
-    let stream = async_stream::stream! {
-        let _request_slot = request_slot;
-        let mut output_text = String::new();
-        yield Ok::<_, std::convert::Infallible>(responses_sse_event(
-            "response.created",
-            &serde_json::json!({
-                "type": "response.created",
-                "response": {
-                    "id": id.clone(),
-                    "object": "response",
-                    "created_at": created_at,
-                    "status": "in_progress",
-                    "model": model.clone(),
-                    "output": [],
-                    "usage": null,
-                },
-            }),
-        ));
-
-        tokio::time::sleep(first_token_delay).await;
-        emit_request_stats_event(&state, &request_id, &model, Some(input_tokens), Some(0), false);
-
-        for i in 0..output_tokens {
-            if i > 0 {
-                tokio::time::sleep(token_delay(&state, &request_id, i)).await;
-            }
-            let token = DUMMY_TOKENS[i % DUMMY_TOKENS.len()];
-            output_text.push_str(token);
-            yield Ok(responses_sse_event(
-                "response.output_text.delta",
-                &serde_json::json!({
-                    "type": "response.output_text.delta",
-                    "response_id": id.clone(),
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": token,
-                }),
-            ));
-            emit_request_stats_event(
-                &state,
-                &request_id,
-                &model,
-                Some(input_tokens),
-                Some(i + 1),
-                false,
-            );
-        }
-
-        yield Ok(responses_sse_event(
-            "response.completed",
-            &serde_json::json!({
-                "type": "response.completed",
-                "response": ResponsesApiResponse {
-                    id: id.clone(),
-                    object: "response",
-                    created_at,
-                    status: "completed",
-                    model: model.clone(),
-                    output: vec![ResponseOutputMessage {
-                        id: format!("msg-{id}"),
-                        r#type: "message",
-                        status: "completed",
-                        role: "assistant",
-                        content: vec![ResponseOutputContent {
-                            r#type: "output_text",
-                            text: output_text,
-                            annotations: Vec::new(),
-                        }],
-                    }],
-                    usage: ResponsesUsage {
-                        input_tokens,
-                        output_tokens,
-                        total_tokens: input_tokens + output_tokens,
-                    },
-                },
-            }),
-        ));
-        emit_request_stats_event(
-            &state,
-            &request_id,
-            &model,
-            Some(input_tokens),
-            Some(output_tokens),
-            true,
-        );
-    };
-
-    let mut response = Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response();
-    insert_kv_cache_headers(response.headers_mut(), kv_cache_access);
-    response
+        kind: StreamKind::Responses {
+            created_at: current_unix_timestamp(),
+        },
+    })
 }
 
 fn responses_sse_event<T: Serialize>(event_name: &'static str, value: &T) -> Event {
@@ -501,12 +372,15 @@ fn responses_sse_event<T: Serialize>(event_name: &'static str, value: &T) -> Eve
 pub(crate) async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<EmbeddingsRequest>,
+    Json(mut req): Json<EmbeddingsRequest>,
 ) -> Response {
-    let _request_slot = acquire_request_slot(&state).await;
+    let model = req.model.take().unwrap_or_else(|| state.model_name.clone());
+    state
+        .record_request(&headers, TestEndpoint::Embeddings, &model)
+        .await;
+    let _request_slot = state.acquire_request_slot().await;
     let item_count = embedding_item_count(&req.input);
     let prompt_tokens = request_embedding_tokens(&headers, &req.input);
-    let model = req.model.clone().unwrap_or(state.model_name.clone());
     let encoding_format = req
         .encoding_format
         .unwrap_or(EmbeddingEncodingFormat::Float);
@@ -521,25 +395,27 @@ pub(crate) async fn embeddings(
         "received embeddings request"
     );
 
-    let data = (0..item_count)
-        .map(|index| EmbeddingItem {
-            object: "embedding",
-            embedding: deterministic_embedding_value(index, encoding_format),
-            index,
+    let data: Vec<_> = (0..item_count)
+        .map(|index| {
+            serde_json::json!({
+                "object": "embedding",
+                "embedding": deterministic_embedding_value(index, encoding_format),
+                "index": index,
+            })
         })
         .collect();
 
-    emit_request_stats_event(&state, &request_id, &model, Some(prompt_tokens), None, true);
+    state.emit_counters(&request_id, &model, prompt_tokens, None, true);
 
-    Json(EmbeddingsResponse {
-        object: "list",
-        data,
-        model,
-        usage: EmbeddingsUsage {
-            prompt_tokens,
-            total_tokens: prompt_tokens,
+    Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens,
         },
-    })
+    }))
     .into_response()
 }
 
@@ -554,31 +430,97 @@ pub(crate) async fn kv_cache_stats(State(state): State<AppState>) -> Json<KvCach
     Json(state.kv_cache.lock().await.stats(&state.model_name))
 }
 
-async fn process_input_with_cache(
-    state: &AppState,
-    cache_affinity_key: Option<&str>,
-    input_tokens: usize,
-) -> KvCacheAccess {
-    let access = state
-        .kv_cache
-        .lock()
-        .await
-        .access(cache_affinity_key, input_tokens);
-    let prefill = prefill_delay(
-        access.uncached_input_tokens as usize,
-        state.prefill_tokens_per_s,
-    );
-    tokio::time::sleep(prefill).await;
-    access.with_commit(
-        state
+impl AppState {
+    async fn process_input_with_cache(
+        &self,
+        cache_affinity_key: Option<&str>,
+        input_tokens: usize,
+    ) -> KvCacheAccess {
+        let access = self
             .kv_cache
             .lock()
             .await
-            .commit(cache_affinity_key, input_tokens),
-    )
+            .access(cache_affinity_key, input_tokens);
+        tokio::time::sleep(prefill_delay(
+            access.uncached_input_tokens as usize,
+            self.prefill_tokens_per_s,
+        ))
+        .await;
+        let commit = self
+            .kv_cache
+            .lock()
+            .await
+            .commit(cache_affinity_key, input_tokens);
+        access.with_commit(commit)
+    }
+
+    async fn acquire_request_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.request_slots.clone()?.acquire_owned().await.ok()
+    }
+
+    async fn record_request(&self, headers: &HeaderMap, endpoint: TestEndpoint, model: &str) {
+        let request_class = request_class(headers);
+        self.test_control
+            .record_request(endpoint, model, request_class)
+            .await;
+        if request_class == TestRequestClass::PylonGenerated {
+            self.test_control.wait_for_bringup_release(model).await;
+        }
+    }
+
+    fn emit_counters(
+        &self,
+        request_id: &str,
+        model: &str,
+        input_tokens: usize,
+        output_tokens: impl Into<Option<usize>>,
+        finished: bool,
+    ) {
+        let _ = self.stats_events.send(StatsStreamEvent::Stats {
+            v: 1,
+            request_id: request_id.to_string(),
+            model: model.to_string(),
+            tokens_processed: Some(input_tokens as u64),
+            tokens_generated: output_tokens.into().map(|tokens| tokens as u64),
+            finished,
+        });
+    }
 }
 
-async fn stream_response(config: StreamResponseConfig) -> Response {
+fn error_response(status: StatusCode, error: impl Serialize) -> Response {
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+pub(crate) enum ChatStreamChunk<'a> {
+    Role,
+    Content(&'a str),
+    Stop,
+}
+
+pub(crate) fn chat_chunk_json(id: &str, model: &str, chunk: ChatStreamChunk<'_>) -> String {
+    let (role, content, finish_reason) = match chunk {
+        ChatStreamChunk::Role => (Some("assistant"), None, None),
+        ChatStreamChunk::Content(content) => (None, Some(content), None),
+        ChatStreamChunk::Stop => (None, None, Some("stop")),
+    };
+    serde_json::to_string(&ChatCompletionChunk {
+        id,
+        object: "chat.completion.chunk",
+        model,
+        choices: [ChunkChoice {
+            index: 0,
+            delta: Delta { role, content },
+            finish_reason,
+        }],
+    })
+    .expect("chat stream event should serialize")
+}
+
+fn chat_sse_event(id: &str, model: &str, chunk: ChatStreamChunk<'_>) -> Event {
+    Event::default().data(chat_chunk_json(id, model, chunk))
+}
+
+fn stream_response(config: StreamResponseConfig) -> Response {
     let StreamResponseConfig {
         state,
         model,
@@ -589,91 +531,106 @@ async fn stream_response(config: StreamResponseConfig) -> Response {
         output_tokens,
         kv_cache_access,
         request_slot,
+        kind,
     } = config;
     let stream = async_stream::stream! {
         let _request_slot = request_slot;
+        let mut output_text = String::new();
+        if let StreamKind::Responses { created_at } = kind {
+            yield Ok::<_, std::convert::Infallible>(responses_sse_event(
+                "response.created",
+                &serde_json::json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": id.as_str(),
+                        "object": "response",
+                        "created_at": created_at,
+                        "status": "in_progress",
+                        "model": model.as_str(),
+                        "output": [],
+                        "usage": null,
+                    },
+                }),
+            ));
+        }
         tokio::time::sleep(first_token_delay).await;
 
-        emit_request_stats_event(&state, &request_id, &model, Some(input_tokens), Some(0), false);
+        state.emit_counters(&request_id, &model, input_tokens, 0, false);
 
-        yield Ok::<_, std::convert::Infallible>(Event::default().data(
-            serde_json::to_string(&ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                model: model.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: Delta {
-                        role: Some("assistant"),
-                        content: None,
-                    },
-                    finish_reason: None,
-                }],
-                usage: None,
-            })
-            .unwrap(),
-        ));
+        if matches!(kind, StreamKind::Chat { .. }) {
+            yield Ok(chat_sse_event(&id, &model, ChatStreamChunk::Role));
+        }
 
         for i in 0..output_tokens {
             if i > 0 {
                 tokio::time::sleep(token_delay(&state, &request_id, i)).await;
             }
-            let token = DUMMY_TOKENS[i % DUMMY_TOKENS.len()];
-            yield Ok(Event::default().data(
-                serde_json::to_string(&ChatCompletionChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk",
-                    model: model.clone(),
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: Delta {
-                            role: None,
-                            content: Some(token.to_string()),
-                        },
-                        finish_reason: None,
-                    }],
-                    usage: None,
-                })
-                .unwrap(),
-            ));
-            emit_request_stats_event(
-                &state,
-                &request_id,
-                &model,
-                Some(input_tokens),
-                Some(i + 1),
-                false,
-            );
+            let token = if matches!(kind, StreamKind::Chat { canary: true }) {
+                CANARY_ANSWER
+            } else {
+                DUMMY_TOKENS[i % DUMMY_TOKENS.len()]
+            };
+            let event = match kind {
+                StreamKind::Chat { .. } => {
+                    chat_sse_event(&id, &model, ChatStreamChunk::Content(token))
+                }
+                StreamKind::Responses { .. } => {
+                    output_text.push_str(token);
+                    responses_sse_event(
+                        "response.output_text.delta",
+                        &serde_json::json!({
+                            "type": "response.output_text.delta",
+                            "response_id": id.as_str(),
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": token,
+                        }),
+                    )
+                }
+            };
+            yield Ok(event);
+            state.emit_counters(&request_id, &model, input_tokens, i + 1, false);
         }
 
-        yield Ok(Event::default().data(
-            serde_json::to_string(&ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                model: model.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: Delta {
-                        role: None,
-                        content: None,
+        let completed = match kind {
+            StreamKind::Chat { .. } => chat_sse_event(&id, &model, ChatStreamChunk::Stop),
+            StreamKind::Responses { created_at } => responses_sse_event(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": id.as_str(),
+                        "object": "response",
+                        "created_at": created_at,
+                        "status": "completed",
+                        "model": model.as_str(),
+                        "output": [{
+                            "id": format!("msg-{id}"),
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": output_text,
+                                "annotations": [],
+                            }],
+                        }],
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens.saturating_add(output_tokens),
+                        },
                     },
-                    finish_reason: Some("stop"),
-                }],
-                usage: None,
-            })
-            .unwrap(),
-        ));
+                }),
+            ),
+        };
+        yield Ok(completed);
 
-        emit_request_stats_event(
-            &state,
-            &request_id,
-            &model,
-            Some(input_tokens),
-            Some(output_tokens),
-            true,
-        );
+        state.emit_counters(&request_id, &model, input_tokens, output_tokens, true);
 
-        yield Ok(Event::default().data("[DONE]"));
+        if matches!(kind, StreamKind::Chat { .. }) {
+            yield Ok(Event::default().data("[DONE]"));
+        }
     };
 
     let mut response = Sse::new(stream)
@@ -688,33 +645,23 @@ pub(crate) fn deterministic_embedding_value(
     format: EmbeddingEncodingFormat,
 ) -> EmbeddingValue {
     match format {
-        EmbeddingEncodingFormat::Float => EmbeddingValue::Float(vec![
-            index as f32,
-            index as f32 + 0.125,
-            -(index as f32) - 0.25,
-        ]),
+        EmbeddingEncodingFormat::Float => {
+            EmbeddingValue::Float([index as f32, index as f32 + 0.125, -(index as f32) - 0.25])
+        }
         EmbeddingEncodingFormat::Base64 => EmbeddingValue::Base64("AAAAAAAAAAA="),
     }
 }
 
-fn rand_id() -> String {
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{t:x}")
-}
-
-fn current_unix_timestamp() -> u64 {
+fn time_since_epoch() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
 }
 
-async fn acquire_request_slot(state: &AppState) -> Option<OwnedSemaphorePermit> {
-    match &state.request_slots {
-        Some(slots) => slots.clone().acquire_owned().await.ok(),
-        None => None,
-    }
+fn rand_id() -> String {
+    format!("{:x}", time_since_epoch().as_nanos())
+}
+
+fn current_unix_timestamp() -> u64 {
+    time_since_epoch().as_secs()
 }

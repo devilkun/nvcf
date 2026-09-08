@@ -5,7 +5,7 @@ This guide documents how maintainers triage public GitHub issues for NVCF.
 ## Supported paths
 
 - Bug reports: use the bug report template.
-- Feature ideas: use `feature-request.md`.
+- Feature ideas: use `02-feature-request.md`.
 - Documentation requests: use the documentation request template.
 - Security vulnerabilities: follow `SECURITY.md`. Do not open a public issue.
 - Questions: use GitHub Discussions.

@@ -26,6 +26,17 @@ pub(crate) struct TpsDistribution {
 }
 
 impl TpsDistribution {
+    pub(crate) fn bootstrap(value: f64) -> Option<Self> {
+        (value > 0.0 && value.is_finite()).then_some(Self {
+            min: value,
+            max: value,
+            mean: value,
+            variance: 0.0,
+            count: SNAPSHOT_THRESHOLD,
+            m2: 0.0,
+        })
+    }
+
     pub(crate) fn update(&mut self, value: f64) {
         if value <= 0.0 || !value.is_finite() {
             return;
@@ -83,5 +94,26 @@ mod tests {
         distribution.update(50.0);
         assert!(distribution.has_sufficient_data());
         assert_eq!(distribution.mean, 30.0);
+    }
+
+    #[test]
+    fn bootstrap_populates_a_ready_distribution_that_real_samples_update() {
+        let mut distribution = TpsDistribution::bootstrap(100.0)
+            .expect("positive finite bootstrap should be accepted");
+
+        assert_eq!(distribution.count, SNAPSHOT_THRESHOLD);
+        assert_eq!(distribution.min, 100.0);
+        assert_eq!(distribution.max, 100.0);
+        assert_eq!(distribution.mean, 100.0);
+        assert_eq!(distribution.variance, 0.0);
+        assert!(distribution.has_sufficient_data());
+
+        distribution.update(160.0);
+
+        assert_eq!(distribution.count, SNAPSHOT_THRESHOLD + 1);
+        assert_eq!(distribution.mean, 110.0);
+        assert_eq!(distribution.min, 100.0);
+        assert_eq!(distribution.max, 160.0);
+        assert!(distribution.variance > 0.0);
     }
 }

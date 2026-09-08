@@ -31,8 +31,8 @@ declare SECRETS_MOUNT_LIST
 
 function initialize_mount_lists() {
     log_step "Initializing auth and secrets mount lists..."
-    AUTH_MOUNT_LIST=$(bao auth list)
-    SECRETS_MOUNT_LIST=$(bao secrets list)
+    AUTH_MOUNT_LIST=$(bao auth list -format=json)
+    SECRETS_MOUNT_LIST=$(bao secrets list -format=json)
     log_success "Mount lists initialized."
 }
 
@@ -48,7 +48,9 @@ function enable_auth_mount() {
     local mount_path=$1
     local mount_type=$2
 
-    if bao auth list | grep -q "^$mount_path/"; then
+    local auth_mounts
+    auth_mounts=$(bao auth list -format=json 2>/dev/null) || true
+    if [[ "$auth_mounts" == *"\"${mount_path}/\""* ]]; then
         log_success "$mount_type auth engine mounted at path '$mount_path'"
         return 0
     fi
@@ -121,6 +123,72 @@ function configure_auth_jwt() {
 }
 
 ##
+# Check whether a bao command failed because a kv-v2 mount is still running
+# its storage upgrade (opened on every backend setup, cleared
+# asynchronously). The second message is the read-enabled standby variant.
+# The API carries no structured code for this, so the match is on message
+# text; a missed match fails hard, and the integration test revalidates
+# the strings against the pinned server version.
+#
+# @param output The captured output of the failed command
+#
+function is_kv_upgrade_window_error() {
+    local output=$1
+
+    case "$output" in
+        *"Upgrading from non-versioned to versioned data"*) return 0 ;;
+        *"Waiting for the primary to upgrade from non-versioned to versioned data"*) return 0 ;;
+    esac
+    return 1
+}
+
+##
+# Block until a kv-v2 mount's data path serves requests, or
+# BAO_KV_UPGRADE_RETRY_BUDGET_SECONDS (default 60) expires. The single
+# place the migrations wait out the upgrade window; delete this function
+# and its call sites in enable_secrets_mount if OpenBao ports the upstream
+# synchronous-upgrade fix (vault-plugin-secrets-kv v0.26.0).
+#
+# Probes the mount's config path, not the data path; both are gated by
+# the same upgrade check, so a successful config read implies the data
+# path is serving. Backs off 1s up to 10s. Non-window errors are left
+# for the caller's next operation to surface.
+#
+# @param mount_path The mount path of the kv-v2 secrets engine
+#
+function wait_kv_v2_mount_data_path_ready() {
+    local mount_path=$1
+
+    local budget=${BAO_KV_UPGRADE_RETRY_BUDGET_SECONDS:-60}
+    if ! [[ "$budget" =~ ^[0-9]+$ ]]; then
+        log_warn "Invalid BAO_KV_UPGRADE_RETRY_BUDGET_SECONDS '${budget}'; using 60"
+        budget=60
+    fi
+    local delay=1
+    local start=$SECONDS
+    local output
+
+    while true; do
+        if output=$(bao read "${mount_path}/config" 2>&1); then
+            return 0
+        fi
+        if ! is_kv_upgrade_window_error "$output"; then
+            return 0
+        fi
+        if (( SECONDS - start + delay > budget )); then
+            log_error "kv-v2 mount '${mount_path}' is still running its storage upgrade after ${budget}s: $output"
+            return 1
+        fi
+        log_info "kv-v2 upgrade in progress on '${mount_path}'; retrying in ${delay}s..."
+        sleep "$delay"
+        delay=$((delay * 2))
+        if (( delay > 10 )); then
+            delay=10
+        fi
+    done
+}
+
+##
 # Enable a secrets engine
 #
 # @param mount_path The mount path of the secrets engine
@@ -130,16 +198,31 @@ function enable_secrets_mount() {
     local mount_path=$1
     local mount_type=$2
 
-    if ! bao secrets list | grep -q "^$mount_path/"; then
-      log_step "Enabling $mount_type secrets engine at mount path '$mount_path'"
-      if ! output=$(bao secrets enable -path=$mount_path $mount_type 2>&1); then
-          log_error "Error enabling $mount_type secrets engine: $output"
-          return 1
-      fi
+    local secrets_mounts
+    secrets_mounts=$(bao secrets list -format=json 2>/dev/null) || true
+    if [[ "$secrets_mounts" == *"\"${mount_path}/\""* ]]; then
+        log_info "$mount_type secrets engine already mounted at path '$mount_path'"
+        # A rerun can find a kv-v2 mount already registered while its
+        # initial storage upgrade is still in progress or incomplete, so
+        # wait here too.
+        if [[ "$mount_type" == "kv-v2" ]]; then
+            wait_kv_v2_mount_data_path_ready "$mount_path" || return 1
+        fi
+        return 0
     fi
 
-    log_info "$mount_type secrets engine already mounted at path '$mount_path'"
-    return 0
+    log_step "Enabling $mount_type secrets engine at mount path '$mount_path'"
+    if ! output=$(bao secrets enable -path=$mount_path $mount_type 2>&1); then
+        log_error "Error enabling $mount_type secrets engine: $output"
+        return 1
+    fi
+
+    # The enable call returns before the backend's storage upgrade finishes.
+    if [[ "$mount_type" == "kv-v2" ]]; then
+        wait_kv_v2_mount_data_path_ready "$mount_path" || return 1
+    fi
+
+    log_success "$mount_type secrets engine enabled at path '$mount_path'"
 }
 
 ##
@@ -154,7 +237,7 @@ function configure_auth_tuning() {
     local default_lease_ttl=$2
     local max_lease_ttl=$3
 
-    if ! echo $AUTH_MOUNT_LIST | grep -q "^$mount_path/"; then
+    if ! echo "$AUTH_MOUNT_LIST" | grep -q "\"${mount_path}/\""; then
         log_error "$mount_type auth engine not mounted at path '$mount_path'"
         return 1
     fi
@@ -180,7 +263,7 @@ function configure_secrets_tuning() {
     local default_lease_ttl=$2
     local max_lease_ttl=$3
 
-    if ! echo $SECRETS_MOUNT_LIST | grep -q "^$mount_path/"; then
+    if ! echo "$SECRETS_MOUNT_LIST" | grep -q "\"${mount_path}/\""; then
         log_error "$mount_type secrets engine not mounted at path '$mount_path'"
         return 1
     fi
@@ -291,15 +374,26 @@ function write_secrets_kv() {
 
     log_step "Writing secrets KV to '$mount_path/$secret'"
 
-    if ! output=$(bao kv get $mount_path/$secret > /dev/null 2>&1) || [ "$overwrite" == "true" ]; then
-      if ! output=$(bao kv put $mount_path/$secret $value 2>&1); then
-          log_error "Error writing secrets KV to '$mount_path/$secret': $output"
-          return 1
-      fi
-      log_success "Secrets KV '$secret' written successfully to '$mount_path'"
-    else
-      log_info "Secrets KV '$secret' already exists in '$mount_path', skipping..."
+    # Skip the existence check when overwriting; its result would be ignored.
+    if [ "$overwrite" != "true" ]; then
+        local get_output
+        if get_output=$(bao kv get "$mount_path/$secret" 2>&1); then
+            log_info "Secrets KV '$secret' already exists in '$mount_path', skipping..."
+            return 0
+        fi
+        if [[ "$get_output" != *"No value found"* ]]; then
+            # Not a plain "secret does not exist" (includes the upgrade
+            # window): never write over a secret that could not be read.
+            log_error "Error checking secrets KV '$mount_path/$secret': $get_output"
+            return 1
+        fi
     fi
+
+    if ! output=$(bao kv put $mount_path/$secret $value 2>&1); then
+        log_error "Error writing secrets KV to '$mount_path/$secret': $output"
+        return 1
+    fi
+    log_success "Secrets KV '$secret' written successfully to '$mount_path'"
 }
 
 ##
@@ -463,27 +557,33 @@ EOF
 # @param target_service_account_namespace The namespace of the target service account
 # @param client_service_name The name of the client service
 # @param scopes The scopes to be added to the JWT secret role
+# @param issuer_override Optional. When non-empty, overrides the derived
+#        "http://<target_service_name>.<target_service_account_namespace>.svc.cluster.local"
+#        issuer. Leave empty to preserve the default in-cluster issuer.
 #
 function generate_jwt_secret_role() {
   local target_service_account_namespace=$1
   local target_service_name=$2
   local client_service_name=$3
   local scopes=$4
+  local issuer_override=${5:-""}
 
   local quoted_scopes=$(sed 's/\([^,]*\)/"\1"/g' <<< "$scopes")
-  local issuer="http://${target_service_name}.${target_service_account_namespace}.svc.cluster.local"
 
-  local role_json=$(cat <<EOF
-{
-  "issuer":"${issuer}",
-  "claims":{
-    "azp":"${client_service_name}",
-    "aud":["${client_service_name}","s:${target_service_name}"],
-    "scopes":[${quoted_scopes}],
-    "sub":"${client_service_name}"
-  }
-}
-EOF
-)
+  local issuer="http://${target_service_name}.${target_service_account_namespace}.svc.cluster.local"
+  if [[ -n "${issuer_override}" ]]; then
+    issuer="${issuer_override}"
+  fi
+
+  # Build the role JSON with jq so every string value is escaped correctly.
+  # Delegating to --arg handles quotes, backslashes, and control characters,
+  # which manual interpolation into a heredoc cannot do safely.
+  local role_json
+  role_json=$(jq -n \
+    --arg issuer     "${issuer}" \
+    --arg client     "${client_service_name}" \
+    --arg target     "${target_service_name}" \
+    --argjson scopes "[${quoted_scopes}]" \
+    '{issuer: $issuer, claims: {azp: $client, aud: [$client, ("s:" + $target)], scopes: $scopes, sub: $client}}')
   echo "$role_json"
 }

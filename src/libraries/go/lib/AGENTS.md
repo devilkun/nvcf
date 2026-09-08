@@ -66,7 +66,8 @@ module's `.golangci.yml`. `make lint` still runs the same module-scoped
 ## Root CI
 
 Root CI generates the `go-lib` subproject validation pipeline from
-`tools/ci/subproject-validations.yaml`.
+`tools/ci/subproject-validations.yaml`, an internal GitLab CI config not
+present in this public snapshot.
 
 The current subproject checks are:
 
@@ -138,5 +139,5 @@ The subtree OSS mirror is controlled by `.oss-allowlist`. Keep it explicit.
 Do not add internal CI, scanner, registry, or toolbox files back to the allowlist.
 
 Root files intentionally omitted from this subtree include local `NOTICE`,
-standalone `.gitlab-ci.yml`, toolbox files, Renovate config, Sonar config, and
-NSPECT allowlists. Root monorepo tooling owns those concerns now.
+standalone `.gitlab-ci.yml`, toolbox files, Renovate config, and restricted
+scanner allowlists. Root monorepo tooling owns those concerns now.

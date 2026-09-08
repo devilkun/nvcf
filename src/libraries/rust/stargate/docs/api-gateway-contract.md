@@ -1,6 +1,6 @@
 # API Gateway Contract
 
-> Type: Reference. Canonical source for frontend model discovery and HTTP proxy contracts.
+Canonical source for frontend model discovery and HTTP proxy contracts.
 
 The gateway is the public API boundary. Stargate is the local backend router.
 
@@ -9,6 +9,7 @@ The gateway is the public API boundary. Stargate is the local backend router.
 This contract was checked against:
 
 - `crates/stargate/src/http_proxy.rs`
+- `crates/stargate/src/http_proxy/diagnostics.rs`
 - `crates/stargate/src/control_plane.rs`
 - `crates/pylon-lib/src/request_observer.rs`
 - `crates/pylon-lib/src/queue_admission.rs`
@@ -59,7 +60,28 @@ services. Those are not gateway APIs.
 
 ## Model Discovery
 
-Call `StargateModelDiscovery/ListModels`.
+Call `StargateModelDiscovery/ListModels`, or use the HTTP mirror on the
+`stargate-proxy` Service:
+
+```text
+GET /v1/models
+```
+
+The HTTP mirror accepts an optional repeatable `model_ids` filter:
+
+| Query parameter | Meaning |
+| --- | --- |
+| `model_ids` | Optional repeatable model filter, for example `?model_ids=a&model_ids=b`. |
+
+The HTTP response is JSON with the same shape as the gRPC response:
+
+```json
+{"model_ids":["model-a","model-b"]}
+```
+
+An empty `model_ids` value returns HTTP `400`. The HTTP path uses the same
+model-id normalization and local routing-state lookup as gRPC, with an
+unscoped model lookup.
 
 Request:
 
@@ -68,12 +90,26 @@ Request:
 
 Response:
 
-- `model_ids`: active model ids in the selected pod's local snapshot.
+- `model_ids`: model ids with a current routable target generation in the
+  selected pod's local state.
 
 `ListModels` is a hint, not a reservation. If a recent positive result is
 followed by proxy `404` with `x-stargate-error-code: no_eligible_candidates`,
-the gateway may retry after its convergence delay. A `503` for a registered
-model means no eligible active backend, not a discovery miss.
+the local route changed after discovery returned; the gateway may retry
+according to its normal policy. A `503` for a registered model means no
+eligible active backend, not a discovery miss.
+
+## Operator Debug State
+
+`GET /debug/state` on the `stargate-proxy` HTTP listener returns a JSON
+snapshot for live diagnosis. It includes safe static configuration (identity,
+listener addresses, tunnel selection, and reverse-tunnel enablement) plus the
+serving Stargate's current active model IDs. The state is local and
+best-effort: routing can change while the response is being assembled.
+
+This endpoint intentionally exposes only explicit non-secret fields; it does
+not serialize credentials, TLS material, backend URLs, or routing topology.
+Restrict it to trusted operator networks; it is not a public gateway API.
 
 ## Proxy Endpoints
 
@@ -100,7 +136,7 @@ Optional trusted headers:
 | `x-routing-key` | Authenticated routing scope. Omit for unscoped. |
 | `x-routing-method` | Request-scoped load-balancer override, only for methods allowed by Stargate config. |
 | `x-cache-affinity-key` | Opaque cache/prefix identity. Required by some LB configs. |
-| `x-priority` | Unsigned priority, default `0`. |
+| `x-priority` | Unsigned priority rank; lower is more urgent. Omit when no priority is resolved. |
 | `x-request-slo-ms` | Per-request LB latency hint. |
 | `x-max-wait-ms` | Wait budget for temporarily infeasible candidates. |
 | `x-stargate-max-wait-ms` | Stargate internal retry budget. |
@@ -108,10 +144,27 @@ Optional trusted headers:
 The gateway must synthesize or validate these headers. Do not pass public
 caller-supplied routing headers through blindly.
 
-Internal header:
+Internal headers:
 
 - `x-stargate-expected-queue-ms`: Stargate-to-pylon only. Stargate strips
   caller values; pylon strips it before upstream forwarding.
+- `x-dynamo-request-priority` and `x-dynamo-request-strict-priority`:
+  pylon-to-engine only. Pylon strips inbound values in every backend mode, so
+  pylon is the only writer of these two headers. When pylon runs with
+  `--pylon-upstream-backend dynamo` (the default), it emits both headers on
+  every inference request: the priority is derived from `x-priority` as
+  `max(0, ceiling - x)` with a configurable ceiling
+  (`--pylon-priority-ceiling`, default 3600), requests without `x-priority`
+  carry the lowest value `0`, and the strict tier is always `0`. Always
+  emitting means the engine reads priority only from pylon, never from
+  client-supplied values. Other engine headers pass through unchanged; the
+  strip denylist is scoped to the priority headers.
+
+  An absent `x-priority` and `x-priority: 0` are opposite ends of the range:
+  absence maps to the lowest engine priority, while rank `0` maps to the
+  highest. The gateway must not synthesize `x-priority: 0` for unconfigured
+  requests. Stargate treats an absent header as `0` for its own queue
+  accounting only; that default never reaches the engine.
 
 Body rules:
 
@@ -137,7 +190,7 @@ Common errors:
 | Status | Meaning | Gateway behavior |
 | --- | --- | --- |
 | `400` | Missing/invalid contract input. | Do not retry unchanged. |
-| `404` + `no_eligible_candidates` | Unknown or unregistered local target. | Retry only for recent discovery convergence. |
+| `404` + `no_eligible_candidates` | Unknown or unregistered local target. | Retry only when a recent discovery response may have raced a local route change. |
 | `413` | Replay body too large. | Do not retry unchanged. |
 | `502/503/504` | Transport, upstream, retry, or active-backend failure. | Treat as serving failure. |
 

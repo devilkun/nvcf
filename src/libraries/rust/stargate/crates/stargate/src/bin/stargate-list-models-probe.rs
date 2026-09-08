@@ -26,19 +26,14 @@ use stargate_proto::pb::stargate_model_discovery_client::StargateModelDiscoveryC
 struct Args {
     #[arg(long, value_name = "ADDR")]
     addr: String,
-
     #[arg(long, value_name = "KEY")]
     routing_key: Option<String>,
-
     #[arg(long = "model-id", value_name = "MODEL")]
     model_ids: Vec<String>,
-
     #[arg(long = "expect", value_name = "MODEL")]
     expected_model_ids: Vec<String>,
-
     #[arg(long, default_value_t = 30, value_name = "N")]
     attempts: u32,
-
     #[arg(long, default_value_t = 1000, value_name = "MS")]
     interval_ms: u64,
 }
@@ -58,52 +53,44 @@ where
     Fut: Future<Output = Result<Vec<String>>>,
 {
     let endpoint = endpoint_from_addr(&args.addr);
-    let expected = sorted_expected_model_ids(args);
+    let mut expected = args.expected_model_ids.clone();
+    expected.sort();
 
-    let mut last_error = None;
+    let mut last_error = "no attempts ran".to_string();
     for attempt in 1..=args.attempts {
-        match list_models_fn(endpoint.clone(), list_models_request(args)).await {
+        last_error = match list_models_fn(endpoint.clone(), list_models_request(args)).await {
             Ok(mut actual) => {
                 actual.sort();
                 if actual == expected {
                     println!("ListModels returned expected models: {actual:?}");
                     return Ok(());
                 }
-                last_error = Some(format!(
+                format!(
                     "attempt {attempt}/{} returned {actual:?}; expected {expected:?}",
                     args.attempts
-                ));
+                )
             }
-            Err(error) => {
-                last_error = Some(format!(
-                    "attempt {attempt}/{} failed: {error:#}",
-                    args.attempts
-                ));
-            }
-        }
+            Err(error) => format!("attempt {attempt}/{} failed: {error:#}", args.attempts),
+        };
 
         if attempt < args.attempts {
             tokio::time::sleep(Duration::from_millis(args.interval_ms)).await;
         }
     }
 
-    bail!(
-        "ListModels did not return expected models from {endpoint}: {}",
-        last_error.unwrap_or_else(|| "no attempts ran".to_string())
-    )
+    bail!("ListModels did not return expected models from {endpoint}: {last_error}")
 }
 
 async fn list_models(endpoint: &str, request: ListModelsRequest) -> Result<Vec<String>> {
     let mut client = StargateModelDiscoveryClient::connect(endpoint.to_string())
         .await
         .with_context(|| format!("connect to {endpoint}"))?;
-    let response = client
+    Ok(client
         .list_models(request)
         .await
         .context("call ListModels")?
-        .into_inner();
-
-    Ok(response.model_ids)
+        .into_inner()
+        .model_ids)
 }
 
 fn endpoint_from_addr(addr: &str) -> String {
@@ -112,12 +99,6 @@ fn endpoint_from_addr(addr: &str) -> String {
     } else {
         format!("http://{addr}")
     }
-}
-
-fn sorted_expected_model_ids(args: &Args) -> Vec<String> {
-    let mut expected = args.expected_model_ids.clone();
-    expected.sort();
-    expected
 }
 
 fn list_models_request(args: &Args) -> ListModelsRequest {
@@ -203,26 +184,14 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_from_addr_preserves_existing_scheme() {
+    fn endpoint_from_addr_normalizes_only_missing_schemes() {
         assert_eq!(
             endpoint_from_addr("https://stargate.example:50071"),
             "https://stargate.example:50071"
         );
-    }
-
-    #[test]
-    fn endpoint_from_addr_adds_http_scheme_for_host_port() {
         assert_eq!(
             endpoint_from_addr("127.0.0.1:50071"),
             "http://127.0.0.1:50071"
-        );
-    }
-
-    #[test]
-    fn sorted_expected_model_ids_is_deterministic() {
-        assert_eq!(
-            sorted_expected_model_ids(&args_with_addr("127.0.0.1:50071")),
-            vec!["model-a".to_string(), "model-z".to_string()]
         );
     }
 
@@ -300,5 +269,11 @@ mod tests {
             "unexpected error: {message}"
         );
         assert_eq!(calls, 2);
+
+        args.attempts = 0;
+        let error = run_probe_with(&args, |_, _| std::future::ready(Ok(Vec::new())))
+            .await
+            .expect_err("zero attempts should fail");
+        assert!(error.to_string().ends_with("no attempts ran"));
     }
 }

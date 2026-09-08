@@ -14,51 +14,67 @@
 // limitations under the License.
 
 use anyhow::{Result, ensure};
+use clap::{ArgAction, Args};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Args, Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransportBenchConfig {
+    #[arg(long = "requests", default_value_t = 20_000, value_name = "N")]
     pub request_count: usize,
+    #[arg(long, default_value_t = 256, value_name = "N")]
     pub concurrency: usize,
+    #[arg(long, default_value_t = 1, value_name = "N")]
     pub quic_connections: usize,
+    #[arg(long, default_value_t = 1_000, value_name = "N")]
     pub warmup_requests: usize,
+    #[arg(long, default_value_t = 1024, value_name = "BYTES")]
     pub request_body_bytes: usize,
+    #[arg(long, default_value_t = 1024, value_name = "BYTES")]
     pub response_body_bytes: usize,
+    #[arg(long, default_value_t = 16 * 1024, value_name = "BYTES")]
     pub request_chunk_bytes: usize,
+    #[arg(long, default_value_t = 16 * 1024, value_name = "BYTES")]
     pub response_chunk_bytes: usize,
+    #[arg(long = "disable-quic-send-fairness", action = ArgAction::SetFalse)]
     pub quic_send_fairness: bool,
+    #[arg(long = "disable-http3-grease", action = ArgAction::SetFalse)]
     pub http3_send_grease: bool,
+    #[arg(long, default_value_t = 1, value_name = "N")]
     pub trials: usize,
+    #[arg(long, default_value_t = 0, value_name = "N")]
     pub warmup_trials: usize,
+    #[arg(long, default_value_t = 0, value_name = "MS")]
     pub cooldown_ms: u64,
+    #[arg(long)]
     pub randomize_order: bool,
+    #[arg(long, default_value_t = 0.02, value_name = "CV")]
     pub noise_threshold_cv: f64,
+    #[arg(long, default_value_t = 1.0, value_name = "PERCENT")]
     pub min_effect_size_percent: f64,
 }
 
 impl TransportBenchConfig {
     pub(super) fn validate(&self) -> Result<()> {
-        ensure!(self.request_count > 0, "requests must be > 0");
-        ensure!(self.concurrency > 0, "concurrency must be > 0");
-        ensure!(self.quic_connections > 0, "quic-connections must be > 0");
-        ensure!(self.trials > 0, "trials must be > 0");
-        ensure!(
-            self.request_chunk_bytes > 0,
-            "request-chunk-bytes must be > 0"
-        );
-        ensure!(
-            self.response_chunk_bytes > 0,
-            "response-chunk-bytes must be > 0"
-        );
-        ensure!(
-            self.noise_threshold_cv.is_finite() && self.noise_threshold_cv >= 0.0,
-            "noise-threshold-cv must be finite and >= 0"
-        );
-        ensure!(
-            self.min_effect_size_percent.is_finite() && self.min_effect_size_percent >= 0.0,
-            "min-effect-size-percent must be finite and >= 0"
-        );
+        for (value, name) in [
+            (self.request_count, "requests"),
+            (self.concurrency, "concurrency"),
+            (self.quic_connections, "quic-connections"),
+            (self.trials, "trials"),
+            (self.request_chunk_bytes, "request-chunk-bytes"),
+            (self.response_chunk_bytes, "response-chunk-bytes"),
+        ] {
+            ensure!(value > 0, "{name} must be > 0");
+        }
+        for (value, name) in [
+            (self.noise_threshold_cv, "noise-threshold-cv"),
+            (self.min_effect_size_percent, "min-effect-size-percent"),
+        ] {
+            ensure!(
+                value.is_finite() && value >= 0.0,
+                "{name} must be finite and >= 0"
+            );
+        }
         Ok(())
     }
 }

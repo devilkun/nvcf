@@ -14,4 +14,4 @@
 # limitations under the License.
 
 helm uninstall -n dns-proxy nvcf-unbound
-helm install nvcf-unbound deploy/ -f deploy/values.yaml -n dns-proxy
+helm install nvcf-unbound ../../../deploy/helm/nvcf-unbound -f ../../../deploy/helm/nvcf-unbound/values.yaml -n dns-proxy

@@ -16,20 +16,28 @@
 use crate::ProtocolError;
 use http::{HeaderName, HeaderValue};
 
+pub fn is_hop_by_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
+}
+
 pub fn append_header_entry(
     header_map: &mut http::HeaderMap,
     key: &str,
     value: &str,
 ) -> Result<(), ProtocolError> {
-    let kh: HeaderName = key
+    let key = key
         .parse()
         .map_err(|e| ProtocolError::InvalidHeader(format!("bad header name '{key}': {e}")))?;
-    let vh: HeaderValue = value
-        .parse()
-        .map_err(|e| ProtocolError::InvalidHeader(format!("bad header value '{value}': {e}")))?;
-    let _ = header_value_to_str(&kh, &vh)?;
-    header_map.append(kh, vh);
-    Ok(())
+    append_header_value(header_map, key, value)
 }
 
 pub fn append_header_entry_bytes(
@@ -37,20 +45,28 @@ pub fn append_header_entry_bytes(
     key: &[u8],
     value: &[u8],
 ) -> Result<(), ProtocolError> {
-    let kh = HeaderName::from_bytes(key).map_err(|e| {
+    let key = HeaderName::from_bytes(key).map_err(|e| {
         ProtocolError::InvalidHeader(format!(
             "bad header name '{}': {e}",
             String::from_utf8_lossy(key)
         ))
     })?;
     let value = std::str::from_utf8(value).map_err(|e| {
-        ProtocolError::InvalidHeader(format!("non-UTF8 header value for '{kh}': {e}"))
+        ProtocolError::InvalidHeader(format!("non-UTF8 header value for '{key}': {e}"))
     })?;
-    let vh: HeaderValue = value
+    append_header_value(header_map, key, value)
+}
+
+fn append_header_value(
+    header_map: &mut http::HeaderMap,
+    key: HeaderName,
+    value: &str,
+) -> Result<(), ProtocolError> {
+    let value: HeaderValue = value
         .parse()
         .map_err(|e| ProtocolError::InvalidHeader(format!("bad header value '{value}': {e}")))?;
-    let _ = header_value_to_str(&kh, &vh)?;
-    header_map.append(kh, vh);
+    let _ = header_value_to_str(&key, &value)?;
+    header_map.append(key, value);
     Ok(())
 }
 
@@ -93,11 +109,8 @@ pub fn queue_time_delta_ms(input_tokens: u64, last_mean_input_tps: f64) -> Optio
         return None;
     }
     let delta_ms = ((input_tokens as f64 / last_mean_input_tps) * 1000.0).ceil();
-    if delta_ms.is_finite() && delta_ms >= 0.0 && delta_ms <= u64::MAX as f64 {
-        Some(delta_ms as u64)
-    } else {
-        None
-    }
+    (delta_ms.is_finite() && delta_ms >= 0.0 && delta_ms <= u64::MAX as f64)
+        .then_some(delta_ms as u64)
 }
 
 pub fn valid_last_mean_input_tps(last_mean_input_tps: f64) -> bool {
@@ -107,6 +120,23 @@ pub fn valid_last_mean_input_tps(last_mean_input_tps: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hop_by_hop_header_policy_is_case_insensitive() {
+        for name in [
+            "Connection",
+            "Proxy-Connection",
+            "Keep-Alive",
+            "Transfer-Encoding",
+            "TE",
+            "Trailer",
+            "Upgrade",
+        ] {
+            let name = HeaderName::from_bytes(name.as_bytes()).unwrap();
+            assert!(is_hop_by_hop_header(&name));
+        }
+        assert!(!is_hop_by_hop_header(&HeaderName::from_static("host")));
+    }
 
     #[test]
     fn multi_value_entries_preserved() {
@@ -138,16 +168,14 @@ mod tests {
     #[test]
     fn append_header_entry_bytes_rejects_non_ascii_value() {
         let mut map = http::HeaderMap::new();
-        let result = append_header_entry_bytes(&mut map, b"x-binary", &[0xd5, 0x97]);
-        assert!(result.is_err());
+        assert!(append_header_entry_bytes(&mut map, b"x-binary", &[0xd5, 0x97]).is_err());
         assert!(map.is_empty());
     }
 
     #[test]
     fn append_header_entry_rejects_non_ascii_value() {
         let mut map = http::HeaderMap::new();
-        let result = append_header_entry(&mut map, "x-binary", "\u{0557}");
-        assert!(result.is_err());
+        assert!(append_header_entry(&mut map, "x-binary", "\u{0557}").is_err());
         assert!(map.is_empty());
     }
 

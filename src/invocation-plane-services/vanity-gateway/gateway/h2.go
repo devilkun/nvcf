@@ -19,7 +19,7 @@ package gateway
 
 import (
 	config "ai-api-gateway-service/gateway_config"
-	middleware2 "ai-api-gateway-service/middleware"
+	"ai-api-gateway-service/middleware"
 	"ai-api-gateway-service/router"
 	"fmt"
 	"math"
@@ -29,12 +29,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/hellofresh/health-go/v5"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+
+	golibversion "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version"
 )
 
 const (
@@ -64,12 +66,28 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 		zap.L().Error("Error compiling regex")
 		return nil, err
 	}
-	transport := middleware2.TracedRoundTripper(&http.Transport{
+	transport := middleware.TracedRoundTripper(&http.Transport{
 		IdleConnTimeout:     30 * time.Second,
 		MaxIdleConnsPerHost: 64,
 		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 	})
-	healthManager, err := healthManager(serverConfig.NvcfApiEndpoint, transport)
+	llmGatewayEndpoint := ""
+	var llmGatewayDirector *LLMGatewayDirector
+	if mappings.HasLLMGatewayRoute() {
+		if serverConfig.LLMGatewayEndpoint == "" {
+			return nil, fmt.Errorf("LLM_GATEWAY_ENDPOINT is required when a model sets functionType LLM")
+		}
+		llmGatewayEndpoint = serverConfig.LLMGatewayEndpoint
+		llmGatewayDirector, err = NewLLMGatewayDirector(llmGatewayEndpoint, transport)
+		if err != nil {
+			return nil, err
+		}
+		if hostWithoutPort(mappings.OpenAI.Host) == llmGatewayDirector.UpstreamHostname() {
+			return nil, fmt.Errorf("openai.host %q is the LLM Gateway endpoint; the gateway would proxy to itself", mappings.OpenAI.Host)
+		}
+	}
+
+	healthManager, err := healthManager(serverConfig.NvcfApiEndpoint, llmGatewayEndpoint, transport)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create health manager: %w", err)
 	}
@@ -85,17 +103,16 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 	}
 	shadower := NewTrafficShadower(shadowMaxConcurrent, requestTimeout)
 
-	openAIDirector, err := NewOpenAIDirectorV2(mappings, re, vanityDirector, shadower)
+	openAIDirector, err := NewOpenAIDirectorV2(mappings, re, vanityDirector, llmGatewayDirector, shadower)
 	if err != nil {
 		return nil, err
 	}
 
 	r := chi.NewRouter()
-	r.Use(middleware2.RejectSpoofedShadowRequests(shadowHeader))
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(requestTimeout))
-	r.Use(middleware2.TracingMiddleware)
+	r.Use(middleware.RejectSpoofedShadowRequests(shadowHeader))
+	r.Use(chimiddleware.Logger)
+	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.Timeout(requestTimeout))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*.nvidia.com", "vscode-file://vscode-app"},
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
@@ -103,13 +120,15 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 		AllowedHeaders:   []string{"*"},
 	}))
 
-	hostRouter := &middleware2.HostRouter{}
+	hostRouter := &middleware.HostRouter{}
+	serverTelemetry := middleware.ServerTelemetryMiddleware()
 
-	registerOpenAI(hostRouter, mappings, openAIDirector, healthManager)
-	registerVanity(hostRouter, mappings, vanityDirector, healthManager)
+	registerOpenAI(hostRouter, mappings, openAIDirector, healthManager, serverTelemetry)
+	registerVanity(hostRouter, mappings, vanityDirector, healthManager, serverTelemetry)
 
 	r.Use(hostRouter.Handler)
-	r.Get(healthPath, healthManager.HandlerFunc)
+	r.With(serverTelemetry).Get(healthPath, healthManager.HandlerFunc)
+	r.With(serverTelemetry).Get("/info", golibversion.Handler().ServeHTTP)
 	return r, nil
 }
 
@@ -123,44 +142,50 @@ func createHttp2Server(addr string, swappableRouter *router.SwappableRouter) *ht
 }
 
 // general pass-through vanity domains
-func registerVanity(hostRouter *middleware2.HostRouter, mappings *config.GatewayConfig, vanityDirector *VanityDirector, healthManager *health.Health) {
+func registerVanity(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, vanityDirector *VanityDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler) {
 	for _, vanity := range mappings.Vanity {
 		r := chi.NewRouter()
+		r.Use(serverTelemetry)
 		for _, mapping := range vanity.Paths {
 			target := VanityExecRequest{
 				FunctionID:        mapping.FunctionID,
 				FunctionVersionID: mapping.FunctionVersionID,
 				PathOverride:      mapping.OutgoingPathOverride,
 				UsePexec:          mapping.UsePexec,
+				CustomHeaders:     mapping.CustomHeaders,
 				EOL:               mapping.EOL,
 				OfflineMessage:    mapping.OfflineMessage,
 			}
 			r.Post(mapping.Path, func(writer http.ResponseWriter, request *http.Request) {
+				middleware.AddFunctionIDMetricAttribute(request.Context(), target.FunctionID)
 				vanityDirector.ServeExec(target, writer, request)
 			})
 		}
 		r.Get(healthPath, healthManager.HandlerFunc)
+		r.Get("/info", golibversion.Handler().ServeHTTP)
 		r.Get("/v1/status/{requestId}", vanityDirector.ServePolling)
-		hostRouter.Register(vanity.Host, middleware.New(r))
+		hostRouter.Register(vanity.Host, chimiddleware.New(r))
 	}
 }
 
 // openai specific domain
-func registerOpenAI(hostRouter *middleware2.HostRouter, mappings *config.GatewayConfig, openAIDirector *OpenAIDirector, healthManager *health.Health) {
+func registerOpenAI(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, openAIDirector *OpenAIDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler) {
 	r := chi.NewRouter()
-	r.Method(http.MethodPost, "/v1/chat/completions", middleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeChatCompletions)))
-	r.Method(http.MethodPost, "/v1/completions", middleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeCompletions)))
-	r.Method(http.MethodPost, "/v1/embeddings", middleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeEmbeddings)))
-	r.Method(http.MethodPost, "/v1/responses", middleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeResponses)))
-	r.Method(http.MethodPost, "/v1/images/generations", middleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageGenerations)))
-	r.Method(http.MethodPost, "/v1/images/edits", middleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageEdits)))
-	r.Method(http.MethodPost, "/v1/images/variations", middleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageVariations)))
+	r.Use(serverTelemetry)
+	r.Method(http.MethodPost, "/v1/chat/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeChatCompletions)))
+	r.Method(http.MethodPost, "/v1/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeCompletions)))
+	r.Method(http.MethodPost, "/v1/embeddings", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeEmbeddings)))
+	r.Method(http.MethodPost, "/v1/responses", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeResponses)))
+	r.Method(http.MethodPost, "/v1/images/generations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageGenerations)))
+	r.Method(http.MethodPost, "/v1/images/edits", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageEdits)))
+	r.Method(http.MethodPost, "/v1/images/variations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageVariations)))
 	r.Get("/v1/models", openAIDirector.ListModels)
 	r.Get("/v1/models/{model}", openAIDirector.GetModel)
 	r.Get("/v1/models/{company}/{model}", openAIDirector.GetModel)
 
 	r.Get(healthPath, healthManager.HandlerFunc)
+	r.Get("/info", golibversion.Handler().ServeHTTP)
 
 	// special domain for openai
-	hostRouter.Register(mappings.OpenAI.Host, middleware.New(r))
+	hostRouter.Register(mappings.OpenAI.Host, chimiddleware.New(r))
 }

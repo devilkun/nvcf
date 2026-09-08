@@ -234,7 +234,7 @@ Dashboards are provided in native Grafana JSON format for [file-provisioning](ht
 Load dashboards into Grafana by placing them in `/etc/grafana/provisioning/dashboards/` on startup.
 
 Published dashboards will be available in the
-[nv-cloud-function-helpers](https://github.com/NVIDIA/nv-cloud-function-helpers) public GitHub repository.
+[NVCF examples](https://github.com/NVIDIA/nvcf/tree/main/examples) public GitHub repository.
 
 ## Troubleshooting
 
@@ -345,7 +345,7 @@ For troubleshooting common observability issues:
 
 NVCF self-hosted control-plane observability is compatible with:
 
-- Any official supported Kubernetes version
+- Supported versions are the latest Kubernetes minor release and the two prior minor releases (N-2). See official Kubernetes docs for current supported [versions](https://kubernetes.io/releases/version-skew-policy/#supported-versions). 
 - Any Prometheus-compatible metrics collection system
 - Any log aggregation system that can collect from Kubernetes stdout/stderr or read
   from the filesystem (depending on K8s cluster configuration)

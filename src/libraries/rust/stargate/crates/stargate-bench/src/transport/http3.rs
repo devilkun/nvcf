@@ -17,24 +17,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytes::{Buf, Bytes};
 use futures::future;
-use http::{Method, Request, Response, StatusCode, Uri};
+use http::{Request, Response, StatusCode, Uri};
 use quinn::Endpoint;
 use stargate_protocol::TunnelTransportProtocol;
-use tokio::sync::{Semaphore, oneshot};
 
-use super::summary::summarize_samples;
-use super::tls::{SERVER_NAME, client_endpoint, connect_quic, server_config};
-use super::trials::{collect_samples, duration_us};
+use super::tls::{SERVER_NAME, client_endpoint, connect_quic};
+use super::trials::{ResponseMeasurement, benchmark_requests, duration_us, request_headers};
 use super::{
-    PayloadShape, RequestSample, RunningServer, SERVER_SHUTDOWN_TIMEOUT, TransportBenchConfig,
-    TransportKind, TransportRunOutcome,
+    PayloadShape, SERVER_SHUTDOWN_TIMEOUT, TransportBenchConfig, TransportKind,
+    TransportRunOutcome, start_quic_server,
 };
 
 struct H3BenchmarkClient {
-    endpoint: Endpoint,
     connection: quinn::Connection,
     send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     driver_task: tokio::task::JoinHandle<Result<()>>,
@@ -44,86 +41,39 @@ pub(super) async fn run_http3_h3_quinn(
     shape: PayloadShape,
     trial_index: usize,
 ) -> Result<TransportRunOutcome> {
-    let server = start_h3_server(config, shape.response_chunks.clone()).await?;
-    let clients = connect_h3_clients(config, server.addr, &server.cert_pem).await?;
+    let server = start_quic_server(
+        config,
+        TunnelTransportProtocol::Http3,
+        shape.response_chunks.clone(),
+        "bind h3 QUIC server",
+        "read h3 server addr",
+        handle_h3_connection,
+    )?;
+    let (endpoint, clients) = connect_h3_clients(config, server.addr, &server.cert_pem).await?;
     let send_requests = Arc::new(
         clients
             .iter()
-            .enumerate()
-            .map(|(connection_index, client)| (connection_index, client.send_request.clone()))
+            .map(|client| client.send_request.clone())
             .collect::<Vec<_>>(),
     );
-
-    if config.warmup_requests > 0 {
-        let _ = drive_h3_requests(
-            send_requests.clone(),
-            server.addr,
-            shape.clone(),
-            config.warmup_requests,
-            config.concurrency,
-        )
-        .await?;
-    }
-
-    let started_at = Instant::now();
-    let samples = drive_h3_requests(
-        send_requests,
-        server.addr,
-        shape.clone(),
-        config.request_count,
-        config.concurrency,
+    let addr = server.addr;
+    let outcome = benchmark_requests(
+        config,
+        TransportKind::Http3H3Quinn,
+        trial_index,
+        shape,
+        move |request_index, connection_index, shape| {
+            let send_request = send_requests[connection_index].clone();
+            move |started_at| {
+                execute_h3_request(send_request, addr, shape, request_index, started_at)
+            }
+        },
     )
     .await?;
-    let measured_duration = started_at.elapsed();
 
-    close_h3_clients(clients).await;
+    close_h3_clients(endpoint, clients).await;
     server.shutdown().await?;
-
-    let summary = summarize_samples(TransportKind::Http3H3Quinn, &samples, measured_duration);
-    Ok(TransportRunOutcome {
-        transport: TransportKind::Http3H3Quinn,
-        trial_index,
-        summary,
-        samples,
-    })
-}
-
-async fn start_h3_server(
-    config: TransportBenchConfig,
-    response_chunks: Arc<Vec<Bytes>>,
-) -> Result<RunningServer> {
-    let generated = server_config(config, TunnelTransportProtocol::Http3.alpn_protocols())?;
-    let endpoint = Endpoint::server(generated.server_config, "127.0.0.1:0".parse()?)
-        .context("bind h3 QUIC server")?;
-    let addr = endpoint.local_addr().context("read h3 server addr")?;
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                incoming = endpoint.accept() => {
-                    let Some(incoming) = incoming else { break };
-                    let response_chunks = response_chunks.clone();
-                    let config = config;
-                    tokio::spawn(async move {
-                        if let Ok(connection) = incoming.await {
-                            let _ = handle_h3_connection(connection, config, response_chunks).await;
-                        }
-                    });
-                }
-            }
-        }
-        endpoint.close(0_u32.into(), b"benchmark shutdown");
-        endpoint.wait_idle().await;
-        Ok(())
-    });
-
-    Ok(RunningServer {
-        addr,
-        cert_pem: generated.cert_pem,
-        shutdown_tx,
-        task,
-    })
+    Ok(outcome)
 }
 
 async fn handle_h3_connection(
@@ -140,9 +90,7 @@ async fn handle_h3_connection(
         match h3_connection.accept().await {
             Ok(Some(resolver)) => {
                 let response_chunks = response_chunks.clone();
-                tokio::spawn(async move {
-                    let _ = handle_h3_request(resolver, response_chunks).await;
-                });
+                tokio::spawn(handle_h3_request(resolver, response_chunks));
             }
             Ok(None) => break,
             Err(error) if error.is_h3_no_error() => break,
@@ -160,13 +108,12 @@ async fn handle_h3_request(
         .resolve_request()
         .await
         .map_err(|error| anyhow!("resolve h3 request: {error:?}"))?;
-    while let Some(chunk) = stream
+    while stream
         .recv_data()
         .await
         .map_err(|error| anyhow!("read h3 request body: {error:?}"))?
-    {
-        let _ = chunk.remaining();
-    }
+        .is_some()
+    {}
 
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -194,7 +141,7 @@ async fn connect_h3_clients(
     config: TransportBenchConfig,
     addr: SocketAddr,
     server_cert_pem: &[u8],
-) -> Result<Vec<H3BenchmarkClient>> {
+) -> Result<(Endpoint, Vec<H3BenchmarkClient>)> {
     let endpoint = client_endpoint(
         config,
         TunnelTransportProtocol::Http3.alpn_protocols(),
@@ -203,32 +150,29 @@ async fn connect_h3_clients(
     let mut clients = Vec::with_capacity(config.quic_connections);
     for _ in 0..config.quic_connections {
         let connection = connect_quic(&endpoint, addr).await?;
-        let quinn_connection = h3_quinn::Connection::new(connection.clone());
         let (mut driver, send_request) = h3::client::builder()
             .send_grease(config.http3_send_grease)
-            .build(quinn_connection)
+            .build(h3_quinn::Connection::new(connection.clone()))
             .await
             .map_err(|error| anyhow!("create h3 client: {error:?}"))?;
         let driver_task = tokio::spawn(async move {
             let error = future::poll_fn(|cx| driver.poll_close(cx)).await;
-            if error.is_h3_no_error() {
-                Ok(())
-            } else {
-                Err(anyhow!("h3 client connection closed: {error:?}"))
-            }
+            ensure!(
+                error.is_h3_no_error(),
+                "h3 client connection closed: {error:?}"
+            );
+            Ok(())
         });
         clients.push(H3BenchmarkClient {
-            endpoint: endpoint.clone(),
             connection,
             send_request,
             driver_task,
         });
     }
-    Ok(clients)
+    Ok((endpoint, clients))
 }
 
-async fn close_h3_clients(clients: Vec<H3BenchmarkClient>) {
-    let endpoint = clients.first().map(|client| client.endpoint.clone());
+async fn close_h3_clients(endpoint: Endpoint, clients: Vec<H3BenchmarkClient>) {
     for mut client in clients {
         // Drop the final request sender before closing QUIC so the H3 driver can drain shutdown.
         drop(client.send_request);
@@ -240,34 +184,7 @@ async fn close_h3_clients(clients: Vec<H3BenchmarkClient>) {
             client.driver_task.abort();
         }
     }
-    if let Some(endpoint) = endpoint {
-        endpoint.wait_idle().await;
-    }
-}
-
-async fn drive_h3_requests(
-    send_requests: Arc<Vec<(usize, h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>)>>,
-    addr: SocketAddr,
-    shape: PayloadShape,
-    request_count: usize,
-    concurrency: usize,
-) -> Result<Vec<RequestSample>> {
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks = Vec::with_capacity(request_count);
-    for request_index in 0..request_count {
-        let (connection_index, send_request) =
-            send_requests[request_index % send_requests.len()].clone();
-        let shape = shape.clone();
-        let semaphore = semaphore.clone();
-        tasks.push(tokio::spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("semaphore should remain open");
-            execute_h3_request(send_request, addr, shape, request_index, connection_index).await
-        }));
-    }
-    collect_samples(tasks).await
+    endpoint.wait_idle().await;
 }
 
 async fn execute_h3_request(
@@ -275,90 +192,46 @@ async fn execute_h3_request(
     addr: SocketAddr,
     shape: PayloadShape,
     request_index: usize,
-    connection_index: usize,
-) -> RequestSample {
-    let started_at = Instant::now();
-    let result = async {
-        let uri: Uri = format!("https://{SERVER_NAME}:{}/v1/chat/completions", addr.port())
-            .parse()
-            .context("build h3 request URI")?;
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(uri)
-            .header("x-request-id", format!("transport-bench-{request_index}"))
-            .header("x-model", "transport-bench-model")
-            .header("x-input-tokens", "1")
-            .header(http::header::CONTENT_TYPE, "application/octet-stream")
-            .body(())
-            .context("build h3 request")?;
-        let mut stream = send_request
-            .send_request(request)
-            .await
-            .map_err(|error| anyhow!("send h3 request headers: {error:?}"))?;
-        for chunk in shape.request_chunks.iter() {
-            stream
-                .send_data(chunk.clone())
-                .await
-                .map_err(|error| anyhow!("send h3 request body: {error:?}"))?;
-        }
+    started_at: Instant,
+) -> Result<ResponseMeasurement> {
+    let uri: Uri = format!("https://{SERVER_NAME}:{}/v1/chat/completions", addr.port())
+        .parse()
+        .context("build h3 request URI")?;
+    let mut request = Request::post(uri)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .body(())
+        .context("build h3 request")?;
+    let headers = request_headers(request_index)?;
+    request.headers_mut().extend(headers);
+    let mut stream = send_request
+        .send_request(request)
+        .await
+        .map_err(|error| anyhow!("send h3 request headers: {error:?}"))?;
+    for chunk in shape.request_chunks.iter() {
         stream
-            .finish()
+            .send_data(chunk.clone())
             .await
-            .map_err(|error| anyhow!("finish h3 request: {error:?}"))?;
-
-        let response = stream
-            .recv_response()
-            .await
-            .map_err(|error| anyhow!("read h3 response headers: {error:?}"))?;
-        let response_headers_us = duration_us(started_at.elapsed());
-        let response_status = Some(response.status().as_u16());
-        let mut first_body_us = None;
-        let mut response_bytes = 0usize;
-        while let Some(chunk) = stream
-            .recv_data()
-            .await
-            .map_err(|error| anyhow!("read h3 response body: {error:?}"))?
-        {
-            if first_body_us.is_none() {
-                first_body_us = Some(duration_us(started_at.elapsed()));
-            }
-            response_bytes += chunk.remaining();
-        }
-        Ok::<_, anyhow::Error>((
-            response_status,
-            response_headers_us,
-            first_body_us,
-            response_bytes,
-        ))
+            .map_err(|error| anyhow!("send h3 request body: {error:?}"))?;
     }
-    .await;
+    stream
+        .finish()
+        .await
+        .map_err(|error| anyhow!("finish h3 request: {error:?}"))?;
 
-    match result {
-        Ok((response_status, response_headers_us, first_body_us, response_bytes)) => {
-            RequestSample {
-                request_index,
-                connection_index,
-                ok: response_status == Some(200) && response_bytes == shape.response_bytes,
-                response_status,
-                request_bytes: shape.request_bytes,
-                response_bytes,
-                response_headers_us: Some(response_headers_us),
-                first_body_us,
-                completion_us: duration_us(started_at.elapsed()),
-                error: None,
-            }
-        }
-        Err(error) => RequestSample {
-            request_index,
-            connection_index,
-            ok: false,
-            response_status: None,
-            request_bytes: shape.request_bytes,
-            response_bytes: 0,
-            response_headers_us: None,
-            first_body_us: None,
-            completion_us: duration_us(started_at.elapsed()),
-            error: Some(error.to_string()),
-        },
+    let response = stream
+        .recv_response()
+        .await
+        .map_err(|error| anyhow!("read h3 response headers: {error:?}"))?;
+    let mut response = ResponseMeasurement::new(
+        Some(response.status().as_u16()),
+        duration_us(started_at.elapsed()),
+    );
+    while let Some(chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|error| anyhow!("read h3 response body: {error:?}"))?
+    {
+        response.record_body(started_at, chunk.remaining());
     }
+    Ok(response)
 }

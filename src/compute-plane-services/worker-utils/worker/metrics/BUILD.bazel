@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "metrics",
@@ -6,9 +6,25 @@ go_library(
     importpath = "github.com/NVIDIA/nvcf/src/compute-plane-services/worker-utils/worker/metrics",
     visibility = ["//visibility:public"],
     deps = [
-        "//worker/progress",
+        "//src/compute-plane-services/worker-utils/worker/progress",
         "@com_github_nvidia_nvcf_src_libraries_go_worker//metrics",
         "@com_github_prometheus_client_golang//prometheus",
         "@com_github_prometheus_client_golang//prometheus/promauto",
+    ],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":metrics",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "metrics_test",
+    srcs = ["metrics_extra_test.go"],
+    embed = [":metrics"],
+    deps = [
+        "//src/compute-plane-services/worker-utils/worker/progress",
+        "@com_github_stretchr_testify//assert",
     ],
 )

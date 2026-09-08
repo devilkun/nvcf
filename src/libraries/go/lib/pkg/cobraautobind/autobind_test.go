@@ -21,6 +21,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -54,7 +55,8 @@ type wideCfg struct {
 	Nest  struct {
 		Inner string `mapstructure:"inner" default:"in"`
 	}
-	ignored string `mapstructure:"-"`
+	Pointer *string `mapstructure:"pointer" default:"ptr"`
+	ignored string  `mapstructure:"-"`
 }
 
 func TestAutobindFlagsFromStruct_allKinds(t *testing.T) {
@@ -73,6 +75,7 @@ func TestAutobindFlagsFromStruct_allKinds(t *testing.T) {
 		"--tags", "a,b",
 		"--alias-flag", "xx",
 		"--nest.inner", "deep",
+		"--pointer", "ptr2",
 	}))
 	require.Equal(t, "hi", v.GetString("s"))
 	require.Equal(t, 7, v.GetInt("i"))
@@ -85,6 +88,24 @@ func TestAutobindFlagsFromStruct_allKinds(t *testing.T) {
 	require.Equal(t, []string{"a", "b"}, v.GetStringSlice("tags"))
 	require.Equal(t, "xx", v.GetString("alias-flag"))
 	require.Equal(t, "deep", v.GetString("nest.inner"))
+	require.Equal(t, "ptr2", v.GetString("pointer"))
+
+	cfg := &wideCfg{}
+	err := v.Unmarshal(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "hi", cfg.S)
+	assert.Equal(t, 7, cfg.I)
+	assert.Equal(t, int32(9), cfg.I32)
+	assert.Equal(t, int64(99), cfg.I64)
+	assert.Equal(t, uint16(200), cfg.U16)
+	assert.False(t, cfg.B)
+	assert.InDelta(t, 2.5, cfg.F64, 0.001)
+	assert.InDelta(t, float32(4), cfg.F32, 0.001)
+	assert.Equal(t, []string{"a", "b"}, cfg.Tags)
+	assert.Equal(t, "deep", cfg.Nest.Inner)
+	if assert.NotNil(t, cfg.Pointer) {
+		assert.Equal(t, "ptr2", *cfg.Pointer)
+	}
 }
 
 func TestAutobindFlagsFromStruct_errors(t *testing.T) {

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/yaml"
 
+	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/clustervalidator"
 	nvidiaiov1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
 	nvcaoptypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
@@ -56,6 +58,28 @@ func readTestdataFile(t *testing.T, fileName string) string {
 	b, err := testdataFiles.ReadFile(fileName)
 	require.NoError(t, err)
 	return string(b)
+}
+
+// stripSPDXHeaders removes the SPDX license header comment blocks that repo
+// license stamping adds to rendered template assets and testdata goldens. The
+// headers carry no semantic content (Kubernetes ignores YAML comments), appear
+// a different number of times on each side of a golden comparison (once per
+// stamped source file), and would otherwise churn every golden assertion each
+// time stamping changes.
+func stripSPDXHeaders(s string) string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "# SPDX-") {
+			// Swallow the blank line that closes a header block.
+			if i+1 < len(lines) && strings.TrimSpace(lines[i+1]) == "" {
+				i++
+			}
+			continue
+		}
+		out = append(out, lines[i])
+	}
+	return strings.Join(out, "\n")
 }
 
 func TestValidateNVCFBackendParams(t *testing.T) {
@@ -249,6 +273,7 @@ func TestSetupNVCADeployment(t *testing.T) {
 					Values: []string{
 						"LogPosting",
 						"CachingSupport",
+						"GracefulNoGPU",
 						"PeriodicInstanceStatusUpdate",
 						"SharedCluster",
 					},
@@ -298,6 +323,7 @@ func TestSetupNVCADeployment(t *testing.T) {
 			LogLevel: "info",
 			FeatureFlags: []string{
 				"CachingSupport",
+				"GracefulNoGPU",
 				"LogPosting",
 				"PeriodicInstanceStatusUpdate",
 				"SharedCluster",
@@ -416,6 +442,12 @@ func TestSetupNVCADeployment(t *testing.T) {
 	assert.Equal(t, []string{"/usr/bin/nvca", "--config", "/var/run/nvca/config.yaml"}, nvcaContainer.Args)
 	assert.Equal(t, []corev1.EnvVar{
 		{
+			// Injected first so the agent's metrics reconciler watches the
+			// operator/validator namespace for the cluster-validator summary.
+			Name:  clustervalidator.SummaryConfigMapNamespaceEnv,
+			Value: bc.operatorNamespace,
+		},
+		{
 			Name: auth.ClientIDEnv,
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
@@ -508,6 +540,7 @@ func TestSetupNVCADeployment(t *testing.T) {
 	assert.Equal(t, expectedAnnotations, gotSvc.Annotations)
 	assert.Equal(t, expectedAnnotations, gotDep.Annotations)
 	assert.Empty(t, gotDep.Spec.Template.Annotations)
+	assert.Equal(t, appsv1.RecreateDeploymentStrategyType, gotDep.Spec.Strategy.Type)
 
 	// Try rollout with the same spec.
 	err = bc.setupNVCADeployment(ctx, inNVCFBackend)
@@ -601,6 +634,7 @@ func TestSetupNVCADeployment_OverrideEnvironmentVars(t *testing.T) {
 		gotDep, getErr = depIface.Get(ctx, nvcaoptypes.NVCAModuleName, metav1.GetOptions{})
 		require.NoError(ct, getErr)
 	}, 10*time.Second, 100*time.Millisecond)
+	assert.Empty(t, gotDep.Spec.Strategy.Type, "default rollout strategy must remain unchanged")
 
 	var nvcaContainer *corev1.Container
 	for i := range gotDep.Spec.Template.Spec.Containers {
@@ -840,7 +874,13 @@ func TestSetupNVCADeployment_Vault(t *testing.T) {
 	assert.Equal(t, []string{"/usr/bin/nvca", "--config", "/var/run/nvca/config.yaml"}, nvcaContainer.Args)
 	// When Vault is enabled, OAuth credentials come from ClientSecretsEnvFile (Vault agent output),
 	// not from SecretKeyRef - so no OAUTH_CLIENT_ID env var is added (fixes "secret oauth-client-id not found").
-	assert.Empty(t, nvcaContainer.Env)
+	// The only env var present is the always-injected validator-summary namespace.
+	assert.Equal(t, []corev1.EnvVar{
+		{
+			Name:  clustervalidator.SummaryConfigMapNamespaceEnv,
+			Value: bc.operatorNamespace,
+		},
+	}, nvcaContainer.Env)
 	assert.Equal(t, []corev1.VolumeMount{
 		{
 			Name:      NGCServiceAPIKeySecretName,
@@ -1583,6 +1623,11 @@ func Test_setupNVCARBAC(t *testing.T) {
 				ResourceNames: []string{nvcaoptypes.NVCAModuleName},
 				Verbs:         []string{"get", "list", "watch"},
 			},
+			{
+				APIGroups: []string{"nvsnap.nvcf.nvidia.io"},
+				Resources: []string{"nvsnapfunctionstates", "nvsnapfunctionstates/status"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "delete", "patch"},
+			},
 			{}, // Node rule, added below
 			{
 				APIGroups: []string{""},
@@ -1999,6 +2044,11 @@ func Test_setupNVCARBAC_ValidationPolicy(t *testing.T) {
 				Verbs:         []string{"get", "list", "watch"},
 			},
 			{
+				APIGroups: []string{"nvsnap.nvcf.nvidia.io"},
+				Resources: []string{"nvsnapfunctionstates", "nvsnapfunctionstates/status"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "delete", "patch"},
+			},
+			{
 				APIGroups: []string{""},
 				Resources: []string{"nodes"},
 				Verbs:     []string{"get", "list", "watch", "update", "patch"},
@@ -2226,6 +2276,11 @@ func Test_NVLinkOptimized(t *testing.T) {
 				Verbs:         []string{"get", "list", "watch"},
 			},
 			{
+				APIGroups: []string{"nvsnap.nvcf.nvidia.io"},
+				Resources: []string{"nvsnapfunctionstates", "nvsnapfunctionstates/status"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "delete", "patch"},
+			},
+			{
 				APIGroups: []string{""},
 				Resources: []string{"nodes"},
 				Verbs:     []string{"get", "list", "watch", "update", "patch"},
@@ -2440,13 +2495,14 @@ func TestGetNetworkPoliciesDataEmptyDDCSIPList(t *testing.T) {
 	got, err := bc.getNetworkPoliciesData(newTestContext(), nb)
 	require.NoError(t, err)
 	assert.Len(t, got, len(expNPNames))
+	assertNetworkPolicyAllowsTCPPort(t, got[IngressNetworkPolicyNameKey], IngressNetworkPolicyNameKey, 8888)
 	b := &bytes.Buffer{}
 	require.NoError(t, err)
 	for _, k := range expNPNames {
 		io.WriteString(b, "---\n")
 		io.WriteString(b, got[k])
 	}
-	assert.Equal(t, readTestdataFile(t, filepath.Join("testdata", "netpols.yaml")), b.String())
+	assert.Equal(t, stripSPDXHeaders(readTestdataFile(t, filepath.Join("testdata", "netpols.yaml"))), stripSPDXHeaders(b.String()))
 }
 
 func TestGetNetworkPoliciesDataWithDDCSIPList(t *testing.T) {
@@ -2472,13 +2528,35 @@ func TestGetNetworkPoliciesDataWithDDCSIPList(t *testing.T) {
 	got, err := bc.getNetworkPoliciesData(newTestContext(), nb)
 	require.NoError(t, err)
 	assert.Len(t, got, len(expNPNames))
+	assertNetworkPolicyAllowsTCPPort(t, got[IngressNetworkPolicyNameKey], IngressNetworkPolicyNameKey, 8888)
 	b := &bytes.Buffer{}
 	require.NoError(t, err)
 	for _, k := range expNPNames {
 		io.WriteString(b, "---\n")
 		io.WriteString(b, got[k])
 	}
-	assert.Equal(t, readTestdataFile(t, filepath.Join("testdata", "netpols_with_ddcs.yaml")), b.String())
+	assert.Equal(t, stripSPDXHeaders(readTestdataFile(t, filepath.Join("testdata", "netpols_with_ddcs.yaml"))), stripSPDXHeaders(b.String()))
+}
+
+func assertNetworkPolicyAllowsTCPPort(t *testing.T, policyYAML, policyName string, port int32) {
+	t.Helper()
+
+	var policy netv1.NetworkPolicy
+	require.NoError(t, yaml.Unmarshal([]byte(policyYAML), &policy))
+	require.Equal(t, policyName, policy.Name)
+
+	for _, ingressRule := range policy.Spec.Ingress {
+		for _, networkPolicyPort := range ingressRule.Ports {
+			if networkPolicyPort.Port == nil || networkPolicyPort.Protocol == nil {
+				continue
+			}
+			if networkPolicyPort.Port.IntVal == port && *networkPolicyPort.Protocol == corev1.ProtocolTCP {
+				return
+			}
+		}
+	}
+
+	assert.Failf(t, "missing TCP port", "%s should allow TCP port %d", policyName, port)
 }
 
 func TestGetEffectiveK8sNetworkCIDRs(t *testing.T) {
@@ -2752,6 +2830,114 @@ func TestEncodeAgentConfig_ConfiguresSelfHostedControlPlaneEndpoints(t *testing.
 	assert.Equal(t, "reval.gateway.example.test", got.Agent.HelmReValServiceHostHeaderOverride)
 	assert.Equal(t, "nats://nats.nats-system.svc.cluster.local:4222", got.Agent.NATSURL)
 	assert.Equal(t, "nats.gateway.example.test", got.Agent.NATSHostOverride)
+}
+
+func TestEncodeAgentConfig_MergesBYOOConfig(t *testing.T) {
+	mergeCfg := nvcaconfig.Config{
+		Agent: nvcaconfig.AgentConfig{
+			BYOOResources: nvcaconfig.ResourceRequirements{
+				Limits: nvcaconfig.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+				Requests: nvcaconfig.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+			},
+			BYOOFluentBitResources: nvcaconfig.ResourceRequirements{
+				Limits: nvcaconfig.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+				Requests: nvcaconfig.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+			},
+			BYOOLogChunking: nvcaconfig.BYOOLogChunkingConfig{
+				Enabled:         true,
+				MaxPayloadBytes: 983040,
+				DryRun:          true,
+			},
+			BYOOOTelCollector: nvcaconfig.BYOOOTelCollectorConfig{
+				ExporterHelper: nvcaconfig.BYOOOTelExporterHelperConfig{
+					Timeout: "30s",
+					SendingQueue: nvcaconfig.BYOOOTelSendingQueueConfig{
+						Batch: nvcaconfig.BYOOOTelSendingQueueBatchConfig{
+							Sizer:   "bytes",
+							MinSize: ptr.To[int64](1000000),
+							MaxSize: ptr.To[int64](1000000),
+						},
+					},
+				},
+				LogSampling: nvcaconfig.BYOOOTelLogSamplingConfig{
+					SamplingPercentage: ptr.To(10.0),
+					Mode:               "hash_seed",
+					HashSeed:           ptr.To(uint32(1234)),
+					FailClosed:         ptr.To(false),
+					AttributeSource:    "record",
+					FromAttribute:      "log.id",
+					SamplingPriority:   "sampling.priority",
+				},
+				TraceSampling: nvcaconfig.BYOOOTelSamplingConfig{
+					SamplingPercentage: ptr.To(1.0),
+					Mode:               "hash_seed",
+					HashSeed:           ptr.To(uint32(1234)),
+					FailClosed:         ptr.To(false),
+				},
+			},
+			BYOODebugMode: nvcaconfig.BYOODebugModeConfig{
+				Enabled: true,
+			},
+			BYOOMetricSubset: nvcaconfig.BYOOMetricSubsetConfig{
+				Enabled:      true,
+				FilterConfig: "error_mode: ignore\nmetric_conditions:\n  - 'metric.name == \"drop\"'\n",
+			},
+			BYOOWorkloadMetrics: nvcaconfig.BYOOWorkloadMetricsConfig{
+				DropLabels: []string{"metric_subset_enabled", "custom_label"},
+			},
+		},
+	}
+
+	data, err := encodeAgentConfig(nvcaconfig.Config{}, mergeCfg, nil, agentHostOverrides{})
+	require.NoError(t, err)
+
+	got, err := nvcaconfig.DecodeConfig(data)
+	require.NoError(t, err)
+	byooLimits := corev1.ResourceList(got.Agent.BYOOResources.Limits)
+	fluentBitRequests := corev1.ResourceList(got.Agent.BYOOFluentBitResources.Requests)
+	assert.True(t, byooLimits.Memory().Equal(resource.MustParse("2Gi")))
+	assert.True(t, fluentBitRequests.Cpu().Equal(resource.MustParse("100m")))
+	assert.True(t, got.Agent.BYOOLogChunking.Enabled)
+	assert.Equal(t, int64(983040), got.Agent.BYOOLogChunking.MaxPayloadBytes)
+	assert.True(t, got.Agent.BYOOLogChunking.DryRun)
+	assert.Equal(t, "30s", got.Agent.BYOOOTelCollector.ExporterHelper.Timeout)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.ExporterHelper.SendingQueue.Batch.MinSize)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.ExporterHelper.SendingQueue.Batch.MaxSize)
+	assert.Equal(t, int64(1000000), *got.Agent.BYOOOTelCollector.ExporterHelper.SendingQueue.Batch.MinSize)
+	assert.Equal(t, int64(1000000), *got.Agent.BYOOOTelCollector.ExporterHelper.SendingQueue.Batch.MaxSize)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.LogSampling.SamplingPercentage)
+	assert.Equal(t, 10.0, *got.Agent.BYOOOTelCollector.LogSampling.SamplingPercentage)
+	assert.Equal(t, "hash_seed", got.Agent.BYOOOTelCollector.LogSampling.Mode)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.LogSampling.HashSeed)
+	assert.Equal(t, uint32(1234), *got.Agent.BYOOOTelCollector.LogSampling.HashSeed)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.LogSampling.FailClosed)
+	assert.False(t, *got.Agent.BYOOOTelCollector.LogSampling.FailClosed)
+	assert.Equal(t, "record", got.Agent.BYOOOTelCollector.LogSampling.AttributeSource)
+	assert.Equal(t, "log.id", got.Agent.BYOOOTelCollector.LogSampling.FromAttribute)
+	assert.Equal(t, "sampling.priority", got.Agent.BYOOOTelCollector.LogSampling.SamplingPriority)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.TraceSampling.SamplingPercentage)
+	assert.Equal(t, 1.0, *got.Agent.BYOOOTelCollector.TraceSampling.SamplingPercentage)
+	assert.Equal(t, "hash_seed", got.Agent.BYOOOTelCollector.TraceSampling.Mode)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.TraceSampling.HashSeed)
+	assert.Equal(t, uint32(1234), *got.Agent.BYOOOTelCollector.TraceSampling.HashSeed)
+	require.NotNil(t, got.Agent.BYOOOTelCollector.TraceSampling.FailClosed)
+	assert.False(t, *got.Agent.BYOOOTelCollector.TraceSampling.FailClosed)
+	assert.True(t, got.Agent.BYOODebugMode.Enabled)
+	assert.True(t, got.Agent.BYOOMetricSubset.Enabled)
+	assert.Contains(t, got.Agent.BYOOMetricSubset.FilterConfig, "metric.name")
+	assert.Equal(t, []string{"metric_subset_enabled", "custom_label"}, got.Agent.BYOOWorkloadMetrics.DropLabels)
 }
 
 func TestAgentHostOverrideConfig_ClearsReValHostForSelfHostedColocatedService(t *testing.T) {
@@ -4343,7 +4529,7 @@ func TestSetupOTelCollectorConfigMap(t *testing.T) {
 				require.NoError(t, err)
 				assert.NotNil(t, cm)
 				assert.Contains(t, cm.Data, "config.yaml")
-				assert.Contains(t, cm.Data["config.yaml"], "k8s_events")
+				assertClusterWideK8sObjects(t, cm.Data["config.yaml"])
 				assert.Contains(t, cm.Data["config.yaml"], "memory_limiter")
 			} else {
 				_, err := clients.K8s.CoreV1().ConfigMaps(ns).Get(ctx, NVCAOTelCollectorConfigMapName, metav1.GetOptions{})
@@ -4544,7 +4730,7 @@ func TestGetOTelCollectorContainerCommandArgsAndEnv_OAuthAuth(t *testing.T) {
 			expectedAuthenticator:   NVCAOTelCollectorAuthenticatorOAuth2Client,
 		},
 		{
-			name: "Vault disabled - service API key bearer token authentication with placeholder OAuth env vars",
+			name: "Vault disabled - service API key bearer token authentication with empty OAuth client ID",
 			nb: &nvidiaiov1.NVCFBackend{
 				Spec: nvidiaiov1.NVCFBackendSpec{
 					NVCFBackendSpecT: nvidiaiov1.NVCFBackendSpecT{
@@ -4560,7 +4746,7 @@ func TestGetOTelCollectorContainerCommandArgsAndEnv_OAuthAuth(t *testing.T) {
 				},
 			},
 			envType:                 nvidiaiov1.EnvTypeProd,
-			expectedOAuthClientID:   NVCAOTelCollectorOAuthPlaceholderClientID,
+			expectedOAuthClientID:   "",
 			expectedOAuthSecretFile: "/home/nvca/vault-agent/secrets/oauth-client-secrets.env",
 			expectedOAuthTokenURL:   "",
 			expectedAuthenticator:   NVCAOTelCollectorAuthenticatorBearerTokenAuth,
@@ -4871,10 +5057,10 @@ func Test_setupAgentConfigConfigMap(t *testing.T) {
 		},
 	}
 
-	agentCfg, err := bc.newAgentConfig(ctx, inNVCFBackend)
+	desiredConfigMap, err := bc.newAgentConfigConfigMap(ctx, inNVCFBackend)
 	require.NoError(t, err)
 
-	err = bc.setupAgentConfigConfigMap(ctx, inNVCFBackend, agentCfg)
+	err = bc.setupAgentConfigConfigMap(ctx, desiredConfigMap)
 	require.NoError(t, err)
 
 	gotCM, err := clients.K8s.CoreV1().ConfigMaps(DefaultNVCASystemNamespace).Get(ctx, agentConfigConfigMapName, metav1.GetOptions{})
@@ -4964,6 +5150,82 @@ func TestNewAgentConfigIncludesServiceOAuthEndpoints(t *testing.T) {
 	assert.Equal(t, "https://stage-fnds-oauth.example.test/.well-known/jwks.json", cfg.Agent.FunctionDeploymentStagesStageOAuthPublicKeysetEndpoint)
 	assert.Equal(t, "https://prod-fnds-oauth.example.test/token", cfg.Agent.FunctionDeploymentStagesProdOAuthTokenURL)
 	assert.Equal(t, "https://prod-fnds-oauth.example.test/.well-known/jwks.json", cfg.Agent.FunctionDeploymentStagesProdOAuthPublicKeysetEndpoint)
+}
+
+func TestNewAgentConfigIncludesLLMRequestRouterAddress(t *testing.T) {
+	ctx := newTestContext()
+	bc := &BackendK8sCache{envType: nvidiaiov1.EnvTypeStage}
+	nb := ngcManagedBackendWithAgentConfig(nvidiaiov1.AgentConfig{
+		LLMRequestRouterAddress: "llm-request-router.nvcf.svc.cluster.local:50071",
+	})
+
+	cfg, err := bc.newAgentConfig(ctx, nb)
+	require.NoError(t, err)
+
+	assert.Equal(t, "llm-request-router.nvcf.svc.cluster.local:50071", cfg.Workload.DefaultStargateAddress)
+	assert.Nil(t, cfg.Workload.TransportTLS)
+}
+
+func TestSetupAgentConfigConfigMapMergesTransportTLSFromAgentConfigMergeConfigMap(t *testing.T) {
+	ctx := newTestContext()
+	clients := mockKubeClientsForIntegrationTests()
+	bc := &BackendK8sCache{
+		clients:           clients,
+		envType:           nvidiaiov1.EnvTypeStage,
+		operatorNamespace: NVCAOperatorNamespace,
+	}
+
+	mergeCfg := nvcaconfig.Config{
+		Workload: nvcaconfig.WorkloadConfig{
+			TransportTLS: &nvcaconfig.TransportTLSConfig{
+				TrustMode:                nvcaconfig.TrustModeBundle,
+				TrustBundleConfigMapName: "nvcf-transport-trust-bundle",
+				TrustBundleKey:           "nvcf-ca-bundle.pem",
+				TrustBundleFingerprint:   "sha256:95b3dc7dfd3212a6f02c644527f0a65890a9a9c80acf7551be6aa89b1f98fe86",
+				TrustBundlePEM:           transportTrustTestPEM,
+			},
+		},
+	}
+	mergeCfgBytes, err := nvcaconfig.EncodeConfig(mergeCfg)
+	require.NoError(t, err)
+
+	_, err = clients.K8s.CoreV1().ConfigMaps(NVCAOperatorNamespace).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agentConfigMergeConfigMapName,
+			Namespace: NVCAOperatorNamespace,
+		},
+		Data: map[string]string{
+			agentConfigFile: string(mergeCfgBytes),
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	nb := ngcManagedBackendWithAgentConfig(nvidiaiov1.AgentConfig{
+		LLMRequestRouterAddress: "llm-request-router.nvcf.svc.cluster.local:50071",
+	})
+	cfg, err := bc.newAgentConfig(ctx, nb)
+	require.NoError(t, err)
+	assert.Nil(t, cfg.Workload.TransportTLS)
+
+	desiredConfigMap, err := bc.newAgentConfigConfigMap(ctx, nb)
+	require.NoError(t, err)
+	err = bc.setupAgentConfigConfigMap(ctx, desiredConfigMap)
+	require.NoError(t, err)
+
+	gotCM, err := clients.K8s.CoreV1().ConfigMaps(DefaultNVCASystemNamespace).Get(ctx, agentConfigConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	gotCfg, err := nvcaconfig.DecodeConfig([]byte(gotCM.Data[agentConfigFile]))
+	require.NoError(t, err)
+
+	assert.Equal(t, "llm-request-router.nvcf.svc.cluster.local:50071", gotCfg.Workload.DefaultStargateAddress)
+	require.NotNil(t, gotCfg.Workload.TransportTLS)
+	assert.Equal(t, nvcaconfig.TrustModeBundle, gotCfg.Workload.TransportTLS.TrustMode)
+	assert.Equal(t, "nvcf-transport-trust-bundle", gotCfg.Workload.TransportTLS.TrustBundleConfigMapName)
+	assert.Equal(t, "nvcf-ca-bundle.pem", gotCfg.Workload.TransportTLS.TrustBundleKey)
+	assert.Equal(t, "sha256:95b3dc7dfd3212a6f02c644527f0a65890a9a9c80acf7551be6aa89b1f98fe86",
+		gotCfg.Workload.TransportTLS.TrustBundleFingerprint)
+	assert.Equal(t, transportTrustTestPEM, gotCfg.Workload.TransportTLS.TrustBundlePEM)
 }
 
 func TestGetChartDefaultAgentConfig(t *testing.T) {

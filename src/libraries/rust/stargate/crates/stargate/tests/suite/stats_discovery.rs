@@ -13,142 +13,112 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::common::{
-    TokenMapAuthenticator, init_crypto, make_stargate_runtime,
-    make_stargate_runtime_with_auth_and_model_discovery,
+    BackendHandle, TokenMapAuthenticator, direct_registration_config, init_crypto,
+    make_stargate_runtime, make_stargate_runtime_with_auth_and_model_discovery,
     make_stargate_runtime_with_model_discovery, make_stargate_runtime_with_shared_discovery,
     make_stargate_runtime_with_shared_discovery_and_remote_watch_urls,
     make_stargate_runtime_with_watch_intervals, start_dummy_inst, wait_for_all_probes_routed_to,
-    wait_for_routing, wait_for_routing_with_rk, with_proxy_headers,
+    wait_for_routing, wait_for_routing_with_rk, wait_until, with_proxy_headers,
 };
 use pylon_lib::{
-    AuthTokenProvider, BringupConfig, CurrentModelStats, InferenceServerRegistrationClient,
-    InferenceServerRegistrationConfig, OutputTokenParserFactory,
+    AuthTokenProvider, CurrentModelStats, InferenceServerRegistrationClient,
+    InferenceServerRegistrationConfig, PylonRuntimeState, QuicHttpTunnelHandle,
 };
+use stargate::runtime::{StargateHandle, StargateRuntime};
 use stargate_proto::pb::stargate_control_plane_client::StargateControlPlaneClient;
 use stargate_proto::pb::stargate_model_discovery_client::StargateModelDiscoveryClient;
-use stargate_proto::pb::{InferenceServerStatus, ListModelsRequest, WatchStargatesRequest};
+use stargate_proto::pb::{
+    InferenceServerStatus, ListModelsRequest, WatchStargatesRequest, WatchStargatesResponse,
+};
 use tonic::transport::Channel;
 
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+type DiscoveryRuntime = (SocketAddr, SocketAddr, SocketAddr, StargateRuntime);
+
+macro_rules! assert_models {
+    ($fixture:expr, $routing_key:expr, $models:expr, $expected:expr) => {
+        $fixture
+            .assert_models($routing_key, $models, $expected)
+            .await
+    };
+}
+
+struct DirectBackend {
+    registration: InferenceServerRegistrationClient,
+    runtime: PylonRuntimeState,
+    _tunnel: QuicHttpTunnelHandle,
+}
+
+async fn shutdown(handles: impl IntoIterator<Item = StargateHandle>) {
+    let handles = handles.into_iter().collect::<Vec<_>>();
+    for handle in &handles {
+        handle.begin_shutdown();
+    }
+    for handle in handles {
+        handle.wait_for_shutdown(TEST_TIMEOUT).await;
+    }
+}
+
+impl DirectBackend {
+    async fn start(grpc_addr: SocketAddr, id: &str, model: &str, auth_token: Option<&str>) -> Self {
+        let (upstream_addr, quic_url, tunnel) = start_dummy_inst(model).await;
+        let runtime = PylonRuntimeState::new(InferenceServerStatus::Active, &[model.to_string()]);
+        let mut registration = InferenceServerRegistrationClient::default();
+        registration
+            .start(InferenceServerRegistrationConfig {
+                auth_token_provider: auth_token
+                    .map(|token| Arc::new(AuthTokenProvider::Static(token.to_string()))),
+                ..direct_registration_config(
+                    vec![grpc_addr.to_string()],
+                    id,
+                    quic_url,
+                    format!("http://{upstream_addr}"),
+                    runtime.clone(),
+                )
+            })
+            .expect("registration failed");
+        Self {
+            registration,
+            runtime,
+            _tunnel: tunnel,
+        }
+    }
+
+    fn set_queued_input_size(&self, queued_input_size: u64) {
+        self.runtime.set_model_stats(
+            "stats-model".to_string(),
+            CurrentModelStats {
+                last_mean_input_tps: 1000.0,
+                queued_input_size,
+                ..CurrentModelStats::default()
+            },
+        );
+    }
+
+    fn stop(&mut self) {
+        self.registration.stop();
+    }
+}
+
 #[tokio::test]
-async fn stats_update_via_channel_propagates() {
+async fn stats_update_via_runtime_state_propagates() {
     init_crypto();
 
     let (grpc_addr, http_addr, runtime) = make_stargate_runtime("test-sg-stats");
     let handle = runtime.start().await.expect("stargate failed to start");
 
-    let (inst_addr_a, quic_url_a, _tunnel_a) = start_dummy_inst("stats-model").await;
-    let (inst_addr_b, quic_url_b, _tunnel_b) = start_dummy_inst("stats-model").await;
-
-    let mut reg_a = InferenceServerRegistrationClient::default();
-    let channels_a = reg_a
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "stats-inst-a".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url_a,
-                upstream_http_base_url: Some(format!("http://{inst_addr_a}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                // Skip calibration so both backends advertise Active immediately;
-                // this test only exercises stats propagation, not bringup.
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["stats-model".to_string()],
-        )
-        .expect("registration failed");
-
-    let mut reg_b = InferenceServerRegistrationClient::default();
-    let channels_b = reg_b
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: vec![grpc_addr.to_string()],
-                inference_server_id: "stats-inst-b".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url_b,
-                upstream_http_base_url: Some(format!("http://{inst_addr_b}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                // Skip calibration so both backends advertise Active immediately;
-                // this test only exercises stats propagation, not bringup.
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: None,
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["stats-model".to_string()],
-        )
-        .expect("registration failed");
-
+    let mut backend_a = DirectBackend::start(grpc_addr, "stats-inst-a", "stats-model", None).await;
+    let mut backend_b = DirectBackend::start(grpc_addr, "stats-inst-b", "stats-model", None).await;
     wait_for_routing(http_addr, "stats-model", Duration::from_secs(5)).await;
 
     // Give instance A more pending prompt work so p2c prefers B.
-    channels_a
-        .model_stats
-        .send_async((
-            "stats-model".to_string(),
-            CurrentModelStats {
-                output_tps: 50.0,
-                last_mean_input_tps: 1000.0,
-                max_output_tps: 100.0,
-                queue_size: 0,
-                queued_input_size: 1_000,
-                kv_cache_capacity_tokens: 0,
-                kv_cache_used_tokens: 0,
-                kv_cache_free_tokens: 0,
-                ..CurrentModelStats::default()
-            },
-        ))
-        .await
-        .expect("send stats failed");
-
-    channels_b
-        .model_stats
-        .send_async((
-            "stats-model".to_string(),
-            CurrentModelStats {
-                output_tps: 50.0,
-                last_mean_input_tps: 1000.0,
-                max_output_tps: 100.0,
-                queue_size: 0,
-                queued_input_size: 0,
-                kv_cache_capacity_tokens: 0,
-                kv_cache_used_tokens: 0,
-                kv_cache_free_tokens: 0,
-                ..CurrentModelStats::default()
-            },
-        ))
-        .await
-        .expect("send stats for B failed");
+    backend_a.set_queued_input_size(1_000);
+    backend_b.set_queued_input_size(0);
 
     wait_for_all_probes_routed_to(
         http_addr,
@@ -160,10 +130,9 @@ async fn stats_update_via_channel_propagates() {
     )
     .await;
 
-    reg_a.stop();
-    reg_b.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    backend_a.stop();
+    backend_b.stop();
+    shutdown([handle]).await;
 }
 
 #[tokio::test]
@@ -173,38 +142,18 @@ async fn watch_stargates_returns_self() {
     let (grpc_addr, _http_addr, runtime) = make_stargate_runtime("test-sg-watch");
     let handle = runtime.start().await.expect("stargate failed to start");
 
-    let mut client = connect_control_plane(grpc_addr).await;
+    let msg = first_stargate_snapshot(grpc_addr).await;
 
-    let resp = client
-        .watch_stargates(WatchStargatesRequest {})
-        .await
-        .expect("WatchStargates RPC failed");
-    let mut stream = resp.into_inner();
-
-    let msg = stream
-        .message()
-        .await
-        .expect("stream error")
-        .expect("stream ended without a message");
-
-    let addrs: Vec<&str> = msg
-        .stargates
-        .iter()
-        .map(|s| s.advertise_addr.as_str())
-        .collect();
     let expected = grpc_addr.to_string();
     assert!(
-        addrs.contains(&expected.as_str()),
-        "WatchStargates should contain the stargate's own advertise_addr ({expected}), got: {addrs:?}"
+        msg.stargates
+            .iter()
+            .any(|stargate| stargate.advertise_addr == expected),
+        "WatchStargates should contain its own advertise_addr ({expected}), got: {:?}",
+        msg.stargates
     );
 
-    // Close gRPC streams before shutdown so tonic's graceful shutdown
-    // doesn't block waiting for in-flight RPCs to finish.
-    drop(stream);
-    drop(client);
-
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    shutdown([handle]).await;
 }
 
 #[tokio::test]
@@ -217,38 +166,26 @@ async fn watch_stargates_returns_remote_watch_urls_without_remote_registration_t
             "test-sg-watch-remote",
             peers,
             vec![
-                " remote-b:50071 ".to_string(),
-                "remote-a:50071".to_string(),
-                "remote-b:50071".to_string(),
+                " https://remote-b:50071 ".to_string(),
+                "http://remote-a:50071".to_string(),
+                "https://remote-b:50071".to_string(),
+                "remote-c:50071".to_string(),
+                "ftp://remote-d:50071".to_string(),
                 String::new(),
             ],
         );
     let handle = runtime.start().await.expect("stargate failed to start");
 
-    let mut client = connect_control_plane(grpc_addr).await;
-    let resp = client
-        .watch_stargates(WatchStargatesRequest {})
-        .await
-        .expect("WatchStargates RPC failed");
-    let mut stream = resp.into_inner();
-
-    let msg = stream
-        .message()
-        .await
-        .expect("stream error")
-        .expect("stream ended without a message");
+    let msg = first_stargate_snapshot(grpc_addr).await;
 
     assert_eq!(msg.stargates.len(), 1);
     assert_eq!(msg.stargates[0].stargate_id, "test-sg-watch-remote");
     assert_eq!(
         msg.watch_stargate_urls,
-        vec!["remote-a:50071", "remote-b:50071"]
+        vec!["http://remote-a:50071", "https://remote-b:50071"]
     );
 
-    drop(stream);
-    drop(client);
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    shutdown([handle]).await;
 }
 
 #[tokio::test]
@@ -263,25 +200,7 @@ async fn watch_stargates_first_message_uses_discovery_snapshot_not_self_only_ini
     let handle_1 = runtime_1.start().await.expect("stargate 1 failed");
     let handle_2 = runtime_2.start().await.expect("stargate 2 failed");
 
-    let endpoint = format!("http://{grpc_addr_1}");
-    let channel = Channel::from_shared(endpoint)
-        .expect("invalid endpoint")
-        .connect()
-        .await
-        .expect("failed to connect to stargate gRPC");
-    let mut client = StargateControlPlaneClient::new(channel);
-
-    let resp = client
-        .watch_stargates(WatchStargatesRequest {})
-        .await
-        .expect("WatchStargates RPC failed");
-    let mut stream = resp.into_inner();
-
-    let msg = tokio::time::timeout(Duration::from_secs(5), stream.message())
-        .await
-        .expect("timed out waiting for WatchStargates")
-        .expect("stream error")
-        .expect("stream ended without a message");
+    let msg = first_stargate_snapshot(grpc_addr_1).await;
 
     let mut ids: Vec<&str> = msg
         .stargates
@@ -295,12 +214,7 @@ async fn watch_stargates_first_message_uses_discovery_snapshot_not_self_only_ini
         "first WatchStargates message should come from discovery, not self-only initial state"
     );
 
-    drop(stream);
-    drop(client);
-    handle_1.begin_shutdown();
-    handle_2.begin_shutdown();
-    handle_1.wait_for_shutdown(Duration::from_secs(5)).await;
-    handle_2.wait_for_shutdown(Duration::from_secs(5)).await;
+    shutdown([handle_1, handle_2]).await;
 }
 
 #[tokio::test]
@@ -314,23 +228,10 @@ async fn watch_stargates_emits_heartbeat_snapshots_without_membership_change() {
     );
     let handle = runtime.start().await.expect("stargate failed to start");
 
-    let mut client = connect_control_plane(grpc_addr).await;
-    let resp = client
-        .watch_stargates(WatchStargatesRequest {})
-        .await
-        .expect("WatchStargates RPC failed");
-    let mut stream = resp.into_inner();
+    let mut stream = watch_stargates(grpc_addr).await;
 
-    let first = tokio::time::timeout(Duration::from_secs(5), stream.message())
-        .await
-        .expect("timed out waiting for initial WatchStargates")
-        .expect("stream error")
-        .expect("stream ended without an initial message");
-    let second = tokio::time::timeout(Duration::from_secs(5), stream.message())
-        .await
-        .expect("timed out waiting for heartbeat WatchStargates")
-        .expect("stream error")
-        .expect("stream ended without a heartbeat message");
+    let first = next_stargate_snapshot(&mut stream, "initial").await;
+    let second = next_stargate_snapshot(&mut stream, "heartbeat").await;
 
     assert_eq!(
         first, second,
@@ -338,122 +239,173 @@ async fn watch_stargates_emits_heartbeat_snapshots_without_membership_change() {
     );
 
     drop(stream);
-    drop(client);
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    shutdown([handle]).await;
 }
 
-async fn connect_control_plane(
-    grpc_addr: std::net::SocketAddr,
-) -> StargateControlPlaneClient<Channel> {
-    let endpoint = Channel::from_shared(format!("http://{grpc_addr}")).expect("invalid endpoint");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        match endpoint.clone().connect().await {
-            Ok(channel) => return StargateControlPlaneClient::new(channel),
-            Err(error) => {
-                if tokio::time::Instant::now() >= deadline {
-                    panic!("failed to connect to stargate gRPC after retries: {error:?}");
-                }
-            }
-        }
+async fn connect_channel(addr: SocketAddr, label: &str) -> Channel {
+    let endpoint = Channel::from_shared(format!("http://{addr}")).expect("invalid endpoint");
+    wait_until(
+        &format!("connect to {label}"),
+        TEST_TIMEOUT,
+        Duration::from_millis(100),
+        || {
+            let endpoint = endpoint.clone();
+            async move { endpoint.connect().await.map_err(|error| error.to_string()) }
+        },
+    )
+    .await
+}
 
-        interval.tick().await;
+async fn watch_stargates(grpc_addr: SocketAddr) -> tonic::Streaming<WatchStargatesResponse> {
+    StargateControlPlaneClient::new(connect_channel(grpc_addr, "stargate gRPC").await)
+        .watch_stargates(WatchStargatesRequest {})
+        .await
+        .expect("WatchStargates RPC failed")
+        .into_inner()
+}
+
+async fn first_stargate_snapshot(grpc_addr: std::net::SocketAddr) -> WatchStargatesResponse {
+    let mut stream = watch_stargates(grpc_addr).await;
+    next_stargate_snapshot(&mut stream, "first").await
+}
+
+async fn next_stargate_snapshot(
+    stream: &mut tonic::Streaming<WatchStargatesResponse>,
+    label: &str,
+) -> WatchStargatesResponse {
+    tokio::time::timeout(TEST_TIMEOUT, stream.message())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label} WatchStargates"))
+        .expect("stream error")
+        .expect("stream ended without a message")
+}
+
+async fn get_json(http_addr: SocketAddr, path: &str) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .get(format!("http://{http_addr}{path}"))
+        .send()
+        .await
+        .expect("HTTP inspection request failed");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response
+        .json()
+        .await
+        .expect("HTTP inspection response should be JSON")
+}
+
+fn list_models_request(routing_key: Option<&str>, model_ids: &[&str]) -> ListModelsRequest {
+    ListModelsRequest {
+        routing_key: routing_key.map(str::to_owned),
+        model_ids: model_ids.iter().map(|id| (*id).to_owned()).collect(),
     }
 }
 
-async fn connect_model_discovery(
-    model_discovery_addr: std::net::SocketAddr,
-) -> StargateModelDiscoveryClient<Channel> {
-    let endpoint =
-        Channel::from_shared(format!("http://{model_discovery_addr}")).expect("invalid endpoint");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        match endpoint.clone().connect().await {
-            Ok(channel) => return StargateModelDiscoveryClient::new(channel),
-            Err(error) => {
-                if tokio::time::Instant::now() >= deadline {
-                    panic!("failed to connect to model discovery gRPC after retries: {error:?}");
-                }
-            }
-        }
-
-        interval.tick().await;
-    }
+struct ModelDiscoveryFixture {
+    grpc_addr: SocketAddr,
+    http_addr: SocketAddr,
+    client: StargateModelDiscoveryClient<Channel>,
+    handle: StargateHandle,
 }
 
-async fn wait_for_list_models(
-    client: &mut StargateModelDiscoveryClient<Channel>,
-    routing_key: Option<&str>,
-    model_ids: &[&str],
-    expected_ids: &[&str],
-    timeout: Duration,
-) -> Vec<String> {
-    let mut expected_ids = expected_ids.to_vec();
-    expected_ids.sort_unstable();
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut interval = tokio::time::interval(Duration::from_millis(200));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        let response = match client
-            .list_models(ListModelsRequest {
-                routing_key: routing_key.map(ToOwned::to_owned),
-                model_ids: model_ids.iter().map(|id| (*id).to_string()).collect(),
-            })
-            .await
-        {
-            Ok(response) => response.into_inner(),
-            Err(error) => {
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
-                        "ListModels for filters {model_ids:?} failed before matching {expected_ids:?} within {}s: {error:?}",
-                        timeout.as_secs(),
-                    );
+impl ModelDiscoveryFixture {
+    async fn start(id: &str) -> Self {
+        Self::from_runtime(make_stargate_runtime_with_model_discovery(id)).await
+    }
+
+    async fn start_with_auth(id: &str, auth: Arc<TokenMapAuthenticator>) -> Self {
+        Self::from_runtime(make_stargate_runtime_with_auth_and_model_discovery(
+            id, auth,
+        ))
+        .await
+    }
+
+    async fn from_runtime(
+        (grpc_addr, model_discovery_addr, http_addr, runtime): DiscoveryRuntime,
+    ) -> Self {
+        init_crypto();
+        let handle = runtime.start().await.expect("stargate failed to start");
+        let client = StargateModelDiscoveryClient::new(
+            connect_channel(model_discovery_addr, "model discovery gRPC").await,
+        );
+        Self {
+            grpc_addr,
+            http_addr,
+            client,
+            handle,
+        }
+    }
+
+    async fn register(&self, backend_id: &str, model: &str) -> BackendHandle {
+        let backend = crate::common::start_and_register_backend(
+            &[self.grpc_addr.to_string()],
+            backend_id,
+            model,
+            false,
+        )
+        .await;
+        wait_for_routing(self.http_addr, model, TEST_TIMEOUT).await;
+        backend
+    }
+
+    async fn direct_backend(
+        &self,
+        backend_id: &str,
+        model: &str,
+        auth_token: &str,
+    ) -> DirectBackend {
+        DirectBackend::start(self.grpc_addr, backend_id, model, Some(auth_token)).await
+    }
+
+    async fn assert_models<const N: usize, const M: usize>(
+        &mut self,
+        routing_key: Option<&str>,
+        model_ids: [&str; N],
+        expected_ids: [&str; M],
+    ) {
+        let client = self.client.clone();
+        let request = list_models_request(routing_key, &model_ids);
+        let mut expected_ids = expected_ids.to_vec();
+        expected_ids.sort_unstable();
+        wait_until(
+            &format!("ListModels {model_ids:?} returns {expected_ids:?}"),
+            TEST_TIMEOUT,
+            Duration::from_millis(200),
+            || {
+                let mut client = client.clone();
+                let request = request.clone();
+                let expected_ids = expected_ids.clone();
+                async move {
+                    let mut actual_ids = client
+                        .list_models(request)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .into_inner()
+                        .model_ids;
+                    actual_ids.sort_unstable();
+                    (actual_ids == expected_ids)
+                        .then_some(())
+                        .ok_or_else(|| format!("returned {actual_ids:?}"))
                 }
-                interval.tick().await;
-                continue;
-            }
-        };
+            },
+        )
+        .await;
+    }
 
-        let mut actual_ids = response
-            .model_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        actual_ids.sort_unstable();
-        if actual_ids == expected_ids {
-            return response.model_ids;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "ListModels for filters {model_ids:?} returned ids {actual_ids:?}; expected {expected_ids:?} within {}s",
-                timeout.as_secs(),
-            );
-        }
-        interval.tick().await;
+    async fn shutdown(self) {
+        drop(self.client);
+        shutdown([self.handle]).await;
     }
 }
 
 #[tokio::test]
 async fn list_models_empty_when_no_models_are_routable() {
-    init_crypto();
-
-    let (grpc_addr, model_discovery_addr, _http_addr, runtime) =
-        make_stargate_runtime_with_model_discovery("test-sg-list-empty");
-    let handle = runtime.start().await.expect("stargate failed to start");
-    let mut wrong_port_client = connect_model_discovery(grpc_addr).await;
-    let mut client = connect_model_discovery(model_discovery_addr).await;
+    let mut fixture = ModelDiscoveryFixture::start("test-sg-list-empty").await;
+    let mut wrong_port_client = StargateModelDiscoveryClient::new(
+        connect_channel(fixture.grpc_addr, "control-plane gRPC").await,
+    );
 
     let control_plane_list_models = wrong_port_client
-        .list_models(ListModelsRequest {
-            routing_key: None,
-            model_ids: vec![],
-        })
+        .list_models(ListModelsRequest::default())
         .await
         .expect_err("control-plane port should not serve ListModels");
     assert_eq!(
@@ -462,11 +414,9 @@ async fn list_models_empty_when_no_models_are_routable() {
         "ListModels must only be served on the model-discovery port"
     );
 
-    let response = client
-        .list_models(ListModelsRequest {
-            routing_key: None,
-            model_ids: vec![],
-        })
+    let response = fixture
+        .client
+        .list_models(ListModelsRequest::default())
         .await
         .expect("ListModels RPC failed")
         .into_inner();
@@ -477,319 +427,183 @@ async fn list_models_empty_when_no_models_are_routable() {
         response.model_ids
     );
 
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    drop(wrong_port_client);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
 async fn list_models_returns_filtered_active_models() {
-    init_crypto();
+    let mut fixture = ModelDiscoveryFixture::start("test-sg-list-active").await;
+    let mut alpha = fixture.register("list-backend-alpha", "list-alpha").await;
+    let mut beta = fixture.register("list-backend-beta", "list-beta").await;
 
-    let (grpc_addr, model_discovery_addr, http_addr, runtime) =
-        make_stargate_runtime_with_model_discovery("test-sg-list-active");
-    let handle = runtime.start().await.expect("stargate failed to start");
-
-    let seeds = vec![grpc_addr.to_string()];
-    let mut alpha = crate::common::start_and_register_backend(
-        &seeds,
-        "list-backend-alpha",
-        "list-alpha",
-        false,
-    )
-    .await;
-    let mut beta =
-        crate::common::start_and_register_backend(&seeds, "list-backend-beta", "list-beta", false)
-            .await;
-
-    wait_for_routing(http_addr, "list-alpha", Duration::from_secs(5)).await;
-    wait_for_routing(http_addr, "list-beta", Duration::from_secs(5)).await;
-
-    let mut client = connect_model_discovery(model_discovery_addr).await;
-    let models = wait_for_list_models(
-        &mut client,
-        None,
-        &["list-alpha"],
-        &["list-alpha"],
-        Duration::from_secs(5),
-    )
-    .await;
-
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0], "list-alpha");
-
-    let all = wait_for_list_models(
-        &mut client,
-        None,
-        &[],
-        &["list-alpha", "list-beta"],
-        Duration::from_secs(5),
-    )
-    .await;
-    let mut all_ids = all.iter().map(String::as_str).collect::<Vec<_>>();
-    all_ids.sort_unstable();
-    assert_eq!(all_ids, vec!["list-alpha", "list-beta"]);
+    assert_models!(fixture, None, ["list-alpha"], ["list-alpha"]);
+    assert_models!(fixture, None, [], ["list-alpha", "list-beta"]);
 
     alpha.stop();
-    let after_alpha_stop = wait_for_list_models(
-        &mut client,
-        None,
-        &[],
-        &["list-beta"],
-        Duration::from_secs(5),
-    )
-    .await;
-    let after_alpha_stop_ids = after_alpha_stop
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    assert_eq!(after_alpha_stop_ids, vec!["list-beta"]);
+    assert_models!(fixture, None, [], ["list-beta"]);
 
     beta.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_model_discovery_and_debug_state_follow_live_registration() {
+    let mut fixture = ModelDiscoveryFixture::start("test-sg-http-inspection").await;
+    let mut alpha = fixture
+        .register("http-inspection-backend-alpha", "http-inspection-alpha")
+        .await;
+    let mut beta = fixture
+        .register("http-inspection-backend-beta", "http-inspection-beta")
+        .await;
+
+    let grpc_models = fixture
+        .client
+        .list_models(list_models_request(
+            None,
+            &[" http-inspection-alpha ", "http-inspection-beta"],
+        ))
+        .await
+        .expect("ListModels RPC failed")
+        .into_inner()
+        .model_ids;
+
+    let model_body = get_json(
+        fixture.http_addr,
+        "/v1/models?model_ids=%20http-inspection-alpha%20&model_ids=http-inspection-beta",
+    )
+    .await;
+    assert_eq!(model_body["model_ids"], serde_json::json!(grpc_models));
+
+    let invalid_filter_response = reqwest::Client::new()
+        .get(format!(
+            "http://{}/v1/models?model_ids=%20",
+            fixture.http_addr
+        ))
+        .send()
+        .await
+        .expect("HTTP model discovery invalid-filter request failed");
+    assert_eq!(
+        invalid_filter_response.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let debug_body = get_json(fixture.http_addr, "/debug/state").await;
+    let debug_config = &debug_body["config"];
+    assert_eq!(debug_config["stargate_id"], "test-sg-http-inspection");
+    assert_eq!(debug_config["backend_connectivity"], "direct");
+    assert_eq!(
+        debug_config["http_listen_addr"],
+        fixture.http_addr.to_string()
+    );
+    assert!(
+        debug_config.get("tls_cert_pem").is_none(),
+        "debug config must contain only safe, explicit fields"
+    );
+    assert_eq!(
+        debug_body["active_model_ids"],
+        serde_json::json!(["http-inspection-alpha", "http-inspection-beta"])
+    );
+
+    alpha.stop();
+    beta.stop();
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
 async fn recent_list_models_hit_can_be_followed_by_no_candidates_404() {
-    init_crypto();
-
-    let (grpc_addr, model_discovery_addr, http_addr, runtime) =
-        make_stargate_runtime_with_model_discovery("test-sg-list-404-race");
-    let handle = runtime.start().await.expect("stargate failed to start");
-
-    let seeds = vec![grpc_addr.to_string()];
-    let mut backend = crate::common::start_and_register_backend(
-        &seeds,
-        "list-404-backend",
-        "list-404-model",
-        false,
-    )
-    .await;
-    wait_for_routing(http_addr, "list-404-model", Duration::from_secs(5)).await;
-
-    let mut client = connect_model_discovery(model_discovery_addr).await;
-    let listed = wait_for_list_models(
-        &mut client,
-        None,
-        &["list-404-model"],
-        &["list-404-model"],
-        Duration::from_secs(5),
-    )
-    .await;
-    assert_eq!(listed, vec!["list-404-model"]);
+    let mut fixture = ModelDiscoveryFixture::start("test-sg-list-404-race").await;
+    let mut backend = fixture.register("list-404-backend", "list-404-model").await;
+    assert_models!(fixture, None, ["list-404-model"], ["list-404-model"]);
 
     backend.stop();
 
     let http_client = reqwest::Client::new();
-    let stargate_url = format!("http://{http_addr}/v1/chat/completions");
+    let stargate_url = format!("http://{}/v1/chat/completions", fixture.http_addr);
     let body = serde_json::json!({
         "model": "list-404-model",
         "messages": [{"role": "user", "content": "hi"}],
         "stream": true,
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        let resp = with_proxy_headers(
-            http_client.post(&stargate_url),
-            "list-404-model",
-            "req-list-404-race",
-        )
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
+    let response = wait_until(
+        "proxy returns no-candidates 404 after recent ListModels hit",
+        TEST_TIMEOUT,
+        Duration::from_millis(50),
+        || {
+            let request = with_proxy_headers(
+                http_client.post(&stargate_url),
+                "list-404-model",
+                "req-list-404-race",
+            )
+            .header("content-type", "application/json")
+            .json(&body);
+            async move {
+                let response = request.send().await.map_err(|error| error.to_string())?;
+                (response.status() == 404)
+                    .then_some(response)
+                    .ok_or_else(|| "response was not 404".to_string())
+            }
+        },
+    )
+    .await;
+    assert_eq!(
+        response
+            .headers()
+            .get("x-stargate-error-code")
+            .and_then(|value| value.to_str().ok()),
+        Some("no_eligible_candidates"),
+        "recent ListModels hit followed by local model disappearance should return the no-candidates contract"
+    );
+    let body: serde_json::Value = response
+        .json()
         .await
-        .expect("request failed");
+        .expect("no-candidates response body should be json");
+    assert_eq!(body["code"], "no_eligible_candidates");
 
-        let status = resp.status();
-        if status == 404 {
-            assert_eq!(
-                resp.headers()
-                    .get("x-stargate-error-code")
-                    .and_then(|value| value.to_str().ok()),
-                Some("no_eligible_candidates"),
-                "recent ListModels hit followed by local model disappearance should return the no-candidates contract"
-            );
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .expect("no-candidates response body should be json");
-            assert_eq!(body["code"], "no_eligible_candidates");
-            break;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "proxy did not return no-candidates 404 after recent ListModels hit; last_status={status}"
-            );
-        }
-        interval.tick().await;
-    }
-
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
 async fn list_models_filters_by_routing_key() {
-    init_crypto();
-
     let auth = Arc::new(TokenMapAuthenticator::new([
         ("list-token-a", "rk-list-a"),
         ("list-token-b", "rk-list-b"),
     ]));
-    let (grpc_addr, model_discovery_addr, http_addr, runtime) =
-        make_stargate_runtime_with_auth_and_model_discovery("test-sg-list-rk", auth);
-    let handle = runtime.start().await.expect("stargate failed to start");
-    let seeds = vec![grpc_addr.to_string()];
+    let mut fixture = ModelDiscoveryFixture::start_with_auth("test-sg-list-rk", auth).await;
+    let mut backend_a = fixture
+        .direct_backend("list-rk-backend-a", "list-rk-model-a", "list-token-a")
+        .await;
+    let mut backend_b = fixture
+        .direct_backend("list-rk-backend-b", "list-rk-model-b", "list-token-b")
+        .await;
 
-    let (inst_addr_a, quic_url_a, _tunnel_a) = start_dummy_inst("list-rk-model-a").await;
-    let mut reg_a = InferenceServerRegistrationClient::default();
-    let _channels_a = reg_a
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds: seeds.clone(),
-                inference_server_id: "list-rk-backend-a".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url_a,
-                upstream_http_base_url: Some(format!("http://{inst_addr_a}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                // Skip calibration so the test only exercises discovery scope.
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(
-                    "list-token-a".to_string(),
-                ))),
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["list-rk-model-a".to_string()],
-        )
-        .expect("registration failed");
+    for (routing_key, model) in [
+        ("rk-list-a", "list-rk-model-a"),
+        ("rk-list-b", "list-rk-model-b"),
+    ] {
+        wait_for_routing_with_rk(fixture.http_addr, Some(routing_key), model, TEST_TIMEOUT).await;
+    }
 
-    let (inst_addr_b, quic_url_b, _tunnel_b) = start_dummy_inst("list-rk-model-b").await;
-    let mut reg_b = InferenceServerRegistrationClient::default();
-    let _channels_b = reg_b
-        .start(
-            InferenceServerRegistrationConfig {
-                seeds,
-                inference_server_id: "list-rk-backend-b".to_string(),
-                cluster_id: String::new(),
-                inference_server_url: quic_url_b,
-                upstream_http_base_url: Some(format!("http://{inst_addr_b}")),
-                min_update_interval: Duration::from_millis(100),
-                status: InferenceServerStatus::Active,
-                reverse_tunnel: false,
-                // Skip calibration so the test only exercises discovery scope.
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
-                },
-                output_token_parser_factory: OutputTokenParserFactory::vllm(),
-                request_observation_tx: None,
-                request_quality_monitor: pylon_lib::RequestQualityMonitorConfig::default(),
-                metrics: None,
-                retry: pylon_lib::PylonRetryConfig::default(),
-                queue_mismatch_retry: pylon_lib::PylonQueueMismatchRetryConfig::default(),
-                queue_tracker: pylon_lib::QueueAdmissionTracker::default(),
-                auth_token_provider: Some(Arc::new(AuthTokenProvider::Static(
-                    "list-token-b".to_string(),
-                ))),
-                quic_insecure: true,
-                tunnel_protocol: Default::default(),
-            },
-            vec!["list-rk-model-b".to_string()],
-        )
-        .expect("registration failed");
-
-    wait_for_routing_with_rk(
-        http_addr,
-        Some("rk-list-a"),
-        "list-rk-model-a",
-        Duration::from_secs(5),
-    )
-    .await;
-    wait_for_routing_with_rk(
-        http_addr,
-        Some("rk-list-b"),
-        "list-rk-model-b",
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let mut client = connect_model_discovery(model_discovery_addr).await;
-    let unscoped = wait_for_list_models(&mut client, None, &[], &[], Duration::from_secs(5)).await;
-    assert!(
-        unscoped.is_empty(),
-        "unscoped ListModels must not include keyed registrations: {unscoped:?}"
-    );
-
-    let listed_a = wait_for_list_models(
-        &mut client,
-        Some("rk-list-a"),
-        &[],
-        &["list-rk-model-a"],
-        Duration::from_secs(5),
-    )
-    .await;
-    assert_eq!(listed_a, vec!["list-rk-model-a"]);
-
-    let listed_b = wait_for_list_models(
-        &mut client,
-        Some("rk-list-b"),
-        &[],
-        &["list-rk-model-b"],
-        Duration::from_secs(5),
-    )
-    .await;
-    assert_eq!(listed_b, vec!["list-rk-model-b"]);
-
-    let wrong_key = wait_for_list_models(
-        &mut client,
-        Some("rk-list-c"),
-        &[],
-        &[],
-        Duration::from_secs(5),
-    )
-    .await;
-    assert!(
-        wrong_key.is_empty(),
-        "ListModels must not leak models across routing keys: {wrong_key:?}"
-    );
-
-    let space_padded = wait_for_list_models(
-        &mut client,
-        Some(" rk-list-a "),
-        &[" list-rk-model-a "],
-        &["list-rk-model-a"],
-        Duration::from_secs(5),
-    )
-    .await;
+    let debug_body = get_json(fixture.http_addr, "/debug/state").await;
     assert_eq!(
-        space_padded.len(),
-        1,
-        "ListModels should trim model filters like proxy headers: {:?}",
-        space_padded
+        debug_body["active_model_ids"],
+        serde_json::json!(["list-rk-model-a", "list-rk-model-b"])
     );
-    assert_eq!(space_padded[0], "list-rk-model-a");
 
-    let blank_model_filter = client
-        .list_models(ListModelsRequest {
-            routing_key: Some("rk-list-a".to_string()),
-            model_ids: vec![" ".to_string()],
-        })
+    assert_models!(fixture, None, [], []);
+    assert_models!(fixture, Some("rk-list-a"), [], ["list-rk-model-a"]);
+    assert_models!(fixture, Some("rk-list-b"), [], ["list-rk-model-b"]);
+    assert_models!(fixture, Some("rk-list-c"), [], []);
+    assert_models!(
+        fixture,
+        Some(" rk-list-a "),
+        [" list-rk-model-a "],
+        ["list-rk-model-a"]
+    );
+
+    let blank_model_filter = fixture
+        .client
+        .list_models(list_models_request(Some("rk-list-a"), &[" "]))
         .await
         .expect_err("blank model filters should be rejected");
     assert_eq!(
@@ -798,8 +612,7 @@ async fn list_models_filters_by_routing_key() {
         "blank model filters should be caller errors"
     );
 
-    reg_a.stop();
-    reg_b.stop();
-    handle.begin_shutdown();
-    handle.wait_for_shutdown(Duration::from_secs(5)).await;
+    backend_a.stop();
+    backend_b.stop();
+    fixture.shutdown().await;
 }

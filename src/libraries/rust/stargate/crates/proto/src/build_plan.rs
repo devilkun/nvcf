@@ -45,7 +45,7 @@ pub(crate) fn proto_compile_plans() -> [ProtoCompilePlan; 2] {
         ProtoCompilePlan {
             protos: &["proto/llm_gateway.proto"],
             includes: &["proto"],
-            build_server: false,
+            build_server: true,
             type_attributes: &[],
             field_attributes: &[],
         },
@@ -67,12 +67,12 @@ mod tests {
     }
 
     #[test]
-    fn gateway_plan_builds_client_only_proto() {
+    fn gateway_plan_builds_client_and_server_proto() {
         let [_, gateway_plan] = proto_compile_plans();
 
         assert_eq!(gateway_plan.protos, ["proto/llm_gateway.proto"]);
         assert_eq!(gateway_plan.includes, ["proto"]);
-        assert!(!gateway_plan.build_server);
+        assert!(gateway_plan.build_server);
         assert!(gateway_plan.type_attributes.is_empty());
         assert!(gateway_plan.field_attributes.is_empty());
     }

@@ -49,11 +49,11 @@ func (c *captureSink) Close() error { return nil }
 
 // fakeSIS is a test double for ClusterLister.
 type fakeSIS struct {
-	clusters []client.SISCluster
+	clusters []client.ICMSCluster
 	err      error
 }
 
-func (f *fakeSIS) ListClusters(_ context.Context, _, _ string) ([]client.SISCluster, error) {
+func (f *fakeSIS) ListClusters(_ context.Context, _, _ string) ([]client.ICMSCluster, error) {
 	return f.clusters, f.err
 }
 
@@ -100,7 +100,7 @@ func buildAllReadyKube(components []ComponentSpec) *fake.Clientset {
 func TestCollector_Healthy(t *testing.T) {
 	components := DefaultComponents()
 	kube := buildAllReadyKube(components)
-	sis := &fakeSIS{clusters: []client.SISCluster{{ClusterID: "cl-1", ClusterName: "ncp-local"}}}
+	sis := &fakeSIS{clusters: []client.ICMSCluster{{ClusterID: "cl-1", ClusterName: "ncp-local"}}}
 	sink := &captureSink{}
 
 	coll := &Collector{
@@ -159,7 +159,7 @@ func TestCollector_DegradedOneNotReady(t *testing.T) {
 	_, err = kube.AppsV1().StatefulSets("cassandra-system").UpdateStatus(ctx, cassandra, metav1.UpdateOptions{})
 	require.NoError(t, err)
 
-	sis := &fakeSIS{clusters: []client.SISCluster{{ClusterName: "ncp-local"}}}
+	sis := &fakeSIS{clusters: []client.ICMSCluster{{ClusterName: "ncp-local"}}}
 	sink := &captureSink{}
 
 	coll := &Collector{
@@ -270,7 +270,7 @@ func TestCollector_UnknownWinsOverDegraded(t *testing.T) {
 func TestCollector_NotFoundComponent(t *testing.T) {
 	// Use an empty kube client — no resources exist.
 	kube := fake.NewSimpleClientset()
-	sis := &fakeSIS{clusters: []client.SISCluster{{ClusterName: "ncp-local"}}}
+	sis := &fakeSIS{clusters: []client.ICMSCluster{{ClusterName: "ncp-local"}}}
 	sink := &captureSink{}
 
 	// Single component to keep the test focused. No Role → single-cluster mode.
@@ -337,7 +337,7 @@ func TestCollector_SplitClusterEmitsRoleLabels(t *testing.T) {
 
 	cpKube := buildAllReadyKube(cpComponents)
 	gpuKube := buildAllReadyKube(gpuComponents)
-	sis := &fakeSIS{clusters: []client.SISCluster{
+	sis := &fakeSIS{clusters: []client.ICMSCluster{
 		{ClusterName: "ncp-local"},
 		{ClusterName: "gpu-cluster-2"},
 	}}
@@ -409,7 +409,7 @@ func TestCollector_SplitClusterEmitsRoleLabels(t *testing.T) {
 func TestCollector_SingleClusterPreserved(t *testing.T) {
 	components := DefaultComponents()
 	kube := buildAllReadyKube(components)
-	sis := &fakeSIS{clusters: []client.SISCluster{{ClusterName: "ncp-local"}}}
+	sis := &fakeSIS{clusters: []client.ICMSCluster{{ClusterName: "ncp-local"}}}
 	sink := &captureSink{}
 
 	// Legacy single-client construction — no ControlPlaneKube/ComputePlaneKube.
@@ -446,7 +446,7 @@ func TestCollector_SplitClusterIsCurrent_ContextOnlyOnCurrent(t *testing.T) {
 	cpKube := buildAllReadyKube(controlPlaneOnlyComponents())
 	gpuKube := buildAllReadyKube(computePlaneOnlyComponents())
 
-	sis := &fakeSIS{clusters: []client.SISCluster{
+	sis := &fakeSIS{clusters: []client.ICMSCluster{
 		{ClusterName: "cluster-a"},
 		{ClusterName: "cluster-b"},
 		{ClusterName: "cluster-c"},

@@ -33,7 +33,6 @@ hickory-resolver = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 stargate-tls = { workspace = true }
 scc = { workspace = true }
 serde = { workspace = true }
@@ -53,10 +52,12 @@ prometheus = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
 stargate-auth = { workspace = true }
 stargate-forwarding = { workspace = true }
 stargate-proto = { workspace = true }
 stargate-protocol = { workspace = true }
+stargate-runtime = { workspace = true }
 stargate-telemetry = { workspace = true }
 async-stream = { workspace = true }
 url = { workspace = true }
@@ -69,7 +70,12 @@ xxhash-rust = { workspace = true }
 [dev-dependencies]
 hyper-util = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+prost = { workspace = true }
 reqwest = { workspace = true }
 serde_yaml_ng = { workspace = true }
 pylon-lib = { workspace = true }
 tempfile = { workspace = true }
+
+[build-dependencies]
+built = { version = "0.8.0", features = ["git2"] }
+git2 = { version = "0.20", default-features = false }

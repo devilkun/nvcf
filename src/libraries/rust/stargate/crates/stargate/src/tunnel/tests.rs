@@ -15,7 +15,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -26,26 +25,85 @@ use axum::{Router, body::Body};
 use futures::{StreamExt, future};
 use quinn::{ClientConfig, Connection, Endpoint};
 use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 use stargate_protocol::{
     RecvStream, SendStream, TunnelTransportProtocol, WebTransportHttpResponseHead,
 };
 
 use super::body::RequestBodySendTask;
-use super::direct::{TunnelConnection, build_client_config, build_server_config};
-use super::http3::{H3ServerConnection, should_forward_h3_tunnel_request_header};
-use super::reverse::ReverseConnectionEvents;
-use super::watcher::ConnState;
-use super::{ConnectionWatcher, EnsureConnectedResult, QuicHttpProxy, QuicTunnelConfig};
-use crate::routing_state::{RegistrationIdentity, StargateState};
+use super::connection::TunnelConnection;
+use super::endpoint::{build_client_config, build_server_config};
+use super::http3::{
+    H3ServerConnection, H3ServerRequestStream, should_forward_h3_tunnel_request_header,
+};
+use super::{
+    EnsureConnectedResult, QuicHttpProxy, QuicTunnelConfig, RegistrationTunnel, StreamingResponse,
+};
+use crate::routing_state::{
+    RegistrationGeneration, RegistrationIdentity, RunningRegistration, StargateState,
+    test_registration_generation,
+};
 use pylon_lib::{
     QuicHttpTunnelConfig, ReverseQuicTunnelConfig, start_quic_http_tunnel,
     start_reverse_quic_tunnel,
 };
+use stargate_runtime::CriticalTaskGroup;
 
 const INFERENCE_SERVER_ID: &str = "test-backend";
+
+macro_rules! tunnel_tests {
+    ($($name:ident => $helper:ident($protocol:ident $(, $argument:expr)*)),+ $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn $name() {
+                $helper(TunnelTransportProtocol::$protocol $(, $argument)*).await;
+            }
+        )+
+    };
+}
+
+tunnel_tests! {
+    direct_raw_quic_tunnel_preserves_request_head => assert_direct_tunnel_preserves_request_head(RawQuic),
+    direct_http3_tunnel_preserves_request_head => assert_direct_tunnel_preserves_request_head(Http3),
+    direct_webtransport_tunnel_preserves_request_head => assert_direct_tunnel_preserves_request_head(WebTransport),
+    direct_http3_tunnel_proxies_request_to_upstream => assert_direct_model_proxy(Http3, "req-h3-direct", "model-h3", "/v1/models?source=http3"),
+    direct_webtransport_tunnel_proxies_request_to_upstream => assert_direct_model_proxy(WebTransport, "req-wt-direct", "model-wt", "/v1/models?source=webtransport"),
+    direct_http3_response_body_survives_generation_retirement => assert_response_body_survives_generation_retirement(Http3, "req-h3-evict-body", "model-h3"),
+    direct_webtransport_response_body_survives_generation_retirement => assert_response_body_survives_generation_retirement(WebTransport, "req-wt-evict-body", "model-wt"),
+    reverse_http3_tunnel_proxies_request_to_upstream => assert_reverse_model_proxy(Http3, "req-h3-reverse", "model-h3", "/v1/models?source=reverse-http3"),
+    reverse_webtransport_tunnel_proxies_request_to_upstream => assert_reverse_model_proxy(WebTransport, "req-wt-reverse", "model-wt", "/v1/models?source=reverse-webtransport"),
+    raw_quic_tunnel_tls_configs_do_not_negotiate_alpn => assert_tunnel_alpn(RawQuic, None),
+    http3_tunnel_tls_configs_negotiate_h3_alpn => assert_tunnel_alpn(Http3, Some(b"h3".to_vec())),
+    raw_quic_tunnel_returns_body_send_error_before_header_timeout => body_send_error_is_returned_before_header_timeout(RawQuic),
+    http3_tunnel_does_not_wait_for_header_timeout_after_body_send_error => body_send_error_is_returned_before_header_timeout(Http3),
+    webtransport_tunnel_returns_body_send_error_before_header_timeout => body_send_error_is_returned_before_header_timeout(WebTransport),
+    raw_quic_tunnel_reports_body_send_error_at_response_eof => body_send_error_is_returned_at_response_eof(RawQuic),
+    http3_tunnel_reports_body_send_error_at_response_eof => body_send_error_is_returned_at_response_eof(Http3),
+    webtransport_tunnel_reports_body_send_error_at_response_eof => body_send_error_is_returned_at_response_eof(WebTransport),
+    raw_quic_tunnel_does_not_wait_forever_for_stalled_request_body_at_response_eof => stalled_body_send_does_not_block_response_eof(RawQuic),
+}
+
+fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+fn server_endpoint(server_config: quinn::ServerConfig) -> Endpoint {
+    Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap()
+}
+
+fn test_server_endpoint(
+    tunnel_protocol: TunnelTransportProtocol,
+    configure: impl FnOnce(&mut quinn::ServerConfig),
+) -> Endpoint {
+    install_crypto_provider();
+    let mut config = build_server_config(
+        &stargate_tls::ServerTlsIdentity::SelfSigned,
+        tunnel_protocol,
+    )
+    .expect("test server config should build");
+    configure(&mut config);
+    server_endpoint(config)
+}
 
 struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -57,98 +115,335 @@ impl Drop for DropNotifier {
     }
 }
 
-async fn setup_mock_backend() -> (TcpListener, String) {
+async fn spawn_mock_backend(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    (listener, format!("http://{addr}"))
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
 }
 
-async fn register_backend(state: &StargateState, id: &str, reverse_tunnel: bool) {
+fn health_backend(body: &'static str) -> Router {
+    Router::new().route("/health", get(move || async move { body }))
+}
+
+fn model_echo_backend() -> Router {
+    Router::new().route(
+        "/v1/models",
+        post(|req: Request| async move {
+            let model = req
+                .headers()
+                .get("x-model")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing")
+                .to_string();
+            let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                StatusCode::OK,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                format!(r#"{{"model":"{model}","body_len":{}}}"#, body.len()),
+            )
+        }),
+    )
+}
+
+async fn response_body(mut response: StreamingResponse) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.body_stream.recv_body().await.unwrap() {
+        body.extend_from_slice(&chunk);
+    }
+    body
+}
+
+async fn response_json(response: StreamingResponse) -> serde_json::Value {
+    serde_json::from_slice(&response_body(response).await).unwrap()
+}
+
+fn test_quic_proxy(tunnel_protocol: TunnelTransportProtocol) -> Arc<QuicHttpProxy> {
+    test_quic_proxy_with(tunnel_protocol, |_| {})
+}
+
+fn test_quic_proxy_with(
+    tunnel_protocol: TunnelTransportProtocol,
+    configure: impl FnOnce(&mut QuicTunnelConfig),
+) -> Arc<QuicHttpProxy> {
+    let mut config = QuicTunnelConfig {
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        direct_quic_connections: 1,
+        tls_cert_pem: None,
+        server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
+        server_identity_reloader: None,
+        tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
+        quic_insecure: true,
+        tunnel_protocol,
+    };
+    configure(&mut config);
+    Arc::new(
+        QuicHttpProxy::new(config, Arc::new(crate::auth::OpenAuthenticator))
+            .expect("test QUIC proxy should initialize"),
+    )
+}
+
+async fn start_test_quic_tunnel(
+    backend_url: String,
+    tunnel_protocol: TunnelTransportProtocol,
+) -> pylon_lib::QuicHttpTunnelHandle {
+    let mut config = QuicHttpTunnelConfig::new("127.0.0.1:0".parse().unwrap(), backend_url);
+    config.tunnel_protocol = tunnel_protocol;
+    start_quic_http_tunnel(config).await.unwrap()
+}
+
+fn test_request_headers(request_id: &str, model: &str, input_tokens: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-request-id", request_id.parse().unwrap());
+    headers.insert("x-model", model.parse().unwrap());
+    headers.insert("x-input-tokens", input_tokens.parse().unwrap());
+    headers
+}
+
+fn register_backend(state: &StargateState, id: &str, reverse_tunnel: bool) -> RunningRegistration {
     let identity = RegistrationIdentity {
         inference_server_id: id.to_string(),
         cluster_id: id.to_string(),
         inference_server_url: "http://127.0.0.1:1".to_string(),
         routing_key: None,
         reverse_tunnel,
-        coordinated_calibration: false,
     };
-    state.begin_registration(&identity).await.unwrap();
+    state.begin_registration(&identity).unwrap()
+}
+
+fn test_generation(
+    id: &str,
+    target_url: &str,
+    reverse_tunnel: bool,
+) -> Arc<RegistrationGeneration> {
+    test_registration_generation(RegistrationIdentity {
+        inference_server_id: id.to_string(),
+        cluster_id: id.to_string(),
+        inference_server_url: target_url.to_string(),
+        routing_key: None,
+        reverse_tunnel,
+    })
+}
+
+async fn connect_direct_registration(
+    proxy: &QuicHttpProxy,
+    target_url: &str,
+) -> Arc<RegistrationGeneration> {
+    let registration = test_generation(INFERENCE_SERVER_ID, target_url, false);
+    proxy
+        .connect_direct_registration(&registration)
+        .await
+        .expect("direct registration should connect");
+    registration
+}
+
+struct DirectTunnelFixture {
+    proxy: Arc<QuicHttpProxy>,
+    registration: Arc<RegistrationGeneration>,
+    tunnel: pylon_lib::QuicHttpTunnelHandle,
+}
+
+impl DirectTunnelFixture {
+    async fn start(app: Router, tunnel_protocol: TunnelTransportProtocol) -> Self {
+        Self::start_with_connections(app, tunnel_protocol, 1).await
+    }
+
+    async fn start_with_connections(
+        app: Router,
+        tunnel_protocol: TunnelTransportProtocol,
+        connection_count: usize,
+    ) -> Self {
+        install_crypto_provider();
+        let backend_url = spawn_mock_backend(app).await;
+        let tunnel = start_test_quic_tunnel(backend_url, tunnel_protocol).await;
+        let proxy = test_quic_proxy_with(tunnel_protocol, |config| {
+            // Keep test failures bounded below the outer harness timeout.
+            config.request_timeout = Duration::from_secs(2);
+            config.direct_quic_connections = connection_count;
+        });
+        let registration =
+            connect_direct_registration(&proxy, &format!("quic://{}", tunnel.listen_addr())).await;
+        Self {
+            proxy,
+            registration,
+            tunnel,
+        }
+    }
+
+    fn target_url(&self) -> String {
+        format!("quic://{}", self.tunnel.listen_addr())
+    }
+
+    fn assert_connection_state(&self, expected: usize, needs_replenishment: bool) {
+        let connections = self
+            .registration
+            .tunnel_connections()
+            .connection_set()
+            .expect("pooled connection");
+        assert!(connections.is_healthy());
+        assert_eq!(connections.len(), expected);
+        assert_eq!(
+            self.proxy
+                .connection_set_needs_replenishment(&self.registration),
+            needs_replenishment
+        );
+    }
+
+    async fn shutdown(self) {
+        self.tunnel.shutdown().await;
+    }
+}
+
+fn raw_connection(registration: &RegistrationGeneration, index: usize) -> Connection {
+    match registration
+        .tunnel_connections()
+        .connection_set()
+        .expect("pooled connection")
+        .connection(index)
+    {
+        TunnelConnection::RawQuic(handle) => handle.connection().clone(),
+        TunnelConnection::Http3(_) | TunnelConnection::WebTransport(_) => {
+            panic!("expected raw QUIC tunnel connection")
+        }
+    }
+}
+
+fn own_reverse_registration(
+    proxy: Arc<QuicHttpProxy>,
+    registration: &RunningRegistration,
+) -> RegistrationTunnel {
+    RegistrationTunnel::reverse(proxy, registration.generation(), Duration::from_millis(100))
 }
 
 async fn start_tunnel_server(
     state: Arc<StargateState>,
-) -> (Arc<QuicHttpProxy>, SocketAddr, CancellationToken) {
-    start_tunnel_server_with_insecure(state, true, TunnelTransportProtocol::Custom).await
-}
-
-async fn start_tunnel_server_with_insecure(
-    state: Arc<StargateState>,
-    quic_insecure: bool,
     tunnel_protocol: TunnelTransportProtocol,
-) -> (Arc<QuicHttpProxy>, SocketAddr, CancellationToken) {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let proxy = Arc::new(
-        QuicHttpProxy::new(
-            QuicTunnelConfig {
-                connect_timeout: Duration::from_secs(5),
-                request_timeout: Duration::from_secs(5),
-                direct_quic_connections: 1,
-                tls_cert_pem: None,
-                server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-                quic_insecure,
-                tunnel_protocol,
-            },
-            Arc::new(crate::auth::OpenAuthenticator),
-        )
-        .expect("test QUIC proxy should initialize"),
-    );
-    let shutdown = CancellationToken::new();
+) -> (Arc<QuicHttpProxy>, SocketAddr, CriticalTaskGroup) {
+    install_crypto_provider();
+    let proxy = test_quic_proxy(tunnel_protocol);
+    let (tasks, _failures) = CriticalTaskGroup::new("stargate test");
     let addr = proxy
         .start_reverse_listener(
-            "127.0.0.1:0".parse().expect("valid test listen address"),
             state,
-            shutdown.clone(),
-            TaskTracker::new(),
+            tasks.clone(),
             None,
-            None,
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("reverse listener socket should bind"),
+            crate::metrics::StargateMetrics::new().expect("metrics should initialize"),
         )
         .await
         .expect("reverse listener should start");
-    (proxy, addr, shutdown)
+    (proxy, addr, tasks)
+}
+
+#[cfg(unix)]
+fn install_projected_identity(root: &std::path::Path, generation: &str, cert: &[u8], key: &[u8]) {
+    use std::os::unix::fs::symlink;
+
+    let generation_dir = root.join(generation);
+    std::fs::create_dir(&generation_dir).expect("create projected generation");
+    std::fs::write(generation_dir.join("tls.crt"), cert).expect("write projected cert");
+    std::fs::write(generation_dir.join("tls.key"), key).expect("write projected key");
+
+    let next_data = root.join("..data-next");
+    let _ = std::fs::remove_file(&next_data);
+    symlink(generation, &next_data).expect("create projected data symlink");
+    std::fs::rename(next_data, root.join("..data")).expect("swap projected data symlink");
+
+    if !root.join("tls.crt").exists() {
+        symlink("..data/tls.crt", root.join("tls.crt")).expect("create projected cert symlink");
+        symlink("..data/tls.key", root.join("tls.key")).expect("create projected key symlink");
+    }
+}
+
+#[cfg(unix)]
+async fn reverse_handshake_trusting(addr: SocketAddr, trusted_cert_pem: &[u8]) -> Result<()> {
+    let mut client = Endpoint::client("127.0.0.1:0".parse().expect("client bind address"))?;
+    client.set_default_client_config(build_client_config(
+        Some(trusted_cert_pem),
+        false,
+        TunnelTransportProtocol::RawQuic,
+    )?);
+    let connection = client.connect(addr, "localhost")?.await?;
+    connection.close(0u32.into(), b"test complete");
+    Ok(())
+}
+
+/// Covers the reverse-listener wiring: the reload task is spawned with a builder
+/// that reproduces the listener ALPN, so a rotated generation serves on new
+/// handshakes without restarting the process.
+#[cfg(unix)]
+#[tokio::test]
+async fn reverse_listener_reloads_projected_server_identity() {
+    install_crypto_provider();
+    let root = tempfile::TempDir::new().expect("create TLS test directory");
+    let (first_cert, first_key) =
+        stargate_tls::generate_self_signed_cert().expect("first identity should generate");
+    let (second_cert, second_key) =
+        stargate_tls::generate_self_signed_cert().expect("second identity should generate");
+    install_projected_identity(root.path(), "..2026_01", &first_cert, &first_key);
+
+    let reloader = stargate_tls::ServerIdentityReloader::load(
+        root.path().join("tls.crt"),
+        root.path().join("tls.key"),
+    )
+    .expect("initial identity should load");
+    let proxy = test_quic_proxy_with(TunnelTransportProtocol::RawQuic, |config| {
+        config.server_tls_identity = reloader.current_identity().clone();
+        config.tls_cert_pem = Some(first_cert.clone());
+        config.server_identity_reloader = Some(reloader.clone());
+        config.tls_reload_interval = Duration::from_millis(20);
+        config.quic_insecure = false;
+    });
+    let (tasks, _failures) = CriticalTaskGroup::new("stargate test");
+    let metrics = crate::metrics::StargateMetrics::new().expect("metrics should initialize");
+    let addr = proxy
+        .start_reverse_listener(
+            Arc::new(StargateState::new()),
+            tasks.clone(),
+            None,
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("reverse listener socket should bind"),
+            metrics.clone(),
+        )
+        .await
+        .expect("reverse listener should start");
+
+    reverse_handshake_trusting(addr, &first_cert)
+        .await
+        .expect("initial identity should serve");
+
+    install_projected_identity(root.path(), "..2026_02", &second_cert, &second_key);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if reverse_handshake_trusting(addr, &second_cert).await.is_ok() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rotated identity was never served"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        reverse_handshake_trusting(addr, &first_cert).await.is_err(),
+        "the replaced identity must stop being served"
+    );
+    assert!(
+        metrics.tls_identity_is_ready(),
+        "a valid rotated identity keeps the listener ready"
+    );
+
+    tasks.begin_shutdown();
 }
 
 #[tokio::test]
 async fn reverse_listener_shutdown_waits_for_stalled_dispatch_task() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let state = Arc::new(StargateState::new());
-    let proxy = Arc::new(
-        QuicHttpProxy::new(
-            QuicTunnelConfig {
-                connect_timeout: Duration::from_secs(5),
-                request_timeout: Duration::from_secs(5),
-                tls_cert_pem: None,
-                server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-                quic_insecure: true,
-                tunnel_protocol: TunnelTransportProtocol::Custom,
-                direct_quic_connections: 1,
-            },
-            Arc::new(crate::auth::OpenAuthenticator),
-        )
-        .expect("test QUIC proxy should initialize"),
-    );
-    let shutdown = CancellationToken::new();
-    let task_tracker = TaskTracker::new();
-    let addr = proxy
-        .start_reverse_listener(
-            "127.0.0.1:0".parse().expect("valid test listen address"),
-            state,
-            shutdown.clone(),
-            task_tracker.clone(),
-            None,
-            None,
-        )
-        .await
-        .expect("reverse listener should start");
+    let (_proxy, addr, tasks) = start_tunnel_server(state, TunnelTransportProtocol::RawQuic).await;
 
     let mut client_endpoint = Endpoint::client(
         "127.0.0.1:0"
@@ -157,7 +452,7 @@ async fn reverse_listener_shutdown_waits_for_stalled_dispatch_task() {
     )
     .expect("client endpoint should start");
     client_endpoint.set_default_client_config(
-        build_client_config(None, true, TunnelTransportProtocol::Custom).expect("client config"),
+        build_client_config(None, true, TunnelTransportProtocol::RawQuic).expect("client config"),
     );
     let connection = client_endpoint
         .connect(addr, "stargate")
@@ -165,9 +460,8 @@ async fn reverse_listener_shutdown_waits_for_stalled_dispatch_task() {
         .await
         .expect("reverse listener accepts connection");
 
-    shutdown.cancel();
-    task_tracker.close();
-    tokio::time::timeout(Duration::from_secs(2), task_tracker.wait())
+    tasks.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(2), tasks.wait())
         .await
         .expect("tracked reverse listener tasks should exit on shutdown");
     tokio::time::timeout(Duration::from_secs(2), connection.closed())
@@ -180,7 +474,7 @@ async fn negotiate_alpn(
     client_config: ClientConfig,
     server_config: quinn::ServerConfig,
 ) -> Option<Vec<u8>> {
-    let server_endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_endpoint = server_endpoint(server_config);
     let server_addr = server_endpoint.local_addr().unwrap();
     let server_task = tokio::spawn(async move {
         let incoming = server_endpoint.accept().await.unwrap();
@@ -204,54 +498,26 @@ async fn negotiate_alpn(
     server_task.await.unwrap()
 }
 
-#[tokio::test]
-async fn custom_tunnel_tls_configs_do_not_negotiate_alpn() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let client_config =
-        build_client_config(None, true, TunnelTransportProtocol::Custom).expect("client config");
+async fn assert_tunnel_alpn(tunnel_protocol: TunnelTransportProtocol, expected: Option<Vec<u8>>) {
+    install_crypto_provider();
+    let client_config = build_client_config(None, true, tunnel_protocol).expect("client config");
     let server_config = build_server_config(
         &stargate_tls::ServerTlsIdentity::SelfSigned,
-        TunnelTransportProtocol::Custom,
+        tunnel_protocol,
     )
     .expect("server config");
-
-    assert_eq!(negotiate_alpn(client_config, server_config).await, None);
-}
-
-#[tokio::test]
-async fn http3_tunnel_tls_configs_negotiate_h3_alpn() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let client_config =
-        build_client_config(None, true, TunnelTransportProtocol::Http3).expect("client config");
-    let server_config = build_server_config(
-        &stargate_tls::ServerTlsIdentity::SelfSigned,
-        TunnelTransportProtocol::Http3,
-    )
-    .expect("server config");
-
-    assert_eq!(
-        negotiate_alpn(client_config, server_config).await,
-        Some(b"h3".to_vec())
-    );
+    assert_eq!(negotiate_alpn(client_config, server_config).await, expected);
 }
 
 async fn connect_reverse_tunnel(
     listener_addr: SocketAddr,
     backend_url: &str,
 ) -> pylon_lib::ReverseQuicTunnelHandle {
-    connect_reverse_tunnel_insecure(listener_addr, backend_url, INFERENCE_SERVER_ID).await
-}
-
-async fn connect_reverse_tunnel_insecure(
-    listener_addr: SocketAddr,
-    backend_url: &str,
-    server_id: &str,
-) -> pylon_lib::ReverseQuicTunnelHandle {
     connect_reverse_tunnel_insecure_with_protocol(
         listener_addr,
         backend_url,
-        server_id,
-        TunnelTransportProtocol::Custom,
+        INFERENCE_SERVER_ID,
+        TunnelTransportProtocol::RawQuic,
     )
     .await
 }
@@ -262,47 +528,171 @@ async fn connect_reverse_tunnel_insecure_with_protocol(
     server_id: &str,
     tunnel_protocol: TunnelTransportProtocol,
 ) -> pylon_lib::ReverseQuicTunnelHandle {
-    let mut config = ReverseQuicTunnelConfig::new(
-        format!("127.0.0.1:{}", listener_addr.port()),
-        server_id.to_string(),
-        backend_url.to_string(),
-    );
+    let mut config = reverse_tunnel_config(listener_addr, server_id, backend_url.to_string());
     config.quic_insecure = true;
     config.tunnel_protocol = tunnel_protocol;
     start_reverse_quic_tunnel(config).await.unwrap()
 }
 
-#[tokio::test]
-async fn reverse_connection_events_wait_until_wakes_existing_waiters() {
-    let events = ReverseConnectionEvents::new();
-    let connected = Arc::new(AtomicBool::new(false));
+fn reverse_tunnel_config(
+    listener_addr: SocketAddr,
+    server_id: &str,
+    backend_url: String,
+) -> ReverseQuicTunnelConfig {
+    ReverseQuicTunnelConfig::new(
+        format!("127.0.0.1:{}", listener_addr.port()),
+        server_id.to_string(),
+        backend_url,
+    )
+}
 
-    let wait = tokio::spawn({
-        let events = events.clone();
-        let connected = connected.clone();
-        async move {
-            events
-                .wait_until(Duration::from_secs(1), move || {
-                    let connected = connected.clone();
-                    async move { connected.load(Ordering::SeqCst) }
-                })
-                .await
-        }
-    });
-    tokio::task::yield_now().await;
-    connected.store(true, Ordering::SeqCst);
-    events.notify_changed();
+struct ReverseTunnelFixture {
+    proxy: Arc<QuicHttpProxy>,
+    generation: Arc<RegistrationGeneration>,
+    addr: SocketAddr,
+    handle: pylon_lib::ReverseQuicTunnelHandle,
+    runtime: CriticalTaskGroup,
+    _owner: RegistrationTunnel,
+}
 
-    let woke = tokio::time::timeout(Duration::from_millis(50), wait)
+impl ReverseTunnelFixture {
+    async fn start(app: Router, tunnel_protocol: TunnelTransportProtocol) -> Self {
+        let backend_url = spawn_mock_backend(app).await;
+        let state = Arc::new(StargateState::new());
+        let registration = register_backend(&state, INFERENCE_SERVER_ID, true);
+        let generation = registration.generation();
+        let (proxy, addr, runtime) = start_tunnel_server(state, tunnel_protocol).await;
+        let owner = own_reverse_registration(proxy.clone(), &registration);
+        let handle = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_reverse_tunnel_insecure_with_protocol(
+                addr,
+                &backend_url,
+                INFERENCE_SERVER_ID,
+                tunnel_protocol,
+            ),
+        )
         .await
-        .expect("reverse connection event should wake promptly")
-        .expect("wait task should complete");
-    assert!(woke);
+        .expect("reverse tunnel handshake timed out");
+        assert!(
+            proxy
+                .await_reverse_connection(generation.clone(), Duration::from_secs(2))
+                .await
+        );
+        Self {
+            proxy,
+            generation,
+            addr,
+            handle,
+            runtime,
+            _owner: owner,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.handle.shutdown().await;
+        self.runtime.begin_shutdown();
+    }
+}
+
+async fn assert_model_proxy(
+    proxy: &QuicHttpProxy,
+    generation: &Arc<RegistrationGeneration>,
+    request_id: &str,
+    model: &str,
+    path: &str,
+) {
+    let response = post_model_json(proxy, generation, request_id, model, path)
+        .await
+        .unwrap();
+    assert_model_echo(response, model).await;
+}
+
+async fn assert_direct_model_proxy(
+    tunnel_protocol: TunnelTransportProtocol,
+    request_id: &str,
+    model: &str,
+    path: &str,
+) {
+    let fixture = DirectTunnelFixture::start(model_echo_backend(), tunnel_protocol).await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        assert_model_proxy(
+            &fixture.proxy,
+            &fixture.registration,
+            request_id,
+            model,
+            path,
+        ),
+    )
+    .await;
+    assert!(response.is_ok(), "direct proxy request timed out");
+    fixture.shutdown().await;
+}
+
+async fn assert_reverse_model_proxy(
+    tunnel_protocol: TunnelTransportProtocol,
+    request_id: &str,
+    model: &str,
+    path: &str,
+) {
+    let fixture = ReverseTunnelFixture::start(model_echo_backend(), tunnel_protocol).await;
+    assert_model_proxy(&fixture.proxy, &fixture.generation, request_id, model, path).await;
+    fixture.shutdown().await;
+}
+
+async fn post_model_json(
+    proxy: &QuicHttpProxy,
+    generation: &Arc<RegistrationGeneration>,
+    request_id: &str,
+    model: &str,
+    path: &str,
+) -> anyhow::Result<StreamingResponse> {
+    let mut headers = test_request_headers(request_id, model, "7");
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    proxy
+        .proxy_request_streaming(
+            generation,
+            Method::POST,
+            path,
+            headers,
+            Body::from(r#"{"ping":true}"#),
+        )
+        .await
+}
+
+async fn post_chat(
+    proxy: &QuicHttpProxy,
+    generation: &Arc<RegistrationGeneration>,
+    headers: HeaderMap,
+    body: Body,
+) -> anyhow::Result<StreamingResponse> {
+    proxy
+        .proxy_request_streaming(
+            generation,
+            Method::POST,
+            "/v1/chat/completions",
+            headers,
+            body,
+        )
+        .await
+}
+
+async fn assert_model_echo(response: StreamingResponse, model: &str) {
+    assert_eq!(response.status, StatusCode::OK);
+    let payload = response_json(response).await;
+    assert_eq!(
+        payload.get("model").and_then(serde_json::Value::as_str),
+        Some(model)
+    );
+    assert_eq!(
+        payload.get("body_len").and_then(serde_json::Value::as_u64),
+        Some(13)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_tunnel_proxies_request_to_upstream() {
-    let (listener, backend_url) = setup_mock_backend().await;
     let app = Router::new().route(
         "/v1/models",
         get(|req: Request| async move {
@@ -315,29 +705,13 @@ async fn reverse_tunnel_proxies_request_to_upstream() {
             (StatusCode::OK, format!(r#"{{"model":"{echo}"}}"#))
         }),
     );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let fixture = ReverseTunnelFixture::start(app, TunnelTransportProtocol::RawQuic).await;
 
-    let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (proxy, addr, shutdown) = start_tunnel_server(state).await;
-
-    let handle = connect_reverse_tunnel(addr, &backend_url).await;
-    assert!(
-        proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
-            .await
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-1".parse().unwrap());
-    headers.insert("x-model", "test-model".parse().unwrap());
-    headers.insert("x-input-tokens", "5".parse().unwrap());
-
-    let response = proxy
+    let headers = test_request_headers("req-1", "test-model", "5");
+    let response = fixture
+        .proxy
         .proxy_request_streaming(
-            INFERENCE_SERVER_ID,
+            &fixture.generation,
             Method::GET,
             "/v1/models",
             headers,
@@ -347,349 +721,136 @@ async fn reverse_tunnel_proxies_request_to_upstream() {
         .unwrap();
 
     assert_eq!(response.status, StatusCode::OK);
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let payload = response_json(response).await;
     assert_eq!(
         payload.get("model").and_then(serde_json::Value::as_str),
         Some("test-model")
     );
 
-    handle.shutdown().await;
-    shutdown.cancel();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reverse_http3_tunnel_proxies_request_to_upstream() {
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route(
-        "/v1/models",
-        post(|req: Request| async move {
-            let model = req
-                .headers()
-                .get("x-model")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("missing")
-                .to_string();
-            let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            (
-                StatusCode::OK,
-                [(http::header::CONTENT_TYPE, "application/json")],
-                format!(r#"{{"model":"{model}","body_len":{}}}"#, body.len()),
-            )
-        }),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (proxy, addr, shutdown) =
-        start_tunnel_server_with_insecure(state, true, TunnelTransportProtocol::Http3).await;
-
-    let handle = tokio::time::timeout(
-        Duration::from_secs(3),
-        connect_reverse_tunnel_insecure_with_protocol(
-            addr,
-            &backend_url,
-            INFERENCE_SERVER_ID,
-            TunnelTransportProtocol::Http3,
-        ),
-    )
-    .await
-    .expect("http3 reverse tunnel handshake timed out");
-    assert!(
-        proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
-            .await
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-h3-reverse".parse().unwrap());
-    headers.insert("x-model", "model-h3".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
-    headers.insert("content-type", "application/json".parse().unwrap());
-
-    let response = proxy
-        .proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/models?source=reverse-http3",
-            headers,
-            Body::from(r#"{"ping":true}"#),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status, StatusCode::OK);
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        payload.get("model").and_then(serde_json::Value::as_str),
-        Some("model-h3")
-    );
-    assert_eq!(
-        payload.get("body_len").and_then(serde_json::Value::as_u64),
-        Some(13)
-    );
-
-    handle.shutdown().await;
-    shutdown.cancel();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reverse_webtransport_tunnel_proxies_request_to_upstream() {
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route(
-        "/v1/models",
-        post(|req: Request| async move {
-            let model = req
-                .headers()
-                .get("x-model")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("missing")
-                .to_string();
-            let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            (
-                StatusCode::OK,
-                [(http::header::CONTENT_TYPE, "application/json")],
-                format!(r#"{{"model":"{model}","body_len":{}}}"#, body.len()),
-            )
-        }),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (proxy, addr, shutdown) =
-        start_tunnel_server_with_insecure(state, true, TunnelTransportProtocol::WebTransport).await;
-
-    let handle = tokio::time::timeout(
-        Duration::from_secs(3),
-        connect_reverse_tunnel_insecure_with_protocol(
-            addr,
-            &backend_url,
-            INFERENCE_SERVER_ID,
-            TunnelTransportProtocol::WebTransport,
-        ),
-    )
-    .await
-    .expect("webtransport reverse tunnel handshake timed out");
-    assert!(
-        proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
-            .await
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-wt-reverse".parse().unwrap());
-    headers.insert("x-model", "model-wt".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
-    headers.insert("content-type", "application/json".parse().unwrap());
-
-    let response = proxy
-        .proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/models?source=reverse-webtransport",
-            headers,
-            Body::from(r#"{"ping":true}"#),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status, StatusCode::OK);
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        payload.get("model").and_then(serde_json::Value::as_str),
-        Some("model-wt")
-    );
-    assert_eq!(
-        payload.get("body_len").and_then(serde_json::Value::as_u64),
-        Some(13)
-    );
-
-    handle.shutdown().await;
-    shutdown.cancel();
+    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_webtransport_stalled_stream_header_does_not_block_later_requests() {
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route(
-        "/v1/models",
-        post(|req: Request| async move {
-            let model = req
-                .headers()
-                .get("x-model")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("missing")
-                .to_string();
-            let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            (
-                StatusCode::OK,
-                [(http::header::CONTENT_TYPE, "application/json")],
-                format!(r#"{{"model":"{model}","body_len":{}}}"#, body.len()),
-            )
-        }),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let fixture =
+        ReverseTunnelFixture::start(model_echo_backend(), TunnelTransportProtocol::WebTransport)
+            .await;
+    let webtransport = match fixture
+        .generation
+        .tunnel_connections()
+        .connection_set()
+        .expect("pooled connection")
+        .choose_healthy()
+        .expect("healthy connection")
+    {
+        TunnelConnection::WebTransport(handle) => handle.clone(),
+        TunnelConnection::RawQuic(_) | TunnelConnection::Http3(_) => {
+            panic!("expected WebTransport tunnel connection")
+        }
+    };
+    let (_stalled_send, _stalled_recv) = webtransport.connection().open_bi().await.unwrap();
 
-    let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (proxy, addr, shutdown) =
-        start_tunnel_server_with_insecure(state, true, TunnelTransportProtocol::WebTransport).await;
-
-    let handle = tokio::time::timeout(
+    let response = tokio::time::timeout(
         Duration::from_secs(3),
-        connect_reverse_tunnel_insecure_with_protocol(
-            addr,
-            &backend_url,
-            INFERENCE_SERVER_ID,
-            TunnelTransportProtocol::WebTransport,
+        post_model_json(
+            &fixture.proxy,
+            &fixture.generation,
+            "req-wt-after-stalled",
+            "model-wt",
+            "/v1/models?source=reverse-webtransport-stalled",
         ),
     )
     .await
-    .expect("webtransport reverse tunnel handshake timed out");
-    assert!(
-        proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
-            .await
+    .expect("request after stalled WebTransport stream timed out")
+    .unwrap();
+    assert_model_echo(response, "model-wt").await;
+    fixture.shutdown().await;
+}
+
+async fn assert_direct_tunnel_preserves_request_head(tunnel_protocol: TunnelTransportProtocol) {
+    let app = Router::new().route(
+        "/v1/models",
+        post(|req: Request| async move {
+            let method = req.method().to_string();
+            let path_and_query = req
+                .uri()
+                .path_and_query()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let repeated_headers = req
+                .headers()
+                .get_all("x-boundary-value")
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .expect("test header should be ascii")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .expect("read test request body");
+            (
+                StatusCode::OK,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "method": method,
+                    "path_and_query": path_and_query,
+                    "repeated_headers": repeated_headers,
+                    "body": String::from_utf8(body.to_vec()).expect("test body should be utf-8"),
+                })
+                .to_string(),
+            )
+        }),
     );
+    let fixture = DirectTunnelFixture::start(app, tunnel_protocol).await;
 
-    {
-        let webtransport = {
-            let pool = proxy.pool.read().await;
-            match pool
-                .get(INFERENCE_SERVER_ID)
-                .expect("pooled connection")
-                .choose_healthy()
-                .expect("healthy connection")
-            {
-                TunnelConnection::WebTransport(handle) => handle.clone(),
-                TunnelConnection::Custom(_) | TunnelConnection::Http3(_) => {
-                    panic!("expected WebTransport tunnel connection")
-                }
-            }
-        };
-        let (_stalled_send, _stalled_recv) = webtransport.connection.open_bi().await.unwrap();
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-request-id", "req-wt-after-stalled".parse().unwrap());
-        headers.insert("x-model", "model-wt".parse().unwrap());
-        headers.insert("x-input-tokens", "7".parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-
-        let response = tokio::time::timeout(
-            Duration::from_secs(3),
-            proxy.proxy_request_streaming(
-                INFERENCE_SERVER_ID,
-                Method::POST,
-                "/v1/models?source=reverse-webtransport-stalled",
-                headers,
-                Body::from(r#"{"ping":true}"#),
-            ),
+    let mut headers = test_request_headers("req-protocol-boundary", "model-boundary", "7");
+    headers.insert("content-type", "application/json".parse().unwrap());
+    headers.append("x-boundary-value", "one".parse().unwrap());
+    headers.append("x-boundary-value", "two".parse().unwrap());
+    let response = fixture
+        .proxy
+        .proxy_request_streaming(
+            &fixture.registration,
+            Method::POST,
+            "/v1/models?source=protocol-boundary",
+            headers,
+            Body::from(r#"{"ping":true}"#),
         )
         .await
-        .expect("request after stalled WebTransport stream timed out")
         .unwrap();
-
-        assert_eq!(response.status, StatusCode::OK);
-        let mut body = Vec::new();
-        let mut stream = response.body_stream;
-        while let Some(chunk) = stream.recv_body().await.unwrap() {
-            body.extend_from_slice(&chunk);
-        }
-        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            payload.get("model").and_then(serde_json::Value::as_str),
-            Some("model-wt")
-        );
-        assert_eq!(
-            payload.get("body_len").and_then(serde_json::Value::as_u64),
-            Some(13)
-        );
-    }
-
-    handle.shutdown().await;
-    shutdown.cancel();
+    assert_eq!(response.status, StatusCode::OK);
+    let payload = response_json(response).await;
+    assert_eq!(payload["method"], "POST");
+    assert_eq!(
+        payload["path_and_query"],
+        "/v1/models?source=protocol-boundary"
+    );
+    assert_eq!(
+        payload["repeated_headers"],
+        serde_json::json!(["one", "two"])
+    );
+    assert_eq!(payload["body"], r#"{"ping":true}"#);
+    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_preconnect_installs_configured_connection_set() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let tunnel = start_quic_http_tunnel(QuicHttpTunnelConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        backend_url,
-    ))
-    .await
-    .unwrap();
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(2),
-            direct_quic_connections: 3,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::Custom,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
+async fn direct_connect_installs_configured_connection_set() {
+    let fixture = DirectTunnelFixture::start_with_connections(
+        health_backend("ok"),
+        TunnelTransportProtocol::RawQuic,
+        3,
     )
-    .unwrap();
+    .await;
+    fixture.assert_connection_state(3, false);
 
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
-
-    let connection_count = {
-        let pool = proxy.pool.read().await;
-        let connection_set = pool.get(INFERENCE_SERVER_ID).expect("pooled connection");
-        assert!(connection_set.is_healthy());
-        connection_set.len()
-    };
-    assert_eq!(connection_count, 3);
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-direct-set".parse().unwrap());
-    headers.insert("x-model", "model-direct-set".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
-    let response = proxy
+    let headers = test_request_headers("req-direct-set", "model-direct-set", "7");
+    let response = fixture
+        .proxy
         .proxy_request_streaming(
-            INFERENCE_SERVER_ID,
+            &fixture.registration,
             Method::GET,
             "/health",
             headers,
@@ -700,132 +861,184 @@ async fn direct_preconnect_installs_configured_connection_set() {
 
     assert_eq!(response.status, StatusCode::OK);
 
-    let first_connection = {
-        let pool = proxy.pool.read().await;
-        let connection_set = pool.get(INFERENCE_SERVER_ID).expect("pooled connection");
-        match &connection_set.inner.connections[0] {
-            TunnelConnection::Custom(connection) => connection.clone(),
-            TunnelConnection::Http3(_) | TunnelConnection::WebTransport(_) => {
-                panic!("expected custom tunnel connection")
-            }
-        }
-    };
-    first_connection.close(0u32.into(), b"test partial direct set close");
-    assert!(
-        proxy.has_healthy_connection(INFERENCE_SERVER_ID).await,
-        "partial direct connection set should remain usable"
-    );
-    assert!(
-        proxy
-            .connection_set_needs_replenishment(INFERENCE_SERVER_ID)
-            .await,
-        "partial direct connection set should request replenishment"
-    );
+    raw_connection(&fixture.registration, 0).close(0u32.into(), b"test partial direct set close");
+    fixture.assert_connection_state(3, true);
 
-    proxy
-        .reconnect_direct(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
+    fixture
+        .proxy
+        .connect_direct_registration(&fixture.registration)
         .await
         .unwrap();
-    assert!(proxy.has_healthy_connection(INFERENCE_SERVER_ID).await);
-    assert!(
-        !proxy
-            .connection_set_needs_replenishment(INFERENCE_SERVER_ID)
-            .await
-    );
-    tunnel.shutdown().await;
+    fixture.assert_connection_state(3, false);
+    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connection_watcher_replenishes_partial_direct_connection_set() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+async fn reverse_install_capability_commits_its_exact_registration() {
+    let fixture =
+        DirectTunnelFixture::start(health_backend("ok"), TunnelTransportProtocol::RawQuic).await;
+    let connection = fixture
+        .registration
+        .tunnel_connections()
+        .connection_set()
+        .expect("source connection set")
+        .choose_healthy()
+        .expect("source healthy connection");
 
-    let tunnel = start_quic_http_tunnel(QuicHttpTunnelConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        backend_url,
-    ))
-    .await
-    .unwrap();
-    let proxy = Arc::new(
-        QuicHttpProxy::new(
-            QuicTunnelConfig {
-                connect_timeout: Duration::from_secs(5),
-                request_timeout: Duration::from_secs(2),
-                direct_quic_connections: 2,
-                tls_cert_pem: None,
-                server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-                quic_insecure: true,
-                tunnel_protocol: TunnelTransportProtocol::Custom,
-            },
-            Arc::new(crate::auth::OpenAuthenticator),
+    let target = test_generation("reverse-install-target", "http://127.0.0.1:1", true);
+    let abandoned = target
+        .begin_reverse_connection_install()
+        .expect("reverse install capability");
+    // Dropping an uncommitted capability must restore install availability.
+    drop(abandoned);
+    let install = target
+        .begin_reverse_connection_install()
+        .expect("replacement reverse install capability");
+
+    assert!(install.finish(connection));
+    assert!(target.tunnel_connections().has_healthy_connection());
+    assert!(
+        target.begin_reverse_connection_install().is_none(),
+        "healthy exact registration should reject another reverse install"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_generation_cannot_open_request_through_replacement_tunnel() {
+    let fixture =
+        DirectTunnelFixture::start(health_backend("ok"), TunnelTransportProtocol::RawQuic).await;
+    let stale_generation = fixture.registration.clone();
+    let mut stale_owner =
+        RegistrationTunnel::direct(fixture.proxy.clone(), stale_generation.clone());
+    assert!(matches!(
+        stale_owner.ensure_connected().await,
+        EnsureConnectedResult::Connected
+    ));
+    // Retire the stale generation before connecting its same-ID replacement.
+    drop(stale_owner);
+    let replacement_generation = test_generation(INFERENCE_SERVER_ID, &fixture.target_url(), false);
+    let mut replacement_owner =
+        RegistrationTunnel::direct(fixture.proxy.clone(), replacement_generation.clone());
+    assert!(matches!(
+        replacement_owner.ensure_connected().await,
+        EnsureConnectedResult::Connected
+    ));
+
+    let headers = test_request_headers("req-exact-generation", "model-exact-generation", "0");
+    let stale_result = fixture
+        .proxy
+        .proxy_request_streaming(
+            &stale_generation,
+            Method::GET,
+            "/health",
+            headers.clone(),
+            Body::empty(),
         )
-        .unwrap(),
-    );
-
-    let target_url = format!("quic://{}", tunnel.listen_addr());
-    let mut watcher = ConnectionWatcher::new(proxy.clone(), Duration::from_millis(100));
-    let result = watcher
-        .ensure_connected(INFERENCE_SERVER_ID, &target_url, false)
         .await;
-    assert!(matches!(result, EnsureConnectedResult::Connected));
-
-    let first_connection = {
-        let pool = proxy.pool.read().await;
-        let connection_set = pool.get(INFERENCE_SERVER_ID).expect("pooled connection");
-        assert_eq!(connection_set.len(), 2);
-        match &connection_set.inner.connections[0] {
-            TunnelConnection::Custom(connection) => connection.clone(),
-            TunnelConnection::Http3(_) | TunnelConnection::WebTransport(_) => {
-                panic!("expected custom tunnel connection")
-            }
-        }
-    };
-    first_connection.close(0u32.into(), b"test watcher direct replenish");
     assert!(
-        proxy.has_healthy_connection(INFERENCE_SERVER_ID).await,
-        "partial direct connection set should stay usable before replenishment"
+        stale_result.is_err(),
+        "stale registration generation must not borrow replacement tunnel"
     );
-    assert!(
+
+    let replacement_response = fixture
+        .proxy
+        .proxy_request_streaming(
+            &replacement_generation,
+            Method::GET,
+            "/health",
+            headers,
+            Body::empty(),
+        )
+        .await
+        .expect("replacement registration should own its tunnel");
+    assert_eq!(replacement_response.status, StatusCode::OK);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_registration_tunnel_cannot_be_reclaimed() {
+    let fixture =
+        DirectTunnelFixture::start(health_backend("ok"), TunnelTransportProtocol::RawQuic).await;
+    let registration = fixture.registration.clone();
+    let mut owner = RegistrationTunnel::direct(fixture.proxy.clone(), registration.clone());
+    assert!(matches!(
+        owner.ensure_connected().await,
+        EnsureConnectedResult::Connected
+    ));
+
+    // Retire this generation so a later owner cannot reclaim its tunnel.
+    drop(owner);
+
+    let mut stale_owner = RegistrationTunnel::direct(fixture.proxy.clone(), registration);
+    assert!(matches!(
+        stale_owner.ensure_connected().await,
+        EnsureConnectedResult::Unavailable
+    ));
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn reverse_connection_wait_finishes_when_registration_tunnel_retires() {
+    install_crypto_provider();
+    let proxy = test_quic_proxy_with(TunnelTransportProtocol::RawQuic, |config| {
+        config.request_timeout = Duration::from_secs(2);
+    });
+    let registration = test_generation(INFERENCE_SERVER_ID, "http://127.0.0.1:1", true);
+    let owner =
+        RegistrationTunnel::reverse(proxy.clone(), registration.clone(), Duration::from_secs(30));
+    let wait = tokio::spawn(async move {
         proxy
-            .connection_set_needs_replenishment(INFERENCE_SERVER_ID)
-            .await,
-        "partial direct connection set should request replenishment"
-    );
+            .await_reverse_connection(registration, Duration::from_secs(30))
+            .await
+    });
+    tokio::task::yield_now().await;
 
-    let result = watcher
-        .ensure_connected(INFERENCE_SERVER_ID, &target_url, false)
-        .await;
+    // Retire the generation to wake its pending reverse-connection waiter.
+    drop(owner);
+
+    let connected = tokio::time::timeout(Duration::from_millis(100), wait)
+        .await
+        .expect("retirement should wake the exact generation's reverse waiter")
+        .expect("reverse wait task should finish");
+    assert!(!connected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registration_tunnel_replenishes_partial_direct_connection_set() {
+    let fixture = DirectTunnelFixture::start_with_connections(
+        health_backend("ok"),
+        TunnelTransportProtocol::RawQuic,
+        2,
+    )
+    .await;
+    let mut tunnel_owner =
+        RegistrationTunnel::direct(fixture.proxy.clone(), fixture.registration.clone());
+    let result = tunnel_owner.ensure_connected().await;
+    assert!(matches!(result, EnsureConnectedResult::Connected));
+    fixture.assert_connection_state(2, false);
+
+    raw_connection(&fixture.registration, 0).close(0u32.into(), b"test watcher direct replenish");
+    fixture.assert_connection_state(2, true);
+
+    let result = tunnel_owner.ensure_connected().await;
     assert!(matches!(result, EnsureConnectedResult::Connected));
 
-    let pool = proxy.pool.read().await;
-    let connection_set = pool.get(INFERENCE_SERVER_ID).expect("pooled connection");
-    assert!(connection_set.is_healthy());
-    assert_eq!(connection_set.len(), 2);
-    // Release the pool read guard before awaiting tunnel shutdown.
-    drop(pool);
-
-    tunnel.shutdown().await;
+    fixture.assert_connection_state(2, false);
+    fixture.shutdown().await;
 }
 
 #[test]
 fn h3_tunnel_request_filter_strips_hop_headers_case_insensitively()
 -> std::result::Result<(), axum::http::header::InvalidHeaderName> {
-    assert!(!should_forward_h3_tunnel_request_header(
-        &HeaderName::from_bytes(b"Connection")?
-    ));
-    assert!(!should_forward_h3_tunnel_request_header(
-        &HeaderName::from_bytes(b"Proxy-Connection")?
-    ));
-    assert!(!should_forward_h3_tunnel_request_header(
-        &HeaderName::from_bytes(b"Host")?
-    ));
+    for name in [b"Connection".as_slice(), b"Proxy-Connection", b"Host"] {
+        assert!(!should_forward_h3_tunnel_request_header(
+            &HeaderName::from_bytes(name)?
+        ));
+    }
     assert!(should_forward_h3_tunnel_request_header(
         &HeaderName::from_bytes(b"X-Request-Id")?
     ));
@@ -833,192 +1046,8 @@ fn h3_tunnel_request_filter_strips_hop_headers_case_insensitively()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_http3_tunnel_proxies_request_to_upstream() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route(
-        "/v1/models",
-        post(|req: Request| async move {
-            let model = req
-                .headers()
-                .get("x-model")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("missing")
-                .to_string();
-            let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            (
-                StatusCode::OK,
-                [(http::header::CONTENT_TYPE, "application/json")],
-                format!(r#"{{"model":"{model}","body_len":{}}}"#, body.len()),
-            )
-        }),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let mut tunnel_config = QuicHttpTunnelConfig::new("127.0.0.1:0".parse().unwrap(), backend_url);
-    tunnel_config.tunnel_protocol = TunnelTransportProtocol::Http3;
-    let tunnel = start_quic_http_tunnel(tunnel_config).await.unwrap();
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(2),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::Http3,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-h3-direct".parse().unwrap());
-    headers.insert("x-model", "model-h3".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
-    headers.insert("content-type", "application/json".parse().unwrap());
-    let response = tokio::time::timeout(
-        Duration::from_secs(3),
-        proxy.proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/models?source=http3",
-            headers,
-            Body::from(r#"{"ping":true}"#),
-        ),
-    )
-    .await
-    .expect("http3 proxy request timed out")
-    .unwrap();
-
-    assert_eq!(response.status, StatusCode::OK);
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        payload.get("model").and_then(serde_json::Value::as_str),
-        Some("model-h3")
-    );
-    assert_eq!(
-        payload.get("body_len").and_then(serde_json::Value::as_u64),
-        Some(13)
-    );
-
-    tunnel.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_webtransport_tunnel_proxies_request_to_upstream() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route(
-        "/v1/models",
-        post(|req: Request| async move {
-            let model = req
-                .headers()
-                .get("x-model")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("missing")
-                .to_string();
-            let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            (
-                StatusCode::OK,
-                [(http::header::CONTENT_TYPE, "application/json")],
-                format!(r#"{{"model":"{model}","body_len":{}}}"#, body.len()),
-            )
-        }),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let mut tunnel_config = QuicHttpTunnelConfig::new("127.0.0.1:0".parse().unwrap(), backend_url);
-    tunnel_config.tunnel_protocol = TunnelTransportProtocol::WebTransport;
-    let tunnel = start_quic_http_tunnel(tunnel_config).await.unwrap();
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(2),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::WebTransport,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-wt-direct".parse().unwrap());
-    headers.insert("x-model", "model-wt".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
-    headers.insert("content-type", "application/json".parse().unwrap());
-    let response = tokio::time::timeout(
-        Duration::from_secs(3),
-        proxy.proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/models?source=webtransport",
-            headers,
-            Body::from(r#"{"ping":true}"#),
-        ),
-    )
-    .await
-    .expect("webtransport proxy request timed out")
-    .unwrap();
-
-    assert_eq!(response.status, StatusCode::OK);
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        payload.get("model").and_then(serde_json::Value::as_str),
-        Some("model-wt")
-    );
-    assert_eq!(
-        payload.get("body_len").and_then(serde_json::Value::as_u64),
-        Some(13)
-    );
-
-    tunnel.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_webtransport_connect_response_uses_connect_timeout() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let server_config = build_server_config(
-        &stargate_tls::ServerTlsIdentity::SelfSigned,
-        TunnelTransportProtocol::WebTransport,
-    )
-    .unwrap();
-    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server = test_server_endpoint(TunnelTransportProtocol::WebTransport, |_| {});
     let server_addr = server.local_addr().unwrap();
     let server_task = tokio::spawn(async move {
         let incoming = server.accept().await.expect("server should accept");
@@ -1042,22 +1071,15 @@ async fn direct_webtransport_connect_response_uses_connect_timeout() {
         futures::future::pending::<()>().await;
     });
 
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_millis(50),
-            request_timeout: Duration::from_secs(2),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::WebTransport,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
+    let proxy = test_quic_proxy_with(TunnelTransportProtocol::WebTransport, |config| {
+        config.connect_timeout = Duration::from_millis(50);
+        config.request_timeout = Duration::from_secs(2);
+    });
+    let registration =
+        test_generation(INFERENCE_SERVER_ID, &format!("quic://{server_addr}"), false);
     let result = tokio::time::timeout(
         Duration::from_secs(1),
-        proxy.preconnect(INFERENCE_SERVER_ID, &format!("quic://{server_addr}")),
+        proxy.connect_direct_registration(&registration),
     )
     .await
     .expect("preconnect should return after the connect timeout");
@@ -1071,10 +1093,11 @@ async fn direct_webtransport_connect_response_uses_connect_timeout() {
     server_task.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_http3_response_body_survives_pool_eviction() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
+async fn assert_response_body_survives_generation_retirement(
+    tunnel_protocol: TunnelTransportProtocol,
+    request_id: &str,
+    model: &str,
+) {
     let release_body = Arc::new(tokio::sync::Notify::new());
     let app = Router::new().route(
         "/v1/stream",
@@ -1099,42 +1122,14 @@ async fn direct_http3_response_body_survives_pool_eviction() {
             }
         }),
     );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let fixture = DirectTunnelFixture::start(app, tunnel_protocol).await;
 
-    let mut tunnel_config = QuicHttpTunnelConfig::new("127.0.0.1:0".parse().unwrap(), backend_url);
-    tunnel_config.tunnel_protocol = TunnelTransportProtocol::Http3;
-    let tunnel = start_quic_http_tunnel(tunnel_config).await.unwrap();
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(2),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::Http3,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-h3-evict-body".parse().unwrap());
-    headers.insert("x-model", "model-h3".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
+    let mut headers = test_request_headers(request_id, model, "7");
     headers.insert("content-type", "application/json".parse().unwrap());
-    let response = proxy
+    let response = fixture
+        .proxy
         .proxy_request_streaming(
-            INFERENCE_SERVER_ID,
+            &fixture.registration,
             Method::POST,
             "/v1/stream",
             headers,
@@ -1144,135 +1139,27 @@ async fn direct_http3_response_body_survives_pool_eviction() {
         .unwrap();
     assert_eq!(response.status, StatusCode::OK);
 
-    proxy.pool.write().await.remove(INFERENCE_SERVER_ID);
+    assert!(fixture.registration.tunnel_connections().retire());
     release_body.notify_waiters();
-
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
+    let body = response_body(response).await;
     assert_eq!(body, b"first-second");
-
-    tunnel.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_webtransport_response_body_survives_pool_eviction() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
-    let release_body = Arc::new(tokio::sync::Notify::new());
-    let app = Router::new().route(
-        "/v1/stream",
-        post({
-            let release_body = release_body.clone();
-            move |_req: Request| {
-                let release_body = release_body.clone();
-                async move {
-                    let body_stream =
-                        futures::stream::once(future::ready(Ok::<_, std::convert::Infallible>(
-                            bytes::Bytes::from_static(b"first-"),
-                        )))
-                        .chain(futures::stream::once(async move {
-                            release_body.notified().await;
-                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"second"))
-                        }));
-                    http::Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Body::from_stream(body_stream))
-                        .unwrap()
-                }
-            }
-        }),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let mut tunnel_config = QuicHttpTunnelConfig::new("127.0.0.1:0".parse().unwrap(), backend_url);
-    tunnel_config.tunnel_protocol = TunnelTransportProtocol::WebTransport;
-    let tunnel = start_quic_http_tunnel(tunnel_config).await.unwrap();
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(2),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::WebTransport,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-wt-evict-body".parse().unwrap());
-    headers.insert("x-model", "model-wt".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
-    headers.insert("content-type", "application/json".parse().unwrap());
-    let response = proxy
-        .proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/stream",
-            headers,
-            Body::from(r#"{"stream":true}"#),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status, StatusCode::OK);
-
-    proxy.pool.write().await.remove(INFERENCE_SERVER_ID);
-    release_body.notify_waiters();
-
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    assert_eq!(body, b"first-second");
-
-    tunnel.shutdown().await;
+    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_http3_tunnel_returns_header_errors_before_request_body_finishes() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    install_crypto_provider();
 
-    let mut tunnel_config = QuicHttpTunnelConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
+    let tunnel = start_test_quic_tunnel(
         "http://127.0.0.1:1".to_string(),
-    );
-    tunnel_config.tunnel_protocol = TunnelTransportProtocol::Http3;
-    let tunnel = start_quic_http_tunnel(tunnel_config).await.unwrap();
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(2),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::Http3,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
+        TunnelTransportProtocol::Http3,
     )
-    .unwrap();
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
+    .await;
+    let proxy = test_quic_proxy_with(TunnelTransportProtocol::Http3, |config| {
+        config.request_timeout = Duration::from_secs(2);
+    });
+    let registration =
+        connect_direct_registration(&proxy, &format!("quic://{}", tunnel.listen_addr())).await;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-request-id", "req-h3-early-error".parse().unwrap());
@@ -1290,10 +1177,9 @@ async fn direct_http3_tunnel_returns_header_errors_before_request_body_finishes(
 
     let response = tokio::time::timeout(
         Duration::from_millis(500),
-        proxy.proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/chat/completions",
+        post_chat(
+            &proxy,
+            &registration,
             headers,
             Body::from_stream(body_stream),
         ),
@@ -1304,12 +1190,7 @@ async fn direct_http3_tunnel_returns_header_errors_before_request_body_finishes(
     let _ = release_body_tx.send(());
 
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    let mut body = Vec::new();
-    let mut stream = response.body_stream;
-    while let Some(chunk) = stream.recv_body().await.unwrap() {
-        body.extend_from_slice(&chunk);
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let payload = response_json(response).await;
     assert_eq!(payload["type"], "about:blank");
     assert_eq!(payload["title"], "Bad Request");
     assert_eq!(payload["status"], 400);
@@ -1351,63 +1232,41 @@ async fn cancelled_request_body_send_finish_aborts_upload_task() {
         .expect("upload drop notifier should send");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn custom_tunnel_returns_body_send_error_before_header_timeout() {
-    body_send_error_is_returned_before_header_timeout(TunnelTransportProtocol::Custom).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http3_tunnel_does_not_wait_for_header_timeout_after_body_send_error() {
-    body_send_error_is_returned_before_header_timeout(TunnelTransportProtocol::Http3).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn webtransport_tunnel_returns_body_send_error_before_header_timeout() {
-    body_send_error_is_returned_before_header_timeout(TunnelTransportProtocol::WebTransport).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn custom_tunnel_reports_body_send_error_at_response_eof() {
-    body_send_error_is_returned_at_response_eof(TunnelTransportProtocol::Custom).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http3_tunnel_reports_body_send_error_at_response_eof() {
-    body_send_error_is_returned_at_response_eof(TunnelTransportProtocol::Http3).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn webtransport_tunnel_reports_body_send_error_at_response_eof() {
-    body_send_error_is_returned_at_response_eof(TunnelTransportProtocol::WebTransport).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn custom_tunnel_does_not_wait_forever_for_stalled_request_body_at_response_eof() {
-    stalled_body_send_does_not_block_response_eof(TunnelTransportProtocol::Custom).await;
-}
-
-struct EarlySuccessBodySendErrorPeer {
+struct BodySendPeer {
     addr: SocketAddr,
     release_tx: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
 
-fn start_early_success_body_send_error_peer(
+impl BodySendPeer {
+    async fn finish(self) {
+        let _ = self.release_tx.send(());
+        self.task.await.expect("body-send test peer should finish");
+    }
+}
+
+enum BodySendPeerMode {
+    EarlySuccess,
+    Inert(tokio::sync::oneshot::Sender<()>),
+}
+
+impl BodySendPeerMode {
+    fn should_reply(self) -> bool {
+        match self {
+            Self::EarlySuccess => true,
+            Self::Inert(headers_seen_tx) => {
+                let _ = headers_seen_tx.send(());
+                false
+            }
+        }
+    }
+}
+
+fn start_body_send_peer(
     tunnel_protocol: TunnelTransportProtocol,
-) -> EarlySuccessBodySendErrorPeer {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let server_config = build_server_config(
-        &stargate_tls::ServerTlsIdentity::SelfSigned,
-        tunnel_protocol,
-    )
-    .expect("test server config should build");
-    let server = Endpoint::server(
-        server_config,
-        "127.0.0.1:0"
-            .parse()
-            .expect("valid test server bind address"),
-    )
-    .expect("test server endpoint should start");
+    mode: BodySendPeerMode,
+) -> BodySendPeer {
+    let server = test_server_endpoint(tunnel_protocol, |_| {});
     let addr = server
         .local_addr()
         .expect("test server endpoint should expose local address");
@@ -1416,201 +1275,94 @@ fn start_early_success_body_send_error_peer(
         let incoming = server.accept().await.expect("server should accept");
         let connection = incoming.await.expect("server connection should complete");
         match tunnel_protocol {
-            TunnelTransportProtocol::Custom => {
-                accept_early_success_custom_request(connection, release_rx).await
+            TunnelTransportProtocol::RawQuic => {
+                accept_body_send_raw_quic_request(connection, mode, release_rx).await
             }
             TunnelTransportProtocol::Http3 => {
-                accept_early_success_h3_request(connection, release_rx).await
+                accept_body_send_h3_request(connection, mode, release_rx).await
             }
             TunnelTransportProtocol::WebTransport => {
-                accept_early_success_webtransport_request(connection, release_rx).await
+                accept_body_send_webtransport_request(connection, mode, release_rx).await
             }
         }
     });
-    EarlySuccessBodySendErrorPeer {
+    BodySendPeer {
         addr,
         release_tx,
         task,
     }
 }
 
-async fn accept_early_success_custom_request(
+fn start_early_success_body_send_error_peer(
+    tunnel_protocol: TunnelTransportProtocol,
+) -> BodySendPeer {
+    install_crypto_provider();
+    start_body_send_peer(tunnel_protocol, BodySendPeerMode::EarlySuccess)
+}
+
+async fn accept_body_send_raw_quic_request(
     connection: Connection,
+    mode: BodySendPeerMode,
     release_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let (server_send, quinn_recv) = connection.accept_bi().await.expect("request stream");
     let mut recv_stream = RecvStream::new(quinn_recv);
     recv_stream.recv_header().await.expect("request headers");
     let mut send_stream = SendStream::new(server_send);
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert("x-status", HeaderValue::from_static("200"));
-    send_stream
-        .send_header(response_headers)
-        .await
-        .expect("send response headers");
-    send_stream.finish().expect("finish response");
-    let _ = release_rx.await;
-}
-
-async fn accept_early_success_h3_request(
-    connection: Connection,
-    release_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut h3_connection: H3ServerConnection = h3::server::builder()
-        .build(h3_quinn::Connection::new(connection))
-        .await
-        .expect("h3 server connection");
-    let resolver = h3_connection
-        .accept()
-        .await
-        .expect("accept h3 request")
-        .expect("h3 request");
-    let (_request, mut stream) = resolver
-        .resolve_request()
-        .await
-        .expect("resolve h3 request");
-    let response = http::Response::builder()
-        .status(StatusCode::OK)
-        .body(())
-        .expect("build h3 response");
-    stream
-        .send_response(response)
-        .await
-        .expect("send h3 response headers");
-    stream.finish().await.expect("finish h3 response");
-    let _ = (&h3_connection, &stream);
-    let _ = release_rx.await;
-}
-
-async fn accept_early_success_webtransport_request(
-    connection: Connection,
-    release_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut builder = h3::server::builder();
-    builder
-        .enable_webtransport(true)
-        .enable_extended_connect(true)
-        .enable_datagram(true)
-        .max_webtransport_sessions(1);
-    let mut h3_connection: H3ServerConnection = builder
-        .build(h3_quinn::Connection::new(connection.clone()))
-        .await
-        .expect("WebTransport h3 server connection");
-    let resolver = h3_connection
-        .accept()
-        .await
-        .expect("accept WebTransport CONNECT")
-        .expect("WebTransport CONNECT request");
-    let (_request, mut connect_stream) = resolver
-        .resolve_request()
-        .await
-        .expect("resolve WebTransport CONNECT");
-    let session_id = connect_stream.id().into_inner();
-    let response = http::Response::builder()
-        .status(StatusCode::OK)
-        .body(())
-        .expect("build WebTransport CONNECT response");
-    connect_stream
-        .send_response(response)
-        .await
-        .expect("send WebTransport CONNECT response");
-
-    let (mut quinn_send, mut quinn_recv) = connection
-        .accept_bi()
-        .await
-        .expect("WebTransport request stream");
-    let stream_session_id = stargate_protocol::read_webtransport_bidi_header(&mut quinn_recv)
-        .await
-        .expect("WebTransport bidi header");
-    assert_eq!(stream_session_id, session_id);
-    stargate_protocol::read_webtransport_http_request_head(&mut quinn_recv)
-        .await
-        .expect("WebTransport request head");
-    let response_head = WebTransportHttpResponseHead {
-        status: StatusCode::OK,
-        headers: HeaderMap::new(),
-    };
-    stargate_protocol::write_webtransport_http_response_head(&mut quinn_send, &response_head)
-        .await
-        .expect("send WebTransport response head");
-    stargate_protocol::finish_webtransport_http_stream(&mut quinn_send)
-        .expect("finish WebTransport response");
-    let _ = (&h3_connection, &connect_stream, &quinn_send);
-    let _ = release_rx.await;
-}
-
-struct InertBodySendErrorPeer {
-    addr: SocketAddr,
-    headers_seen_rx: tokio::sync::oneshot::Receiver<()>,
-    release_tx: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-fn start_inert_body_send_error_peer(
-    tunnel_protocol: TunnelTransportProtocol,
-) -> InertBodySendErrorPeer {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let server_config = build_server_config(
-        &stargate_tls::ServerTlsIdentity::SelfSigned,
-        tunnel_protocol,
-    )
-    .expect("test server config should build");
-    let server = Endpoint::server(
-        server_config,
-        "127.0.0.1:0"
-            .parse()
-            .expect("valid test server bind address"),
-    )
-    .expect("test server endpoint should start");
-    let addr = server
-        .local_addr()
-        .expect("test server endpoint should expose local address");
-    let (headers_seen_tx, headers_seen_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let incoming = server.accept().await.expect("server should accept");
-        let connection = incoming.await.expect("server connection should complete");
-        match tunnel_protocol {
-            TunnelTransportProtocol::Custom => {
-                accept_inert_custom_request(connection, headers_seen_tx, release_rx).await
-            }
-            TunnelTransportProtocol::Http3 => {
-                accept_inert_h3_request(connection, headers_seen_tx, release_rx).await
-            }
-            TunnelTransportProtocol::WebTransport => {
-                accept_inert_webtransport_request(connection, headers_seen_tx, release_rx).await
-            }
-        }
-    });
-    InertBodySendErrorPeer {
-        addr,
-        headers_seen_rx,
-        release_tx,
-        task,
+    if mode.should_reply() {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert("x-status", HeaderValue::from_static("200"));
+        send_stream
+            .send_header(response_headers)
+            .await
+            .expect("send response headers");
+        send_stream.finish().expect("finish response");
     }
-}
-
-async fn accept_inert_custom_request(
-    connection: Connection,
-    headers_seen_tx: tokio::sync::oneshot::Sender<()>,
-    release_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    let (server_send, quinn_recv) = connection.accept_bi().await.expect("request stream");
-    let keep_response_send_open = server_send;
-    let mut recv_stream = RecvStream::new(quinn_recv);
-    recv_stream.recv_header().await.expect("request headers");
-    let _ = headers_seen_tx.send(());
     let _ = release_rx.await;
-    // Keep the server-side response stream in the task state until the
-    // synthetic request-body failure has been observed.
-    let _ = &keep_response_send_open;
 }
 
-async fn accept_inert_h3_request(
+async fn accept_body_send_h3_request(
     connection: Connection,
-    headers_seen_tx: tokio::sync::oneshot::Sender<()>,
+    mode: BodySendPeerMode,
     release_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
+    let (_h3_connection, mut stream) = accept_h3_request(connection).await;
+    if mode.should_reply() {
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .expect("build h3 response");
+        stream
+            .send_response(response)
+            .await
+            .expect("send h3 response headers");
+        stream.finish().await.expect("finish h3 response");
+    }
+    let _ = release_rx.await;
+}
+
+async fn accept_body_send_webtransport_request(
+    connection: Connection,
+    mode: BodySendPeerMode,
+    release_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let (_h3_connection, _connect_stream, mut quinn_send, _quinn_recv) =
+        accept_webtransport_request(connection).await;
+    if mode.should_reply() {
+        let response_head = WebTransportHttpResponseHead {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        stargate_protocol::write_webtransport_http_response_head(&mut quinn_send, &response_head)
+            .await
+            .expect("send WebTransport response head");
+        stargate_protocol::finish_webtransport_http_stream(&mut quinn_send)
+            .expect("finish WebTransport response");
+    }
+    let _ = release_rx.await;
+}
+
+async fn accept_h3_request(connection: Connection) -> (H3ServerConnection, H3ServerRequestStream) {
     let mut h3_connection: H3ServerConnection = h3::server::builder()
         .build(h3_quinn::Connection::new(connection))
         .await
@@ -1624,18 +1376,16 @@ async fn accept_inert_h3_request(
         .resolve_request()
         .await
         .expect("resolve h3 request");
-    let keep_request_stream_open = stream;
-    let _ = headers_seen_tx.send(());
-    let _ = release_rx.await;
-    // Keep H3 state alive so the peer does not synthesize a response or
-    // reset before the local body producer error wins.
-    let _ = (&h3_connection, &keep_request_stream_open);
+    (h3_connection, stream)
 }
 
-async fn accept_inert_webtransport_request(
+async fn accept_webtransport_request(
     connection: Connection,
-    headers_seen_tx: tokio::sync::oneshot::Sender<()>,
-    release_rx: tokio::sync::oneshot::Receiver<()>,
+) -> (
+    H3ServerConnection,
+    H3ServerRequestStream,
+    quinn::SendStream,
+    quinn::RecvStream,
 ) {
     let mut builder = h3::server::builder();
     builder
@@ -1657,12 +1407,13 @@ async fn accept_inert_webtransport_request(
         .await
         .expect("resolve WebTransport CONNECT");
     let session_id = connect_stream.id().into_inner();
-    let response = http::Response::builder()
-        .status(StatusCode::OK)
-        .body(())
-        .expect("build WebTransport CONNECT response");
     connect_stream
-        .send_response(response)
+        .send_response(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(())
+                .expect("build WebTransport CONNECT response"),
+        )
         .await
         .expect("send WebTransport CONNECT response");
 
@@ -1670,7 +1421,6 @@ async fn accept_inert_webtransport_request(
         .accept_bi()
         .await
         .expect("WebTransport request stream");
-    let keep_response_send_open = quinn_send;
     let stream_session_id = stargate_protocol::read_webtransport_bidi_header(&mut quinn_recv)
         .await
         .expect("WebTransport bidi header");
@@ -1678,51 +1428,37 @@ async fn accept_inert_webtransport_request(
     stargate_protocol::read_webtransport_http_request_head(&mut quinn_recv)
         .await
         .expect("WebTransport request head");
-    let _ = headers_seen_tx.send(());
-    let _ = release_rx.await;
-    // Keep the CONNECT session and server-side response stream open until
-    // the synthetic request-body failure has been observed.
-    let _ = (&h3_connection, &connect_stream, &keep_response_send_open);
+    (h3_connection, connect_stream, quinn_send, quinn_recv)
+}
+
+fn start_inert_body_send_error_peer(
+    tunnel_protocol: TunnelTransportProtocol,
+) -> (BodySendPeer, tokio::sync::oneshot::Receiver<()>) {
+    install_crypto_provider();
+    let (headers_seen_tx, headers_seen_rx) = tokio::sync::oneshot::channel();
+    let peer = start_body_send_peer(tunnel_protocol, BodySendPeerMode::Inert(headers_seen_tx));
+    (peer, headers_seen_rx)
 }
 
 async fn body_send_error_is_returned_before_header_timeout(
     tunnel_protocol: TunnelTransportProtocol,
 ) {
-    let peer = start_inert_body_send_error_peer(tunnel_protocol);
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(5),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .expect("test QUIC proxy should initialize");
-    proxy
-        .preconnect(INFERENCE_SERVER_ID, &format!("quic://{}", peer.addr))
-        .await
-        .expect("proxy should preconnect to inert test peer");
+    let (peer, headers_seen_rx) = start_inert_body_send_error_peer(tunnel_protocol);
+    let proxy = test_quic_proxy(tunnel_protocol);
+    let registration = connect_direct_registration(&proxy, &format!("quic://{}", peer.addr)).await;
 
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", HeaderValue::from_static("req-body-error"));
-    headers.insert("x-model", HeaderValue::from_static("model-body-error"));
-    headers.insert("x-input-tokens", HeaderValue::from_static("7"));
+    let mut headers = test_request_headers("req-body-error", "model-body-error", "7");
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     let body_stream = futures::stream::once(async move {
-        let _ = peer.headers_seen_rx.await;
+        let _ = headers_seen_rx.await;
         Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("synthetic body failure"))
     });
 
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        proxy.proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/chat/completions",
+        post_chat(
+            &proxy,
+            &registration,
             headers,
             Body::from_stream(body_stream),
         ),
@@ -1739,39 +1475,15 @@ async fn body_send_error_is_returned_before_header_timeout(
         "unexpected error chain: {error_chain}"
     );
 
-    let _ = peer.release_tx.send(());
-    peer.task
-        .await
-        .expect("inert body-send-error peer task should finish");
+    peer.finish().await;
 }
 
 async fn body_send_error_is_returned_at_response_eof(tunnel_protocol: TunnelTransportProtocol) {
     let peer = start_early_success_body_send_error_peer(tunnel_protocol);
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(5),
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol,
-            direct_quic_connections: 1,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .expect("test QUIC proxy should initialize");
-    proxy
-        .preconnect(INFERENCE_SERVER_ID, &format!("quic://{}", peer.addr))
-        .await
-        .expect("proxy should preconnect to early-success test peer");
+    let proxy = test_quic_proxy(tunnel_protocol);
+    let registration = connect_direct_registration(&proxy, &format!("quic://{}", peer.addr)).await;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-request-id",
-        HeaderValue::from_static("req-body-error-after-headers"),
-    );
-    headers.insert("x-model", HeaderValue::from_static("model-body-error"));
-    headers.insert("x-input-tokens", HeaderValue::from_static("7"));
+    let mut headers = test_request_headers("req-body-error-after-headers", "model-body-error", "7");
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     let (release_body_tx, release_body_rx) = tokio::sync::oneshot::channel();
     let body_stream = futures::stream::once(future::ready(Ok::<_, std::io::Error>(
@@ -1784,10 +1496,9 @@ async fn body_send_error_is_returned_at_response_eof(tunnel_protocol: TunnelTran
 
     let response = tokio::time::timeout(
         Duration::from_millis(500),
-        proxy.proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/chat/completions",
+        post_chat(
+            &proxy,
+            &registration,
             headers,
             Body::from_stream(body_stream),
         ),
@@ -1808,39 +1519,18 @@ async fn body_send_error_is_returned_at_response_eof(tunnel_protocol: TunnelTran
         "unexpected error chain: {error_chain}"
     );
 
-    let _ = peer.release_tx.send(());
-    peer.task
-        .await
-        .expect("early-success body-send-error peer task should finish");
+    peer.finish().await;
 }
 
 async fn stalled_body_send_does_not_block_response_eof(tunnel_protocol: TunnelTransportProtocol) {
     let peer = start_early_success_body_send_error_peer(tunnel_protocol);
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_millis(50),
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol,
-            direct_quic_connections: 1,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .expect("test QUIC proxy should initialize");
-    proxy
-        .preconnect(INFERENCE_SERVER_ID, &format!("quic://{}", peer.addr))
-        .await
-        .expect("proxy should preconnect to early-success test peer");
+    let proxy = test_quic_proxy_with(tunnel_protocol, |config| {
+        config.request_timeout = Duration::from_millis(50);
+    });
+    let registration = connect_direct_registration(&proxy, &format!("quic://{}", peer.addr)).await;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-request-id",
-        HeaderValue::from_static("req-body-stalled-after-headers"),
-    );
-    headers.insert("x-model", HeaderValue::from_static("model-body-stalled"));
-    headers.insert("x-input-tokens", HeaderValue::from_static("7"));
+    let mut headers =
+        test_request_headers("req-body-stalled-after-headers", "model-body-stalled", "7");
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     let body_stream = futures::stream::once(future::ready(Ok::<_, std::io::Error>(
         bytes::Bytes::from_static(b"partial request body"),
@@ -1851,10 +1541,9 @@ async fn stalled_body_send_does_not_block_response_eof(tunnel_protocol: TunnelTr
 
     let response = tokio::time::timeout(
         Duration::from_millis(500),
-        proxy.proxy_request_streaming(
-            INFERENCE_SERVER_ID,
-            Method::POST,
-            "/v1/chat/completions",
+        post_chat(
+            &proxy,
+            &registration,
             headers,
             Body::from_stream(body_stream),
         ),
@@ -1870,26 +1559,18 @@ async fn stalled_body_send_does_not_block_response_eof(tunnel_protocol: TunnelTr
         .expect("response EOF should not fail for a merely stalled request body");
     assert!(eof.is_none());
 
-    let _ = peer.release_tx.send(());
-    peer.task
-        .await
-        .expect("early-success stalled-body peer task should finish");
+    peer.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_header_timeout_uses_remaining_budget_after_stream_setup() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let mut server_config = build_server_config(
-        &stargate_tls::ServerTlsIdentity::SelfSigned,
-        TunnelTransportProtocol::Custom,
-    )
-    .unwrap();
-    let mut transport = quinn::TransportConfig::default();
-    // Limit the server to one open request stream so the second request
-    // spends part of its timeout budget waiting for stream capacity.
-    transport.max_concurrent_bidi_streams(1_u8.into());
-    server_config.transport_config(Arc::new(transport));
-    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server = test_server_endpoint(TunnelTransportProtocol::RawQuic, |config| {
+        let mut transport = quinn::TransportConfig::default();
+        // Limit the server to one open request stream so the second request
+        // spends part of its timeout budget waiting for stream capacity.
+        transport.max_concurrent_bidi_streams(1_u8.into());
+        config.transport_config(Arc::new(transport));
+    });
     let server_addr = server.local_addr().unwrap();
     let server_task = tokio::spawn(async move {
         let incoming = server.accept().await.expect("server should accept");
@@ -1899,76 +1580,38 @@ async fn response_header_timeout_uses_remaining_budget_after_stream_setup() {
             let _ = first_recv.read_to_end(1024).await;
         });
 
-        let (second_send, second_recv) = connection.accept_bi().await.expect("second stream");
+        let (_second_send, second_recv) = connection.accept_bi().await.expect("second stream");
         first_task.await.unwrap();
         let mut recv_stream = RecvStream::new(second_recv);
-        let mut send_stream = SendStream::new(second_send);
         recv_stream.recv_header().await.expect("request headers");
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let mut response_headers = HeaderMap::new();
-        response_headers.insert("x-status", HeaderValue::from_static("200"));
-        send_stream
-            .send_header(response_headers)
-            .await
-            .expect("send response headers");
-        send_stream.finish().expect("finish response");
+        future::pending::<()>().await;
     });
 
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_millis(250),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::Custom,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
-    proxy
-        .preconnect(INFERENCE_SERVER_ID, &format!("quic://{server_addr}"))
-        .await
-        .unwrap();
+    let proxy = test_quic_proxy_with(TunnelTransportProtocol::RawQuic, |config| {
+        config.request_timeout = Duration::from_millis(250);
+    });
+    let registration = connect_direct_registration(&proxy, &format!("quic://{server_addr}")).await;
 
-    let connection = {
-        let pool = proxy.pool.read().await;
-        match pool
-            .get(INFERENCE_SERVER_ID)
-            .expect("pooled connection")
-            .choose_healthy()
-            .expect("healthy connection")
-        {
-            TunnelConnection::Custom(connection) => connection.clone(),
-            TunnelConnection::Http3(_) | TunnelConnection::WebTransport(_) => {
-                panic!("expected custom tunnel connection")
-            }
-        }
-    };
+    let connection = raw_connection(&registration, 0);
     let first_stream = connection.open_bi().await.expect("open first stream");
 
-    let mut headers = HeaderMap::new();
-    headers.insert("x-request-id", "req-header-budget".parse().unwrap());
-    headers.insert("x-model", "model-budget".parse().unwrap());
-    headers.insert("x-input-tokens", "7".parse().unwrap());
-    let request = proxy.proxy_request_streaming(
-        INFERENCE_SERVER_ID,
-        Method::POST,
-        "/v1/chat/completions",
-        headers,
-        Body::empty(),
-    );
+    let headers = test_request_headers("req-header-budget", "model-budget", "7");
+    let request = post_chat(&proxy, &registration, headers, Body::empty());
     tokio::pin!(request);
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(180), &mut request)
+            .await
+            .is_err(),
+        "request should wait for stream capacity"
+    );
     // Free the only server-side request stream after setup has consumed
     // most of the request timeout, so the response-header phase should
     // inherit only the remaining budget.
     drop(first_stream);
 
-    let result = tokio::time::timeout(Duration::from_secs(1), &mut request)
+    let result = tokio::time::timeout(Duration::from_millis(120), &mut request)
         .await
-        .expect("request should complete before outer test timeout");
+        .expect("remaining request budget should expire before the outer bound");
     let error = match result {
         Ok(_) => panic!("response header wait should use only remaining budget"),
         Err(error) => error,
@@ -1983,126 +1626,43 @@ async fn response_header_timeout_uses_remaining_budget_after_stream_setup() {
 
 #[tokio::test]
 async fn health_check_succeeds_through_reverse_tunnel() {
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route("/health", get(|| async { (StatusCode::OK, "ok") }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (proxy, addr, shutdown) = start_tunnel_server(state).await;
-
-    let handle = connect_reverse_tunnel(addr, &backend_url).await;
-    assert!(
-        proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
-            .await
-    );
-
-    let rtt = proxy.health_check_rtt(INFERENCE_SERVER_ID).await.unwrap();
+    let fixture =
+        ReverseTunnelFixture::start(health_backend("ok"), TunnelTransportProtocol::RawQuic).await;
+    let rtt = fixture
+        .proxy
+        .health_check_rtt(&fixture.generation)
+        .await
+        .unwrap();
     assert!(rtt.as_millis() < 1000);
-
-    handle.shutdown().await;
-    shutdown.cancel();
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
 async fn handshake_nack_for_unregistered_server() {
     let state = Arc::new(StargateState::new());
-    let (_proxy, addr, shutdown) = start_tunnel_server(state).await;
+    let (_proxy, addr, runtime) =
+        start_tunnel_server(state, TunnelTransportProtocol::RawQuic).await;
 
-    let (listener, backend_url) = setup_mock_backend().await;
     let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let backend_url = spawn_mock_backend(app).await;
 
-    let mut config = ReverseQuicTunnelConfig::new(
-        format!("127.0.0.1:{}", addr.port()),
-        "unregistered-backend".to_string(),
-        backend_url,
-    );
+    let mut config = reverse_tunnel_config(addr, "unregistered-backend", backend_url);
     config.quic_insecure = true;
     let result = start_reverse_quic_tunnel(config).await;
 
     assert!(result.is_err(), "expected handshake to be rejected");
 
-    shutdown.cancel();
-}
-
-#[tokio::test]
-async fn url_change_evicts_stale_pool_entry() {
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (proxy, addr, shutdown) = start_tunnel_server(state).await;
-
-    let handle = connect_reverse_tunnel(addr, &backend_url).await;
-    assert!(
-        proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
-            .await,
-    );
-    assert!(proxy.has_healthy_connection(INFERENCE_SERVER_ID).await);
-
-    let mut watcher = ConnectionWatcher::new(proxy.clone(), Duration::from_millis(100));
-    watcher.states.insert(
-        INFERENCE_SERVER_ID.to_string(),
-        ConnState::Connected {
-            url: "quic://1.2.3.4:9999".to_string(),
-        },
-    );
-
-    let result = watcher
-        .ensure_connected(INFERENCE_SERVER_ID, "quic://5.6.7.8:1111", true)
-        .await;
-    assert!(matches!(result, EnsureConnectedResult::ReverseDisconnected));
-    assert!(
-        !proxy.has_healthy_connection(INFERENCE_SERVER_ID).await,
-        "stale pool entry should have been evicted on URL change"
-    );
-
-    handle.shutdown().await;
-    shutdown.cancel();
+    runtime.begin_shutdown();
 }
 
 #[tokio::test]
 async fn duplicate_reverse_connection_rejected() {
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let fixture =
+        ReverseTunnelFixture::start(health_backend("ok"), TunnelTransportProtocol::RawQuic).await;
 
-    let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (proxy, addr, shutdown) = start_tunnel_server(state).await;
+    let backend_url2 = spawn_mock_backend(health_backend("ok")).await;
 
-    let handle1 = connect_reverse_tunnel(addr, &backend_url).await;
-    assert!(
-        proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
-            .await,
-        "first reverse connection should be accepted"
-    );
-
-    let (listener2, backend_url2) = setup_mock_backend().await;
-    let app2 = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener2, app2).await;
-    });
-
-    let mut dup_config = ReverseQuicTunnelConfig::new(
-        format!("127.0.0.1:{}", addr.port()),
-        INFERENCE_SERVER_ID.to_string(),
-        backend_url2,
-    );
+    let mut dup_config = reverse_tunnel_config(fixture.addr, INFERENCE_SERVER_ID, backend_url2);
     dup_config.quic_insecure = true;
     let result = start_reverse_quic_tunnel(dup_config).await;
     assert!(
@@ -2110,199 +1670,164 @@ async fn duplicate_reverse_connection_rejected() {
         "second connection with same id should be rejected while first is active"
     );
 
-    handle1.shutdown().await;
-    shutdown.cancel();
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
-async fn await_reverse_connection_ignores_closed_pool_entry() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+async fn reverse_connection_cannot_cross_registration_generation() {
+    let app = Router::new().route("/health", get(|| async { "old" }));
+    let backend_url = spawn_mock_backend(app).await;
 
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(5),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: TunnelTransportProtocol::Custom,
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
-    let tunnel = start_quic_http_tunnel(QuicHttpTunnelConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        backend_url,
-    ))
-    .await
-    .unwrap();
-
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
+    let state = Arc::new(StargateState::new());
+    let old_registration = register_backend(&state, INFERENCE_SERVER_ID, true);
+    let old_generation = old_registration.generation();
+    let (proxy, addr, runtime) =
+        start_tunnel_server(state.clone(), TunnelTransportProtocol::RawQuic).await;
+    let old_tunnel = RegistrationTunnel::reverse(
+        proxy.clone(),
+        old_generation.clone(),
+        Duration::from_millis(100),
+    );
+    let old_handle = connect_reverse_tunnel(addr, &backend_url).await;
     assert!(
         proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(1))
+            .await_reverse_connection(old_generation.clone(), Duration::from_secs(2))
+            .await
+    );
+
+    state.end_registration(old_registration).await;
+    let replacement = register_backend(&state, INFERENCE_SERVER_ID, true);
+    let replacement_generation = replacement.generation();
+    let replacement_tunnel = RegistrationTunnel::reverse(
+        proxy.clone(),
+        replacement_generation.clone(),
+        Duration::from_millis(100),
+    );
+
+    let replacement_app = Router::new().route("/health", get(|| async { "replacement" }));
+    let replacement_backend_url = spawn_mock_backend(replacement_app).await;
+    let replacement_handle = connect_reverse_tunnel(addr, &replacement_backend_url).await;
+    assert!(
+        proxy
+            .await_reverse_connection(replacement_generation.clone(), Duration::from_secs(2))
+            .await,
+        "replacement registration should own its own reverse connection"
+    );
+
+    // Delayed old-generation release must not remove the replacement generation.
+    drop(old_tunnel);
+    assert!(
+        proxy.has_healthy_connection(&replacement_generation),
+        "delayed old-generation cleanup must not remove the replacement tunnel"
+    );
+
+    state.end_registration(replacement).await;
+    // Mirror registration-session ordering: retire routing before releasing its tunnel.
+    drop(replacement_tunnel);
+    replacement_handle.shutdown().await;
+    old_handle.shutdown().await;
+    runtime.begin_shutdown();
+}
+
+#[tokio::test]
+async fn await_reverse_connection_ignores_closed_generation_connection() {
+    install_crypto_provider();
+    let app = Router::new().route("/health", get(|| async { "ok" }));
+    let backend_url = spawn_mock_backend(app).await;
+
+    let proxy = test_quic_proxy(TunnelTransportProtocol::RawQuic);
+    let tunnel = start_test_quic_tunnel(backend_url, TunnelTransportProtocol::RawQuic).await;
+
+    let registration =
+        connect_direct_registration(&proxy, &format!("quic://{}", tunnel.listen_addr())).await;
+    assert!(
+        proxy
+            .await_reverse_connection(registration.clone(), Duration::from_secs(1))
             .await
     );
 
     tunnel.shutdown().await;
     tokio::time::timeout(Duration::from_secs(2), async {
-        while proxy.has_healthy_connection(INFERENCE_SERVER_ID).await {
+        while proxy.has_healthy_connection(&registration) {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("pooled connection should close");
+    .expect("registered connection should close");
 
     assert!(
         !proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_millis(50))
+            .await_reverse_connection(registration, Duration::from_millis(50))
             .await,
-        "closed pool entry must not satisfy reverse connection wait"
+        "closed generation connection must not satisfy reverse connection wait"
     );
-}
-
-#[test]
-fn build_client_config_insecure_succeeds_without_cert() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let result = build_client_config(None, true, TunnelTransportProtocol::Custom);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn build_client_config_secure_fails_without_cert() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let result = build_client_config(None, false, TunnelTransportProtocol::Custom);
-    assert!(result.is_err());
-}
-
-#[test]
-fn build_client_config_secure_succeeds_with_cert() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (cert_pem, _key_pem) = stargate_tls::generate_self_signed_cert().unwrap();
-    let result = build_client_config(Some(&cert_pem), false, TunnelTransportProtocol::Custom);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn build_server_config_self_signed_when_none() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let result = build_server_config(
-        &stargate_tls::ServerTlsIdentity::SelfSigned,
-        TunnelTransportProtocol::Custom,
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn build_server_config_uses_provided_cert() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (cert_pem, key_pem) = stargate_tls::generate_self_signed_cert().unwrap();
-    let result = build_server_config(
-        &stargate_tls::ServerTlsIdentity::Provided { cert_pem, key_pem },
-        TunnelTransportProtocol::Custom,
-    );
-    assert!(result.is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_tunnel_works_with_secure_client_and_provided_cert() {
-    let (listener, backend_url) = setup_mock_backend().await;
     let app = Router::new().route("/health", get(|| async { (StatusCode::OK, "ok") }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let backend_url = spawn_mock_backend(app).await;
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    install_crypto_provider();
     let (cert_pem, key_pem) = stargate_tls::generate_self_signed_cert().unwrap();
 
     let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
+    let registration = register_backend(&state, INFERENCE_SERVER_ID, true);
+    let generation = registration.generation();
 
-    let proxy = Arc::new(
-        QuicHttpProxy::new(
-            QuicTunnelConfig {
-                connect_timeout: Duration::from_secs(5),
-                request_timeout: Duration::from_secs(5),
-                direct_quic_connections: 1,
-                tls_cert_pem: Some(cert_pem.clone()),
-                server_tls_identity: stargate_tls::ServerTlsIdentity::Provided {
-                    cert_pem: cert_pem.clone(),
-                    key_pem,
-                },
-                quic_insecure: false,
-                tunnel_protocol: Default::default(),
-            },
-            Arc::new(crate::auth::OpenAuthenticator),
-        )
-        .unwrap(),
-    );
-    let shutdown = CancellationToken::new();
+    let proxy = test_quic_proxy_with(Default::default(), |config| {
+        config.tls_cert_pem = Some(cert_pem.clone());
+        config.server_tls_identity = stargate_tls::ServerTlsIdentity::Provided {
+            cert_pem: cert_pem.clone(),
+            key_pem,
+        };
+        config.quic_insecure = false;
+    });
+    let (runtime, _failures) = CriticalTaskGroup::new("stargate test");
     let addr = proxy
         .start_reverse_listener(
-            "127.0.0.1:0".parse().unwrap(),
             state,
-            shutdown.clone(),
-            TaskTracker::new(),
+            runtime.clone(),
             None,
-            None,
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            crate::metrics::StargateMetrics::new().expect("metrics should initialize"),
         )
         .await
         .unwrap();
+    let _tunnel = own_reverse_registration(proxy.clone(), &registration);
 
-    let mut config = ReverseQuicTunnelConfig::new(
-        format!("127.0.0.1:{}", addr.port()),
-        INFERENCE_SERVER_ID.to_string(),
-        backend_url,
-    );
+    let mut config = reverse_tunnel_config(addr, INFERENCE_SERVER_ID, backend_url);
     config.tls_cert_pem = Some(cert_pem);
     config.quic_insecure = false;
     let handle = start_reverse_quic_tunnel(config).await.unwrap();
 
     assert!(
         proxy
-            .await_reverse_connection(INFERENCE_SERVER_ID, Duration::from_secs(2))
+            .await_reverse_connection(generation.clone(), Duration::from_secs(2))
             .await
     );
 
-    let rtt = proxy.health_check_rtt(INFERENCE_SERVER_ID).await.unwrap();
+    let rtt = proxy.health_check_rtt(&generation).await.unwrap();
     assert!(rtt.as_millis() < 1000);
 
     handle.shutdown().await;
-    shutdown.cancel();
+    runtime.begin_shutdown();
 }
 
 #[tokio::test]
 async fn reverse_tunnel_secure_client_rejects_unknown_server_cert() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    install_crypto_provider();
 
     let state = Arc::new(StargateState::new());
-    register_backend(&state, INFERENCE_SERVER_ID, true).await;
-    let (_proxy, addr, shutdown) = start_tunnel_server(state).await;
+    register_backend(&state, INFERENCE_SERVER_ID, true);
+    let (_proxy, addr, runtime) =
+        start_tunnel_server(state, TunnelTransportProtocol::RawQuic).await;
 
-    let (listener, backend_url) = setup_mock_backend().await;
     let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let backend_url = spawn_mock_backend(app).await;
 
     let (different_cert, _) = stargate_tls::generate_self_signed_cert().unwrap();
-    let mut config = ReverseQuicTunnelConfig::new(
-        format!("127.0.0.1:{}", addr.port()),
-        INFERENCE_SERVER_ID.to_string(),
-        backend_url,
-    );
+    let mut config = reverse_tunnel_config(addr, INFERENCE_SERVER_ID, backend_url);
     config.tls_cert_pem = Some(different_cert);
     config.quic_insecure = false;
     let result = start_reverse_quic_tunnel(config).await;
@@ -2312,56 +1837,5 @@ async fn reverse_tunnel_secure_client_rejects_unknown_server_cert() {
         "secure client with different CA should reject server cert"
     );
 
-    shutdown.cancel();
-}
-
-#[tokio::test]
-async fn failed_reconnect_direct_preserves_existing_connection() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (listener, backend_url) = setup_mock_backend().await;
-    let app = Router::new().route("/health", get(|| async { "ok" }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let proxy = QuicHttpProxy::new(
-        QuicTunnelConfig {
-            connect_timeout: Duration::from_millis(50),
-            request_timeout: Duration::from_secs(5),
-            direct_quic_connections: 1,
-            tls_cert_pem: None,
-            server_tls_identity: stargate_tls::ServerTlsIdentity::SelfSigned,
-            quic_insecure: true,
-            tunnel_protocol: Default::default(),
-        },
-        Arc::new(crate::auth::OpenAuthenticator),
-    )
-    .unwrap();
-    let tunnel = start_quic_http_tunnel(QuicHttpTunnelConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        backend_url,
-    ))
-    .await
-    .unwrap();
-
-    proxy
-        .preconnect(
-            INFERENCE_SERVER_ID,
-            &format!("quic://{}", tunnel.listen_addr()),
-        )
-        .await
-        .unwrap();
-    assert!(proxy.has_healthy_connection(INFERENCE_SERVER_ID).await);
-
-    let result = proxy
-        .reconnect_direct(INFERENCE_SERVER_ID, "quic://not-an-ip:50072")
-        .await;
-
-    assert!(result.is_err());
-    assert!(
-        proxy.has_healthy_connection(INFERENCE_SERVER_ID).await,
-        "failed reconnect must not remove the existing healthy connection"
-    );
-
-    tunnel.shutdown().await;
+    runtime.begin_shutdown();
 }

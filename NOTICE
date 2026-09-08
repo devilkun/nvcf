@@ -11,6 +11,7 @@ The following third-party licenses are included in this repository:
     deploy/helm/container-cache/NOTICE
     deploy/helm/nats/NOTICE
     deploy/helm/openbao/NOTICE
+    infra/openbao/plugins/vault-plugin-secrets-jwt/NOTICE
     src/compute-plane-services/byoo-otel-collector/NOTICE
     src/compute-plane-services/ess-agent/NOTICE
     src/compute-plane-services/image-credential-helper/vendor/dario.cat/mergo/LICENSE
@@ -144,8 +145,6 @@ The following third-party licenses are included in this repository:
     src/compute-plane-services/nvca/vendor/github.com/felixge/httpsnoop/LICENSE.txt
     src/compute-plane-services/nvca/vendor/github.com/fsnotify/fsnotify/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/fxamacker/cbor/v2/LICENSE
-    src/compute-plane-services/nvca/vendor/github.com/go-jose/go-jose/v3/json/LICENSE
-    src/compute-plane-services/nvca/vendor/github.com/go-jose/go-jose/v3/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/go-jose/go-jose/v4/json/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/go-jose/go-jose/v4/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/go-logr/logr/LICENSE
@@ -209,7 +208,6 @@ The following third-party licenses are included in this repository:
     src/compute-plane-services/nvca/vendor/github.com/NVIDIA/k8s-dra-driver-gpu/NOTICE
     src/compute-plane-services/nvca/vendor/github.com/NVIDIA/KAI-scheduler/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/NVIDIA/KAI-scheduler/NOTICE
-    src/compute-plane-services/nvca/vendor/github.com/NVIDIA/nvcf/src/libraries/go/lib/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/opencontainers/go-digest/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/opencontainers/go-digest/LICENSE.docs
     src/compute-plane-services/nvca/vendor/github.com/opencontainers/image-spec/LICENSE
@@ -222,6 +220,7 @@ The following third-party licenses are included in this repository:
     src/compute-plane-services/nvca/vendor/github.com/prometheus/client_model/NOTICE
     src/compute-plane-services/nvca/vendor/github.com/prometheus/common/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/prometheus/common/NOTICE
+    src/compute-plane-services/nvca/vendor/github.com/prometheus/otlptranslator/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/prometheus/procfs/LICENSE
     src/compute-plane-services/nvca/vendor/github.com/prometheus/procfs/NOTICE
     src/compute-plane-services/nvca/vendor/github.com/run-ai/karta/LICENSE
@@ -254,9 +253,11 @@ The following third-party licenses are included in this repository:
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp/LICENSE
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/exporters/otlp/otlptrace/LICENSE
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc/LICENSE
+    src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/exporters/prometheus/LICENSE
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/LICENSE
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/metric/LICENSE
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/sdk/LICENSE
+    src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/sdk/metric/LICENSE
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/otel/trace/LICENSE
     src/compute-plane-services/nvca/vendor/go.opentelemetry.io/proto/otlp/LICENSE
     src/compute-plane-services/nvca/vendor/go.uber.org/mock/LICENSE
@@ -308,6 +309,14 @@ The following third-party licenses are included in this repository:
     src/compute-plane-services/nvca/vendor/sigs.k8s.io/randfill/NOTICE
     src/compute-plane-services/nvca/vendor/sigs.k8s.io/structured-merge-diff/v6/LICENSE
     src/compute-plane-services/nvca/vendor/sigs.k8s.io/yaml/LICENSE
+    src/compute-plane-services/nvsnap/NOTICE
+    src/control-plane-services/api-keys/NOTICE
+    src/control-plane-services/cloud-functions/NOTICE
+    src/control-plane-services/cloud-tasks/NOTICE
+    src/control-plane-services/encrypted-secret-store/NOTICE
+    src/control-plane-services/event-ledger/NOTICE
+    src/control-plane-services/instance-cluster-management/NOTICE
+    src/control-plane-services/notary/NOTICE
     src/invocation-plane-services/llm-api-gateway/NOTICE
     src/invocation-plane-services/ratelimiter/NOTICE
     src/libraries/go/lib/vendor/cloud.google.com/go/compute/metadata/LICENSE
@@ -474,3 +483,5 @@ The following third-party licenses are included in this repository:
     src/libraries/go/lib/vendor/sigs.k8s.io/randfill/NOTICE
     src/libraries/go/lib/vendor/sigs.k8s.io/structured-merge-diff/v6/LICENSE
     src/libraries/go/lib/vendor/sigs.k8s.io/yaml/LICENSE
+    src/libraries/java/nv-boot-parent/NOTICE
+    src/uis/nvcf-ui/NOTICE

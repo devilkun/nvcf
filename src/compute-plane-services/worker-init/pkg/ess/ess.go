@@ -76,7 +76,9 @@ func SetupEssAgent(assertionToken, configDir, rawConfigDir string) error {
 	zap.L().Info("Setting up ess agent")
 	_, err := os.Stat(configDir)
 	if errors.Is(err, os.ErrNotExist) {
-		err = utils.CreateDirectory(configDir, os.FileMode(0700))
+		// Must be readable by the non-root ess-agent sidecar that reads the
+		// token written here; tighter perms cause it to send no token (ESS 401).
+		err = utils.CreateDirectory(configDir, os.FileMode(0777))
 		if err != nil {
 			return err
 		}
@@ -86,7 +88,7 @@ func SetupEssAgent(assertionToken, configDir, rawConfigDir string) error {
 
 	tokenFile := filepath.Join(configDir, EssTokenFileName)
 	zap.L().Info("Writing assertion token", zap.String("token file", tokenFile))
-	if err := os.WriteFile(tokenFile, []byte(assertionToken), 0600); err != nil {
+	if err := os.WriteFile(tokenFile, []byte(assertionToken), 0666); err != nil {
 		return err
 	}
 

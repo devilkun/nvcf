@@ -5,10 +5,17 @@ local k3d cluster using the documented Helmfile workflow. Useful when you want
 to drive the install through the same Make targets used in production.
 
 <Info>
-This setup is for **local development only**. It uses fake GPUs, a single
+This setup is for local development only. It uses fake GPUs, a single
 Cassandra replica, and ephemeral storage. Do not use this for production
 workloads.
 </Info>
+
+Clone the public repository and run the remaining commands from its root:
+
+```bash
+git clone https://github.com/nvidia/nvcf.git
+cd nvcf
+```
 
 ## Prerequisites
 
@@ -18,9 +25,10 @@ Install the following tools:
 - [k3d](https://k3d.io/#installation) v5.x or later
 - `kubectl`
 - `helm` >= 3.12
+- [Go](https://go.dev/doc/install) >= 1.24.0 (required to build `nvcf-cli`)
 - `helmfile` >= 1.1.0, < 1.2.0
 - `helm-diff` plugin: `helm plugin install https://github.com/databus23/helm-diff`
-- An **NGC API key** from [ngc.nvidia.com](https://ngc.nvidia.com) with
+- An NGC API key from [ngc.nvidia.com](https://ngc.nvidia.com) with
   access to the NVCF chart and image registry.
 - The NGC organization and team slugs that hold the chart/image repository
   you have access to.
@@ -29,7 +37,7 @@ Install the following tools:
   exist on disk before those steps run:
 
   ```bash
-  go build -o nvcf-cli ./src/clis/nvcf-cli
+  go build -C src/clis/nvcf-cli -o ../../../nvcf-cli .
   ```
 
 Export the env vars used below:
@@ -49,7 +57,9 @@ make -C tools/ncp-local-cluster build-and-deploy-cluster
 <Note>
 The single-cluster (`ncp-local`) and multi-cluster
 (`ncp-local-cp` + `ncp-local-compute-N`) topologies both claim host
-ports 8080/8443/4222 and cannot coexist. If you already have the
+ports 8080/8443/4222 and cannot coexist. The multi-cluster control plane also
+claims host ports 9090 and 10081 for worker-facing API gRPC and the stack-owned
+grpc-proxy TCP listener. If you already have the
 multi-cluster topology running:
 
 ```bash
@@ -69,22 +79,32 @@ because compute and control plane share the cluster.
 ```bash
 cp tests/bdd/fixtures/self-managed-local-bdd.yaml \
    deploy/stacks/self-managed/environments/local-bdd.yaml
+cp tests/bdd/fixtures/nvcf-compute-plane-local-bdd.yaml \
+   deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml
 ```
 
 Substitute your NGC org and team in for the placeholders:
 
 ```bash
-sed -i.bak \
-  -e "s|REPLACE_WITH_SAMPLE_NGC_ORG|${SAMPLE_NGC_ORG}|g" \
-  -e "s|REPLACE_WITH_SAMPLE_NGC_TEAM|${SAMPLE_NGC_TEAM}|g" \
-  deploy/stacks/self-managed/environments/local-bdd.yaml
-rm deploy/stacks/self-managed/environments/local-bdd.yaml.bak
+for file in \
+  deploy/stacks/self-managed/environments/local-bdd.yaml \
+  deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml; do
+  sed -i.bak \
+    -e "s|REPLACE_WITH_SAMPLE_NGC_ORG|${SAMPLE_NGC_ORG}|g" \
+    -e "s|REPLACE_WITH_SAMPLE_NGC_TEAM|${SAMPLE_NGC_TEAM}|g" \
+    "$file"
+  rm "${file}.bak"
+done
 ```
 
-The fields touched are `global.helm.sources.repository`,
-`global.image.repository`, and `api.env.NVCF_SIDECARS_LLM_ROUTER_CLIENT_IMAGE`.
-Set `global.imagePullSecrets[0].name` if your secret name differs from
-`nvcr-pull-secret`.
+Across the two files, the substitutions update `global.helm.sources.repository`
+and `global.image.repository`. The control-plane file also updates
+`api.remoteConfig.configData.nvcf.sidecars.llm-router-client-image`. When the
+LLM addon is enabled, the stack defaults the worker address to the cluster-local
+request-router service. Set
+`global.imagePullSecrets[0].name` if your secret name differs from
+`nvcr-pull-secret`. The compute-plane environment provides the NVCA endpoint
+settings consumed by its Helmfile.
 
 ## Step 3: Author the secrets file
 
@@ -92,7 +112,7 @@ Set `global.imagePullSecrets[0].name` if your secret name differs from
 cp deploy/stacks/self-managed/secrets/secrets.yaml.template \
    deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml
 
-BASE64_CRED=$(echo -n "\$oauthtoken:${NGC_API_KEY}" | base64 -w0)
+BASE64_CRED=$(printf '%s' "\$oauthtoken:${NGC_API_KEY}" | base64 | tr -d '\n')
 sed -i.bak "s|REPLACE_WITH_BASE64_DOCKER_CREDENTIAL|${BASE64_CRED}|g" \
   deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml
 rm deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml.bak
@@ -157,26 +177,41 @@ When this succeeds, the following helm releases are deployed:
 ## Step 7: Register the cluster
 
 ```bash
-make -C deploy/stacks/self-managed register-cluster \
+$(pwd)/nvcf-cli \
+  --config $(pwd)/tests/bdd/fixtures/nvcf-cli-local.yaml \
+  self-hosted \
+  --control-plane-stack deploy/stacks/self-managed \
+  --env local-bdd \
+  control-plane profile export \
+  --cluster-name ncp-local
+
+$(pwd)/nvcf-cli \
+  --config $(pwd)/tests/bdd/fixtures/nvcf-cli-local.yaml \
+  init
+
+make -C deploy/stacks/nvcf-compute-plane register-cluster \
   CLUSTER_NAME=ncp-local \
+  CONTROL_PLANE_PROFILE=$(pwd)/deploy/stacks/self-managed/out/control-plane-profile.yaml \
+  COMPUTE_KUBE_CONTEXT=k3d-ncp-local \
   NVCF_CLI=$(pwd)/nvcf-cli \
   NVCF_CLI_CONFIG=$(pwd)/tests/bdd/fixtures/nvcf-cli-local.yaml
 ```
 
 <Note>
-`make register-cluster` runs `nvcf-cli init` internally before
-`cluster register`, so the Helmfile flow does not need a separate `init`
-step (unlike the CLI flow).
+The profile export captures the installed control plane's endpoints and trust
+material. Run `nvcf-cli init` explicitly. The Make target forwards
+`NVCF_CLI_CONFIG` to registration but does not initialize it.
 </Note>
 
-The target produces
-`deploy/stacks/self-managed/out/ncp-local-register-values.yaml` with PSAT
-identitySource and `*.localhost` URLs.
+The target writes the registration handoff file to
+`deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml`.
+The `template`, `install`, and `apply` targets copy that file into
+`deploy/stacks/nvcf-compute-plane/out/` before running Helmfile.
 
 ## Step 8: Install the NVCA operator
 
 ```bash
-make -C deploy/stacks/self-managed install-nvca-operator \
+make -C deploy/stacks/nvcf-compute-plane install \
   CLUSTER_NAME=ncp-local \
   HELMFILE_ENV=local-bdd \
   NVCF_CLI=$(pwd)/nvcf-cli \

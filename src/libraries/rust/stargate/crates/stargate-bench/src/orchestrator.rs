@@ -28,7 +28,13 @@ const STARGATE_HTTP_PORT: u16 = 8000;
 const STARGATE_METRICS_PORT: u16 = 9090;
 const MOCK_DYNAMO_HTTP_PORT: u16 = 8090;
 
-#[derive(Debug, Clone, Serialize)]
+macro_rules! command {
+    ($($flag:expr $(=> $value:expr)?),* $(,)?) => {
+        [$(String::from($flag), $(String::from($value),)?)*]
+    };
+}
+
+#[derive(Serialize)]
 pub struct PreparedSuite {
     pub output_dir: PathBuf,
     pub benchmark_name: String,
@@ -37,7 +43,7 @@ pub struct PreparedSuite {
     pub algorithm_runs: Vec<PreparedAlgorithmRun>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub struct PreparedAlgorithmRun {
     pub algorithm_name: String,
     pub run_dir: PathBuf,
@@ -66,24 +72,24 @@ pub fn prepare_suite(
     let manifest_path = output_dir.join("manifest.json");
     write_manifest_json(&manifest_path, manifest)?;
 
-    let config_path = output_dir.join("benchmark-config.json");
-    let config_bytes =
-        serde_json::to_vec_pretty(config).context("failed to serialize benchmark config")?;
-    std::fs::write(&config_path, config_bytes)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    write_pretty_json(
+        &output_dir.join("benchmark-config.json"),
+        config,
+        "benchmark config",
+    )?;
 
     let mut runs = Vec::with_capacity(config.algorithms.len());
     for (index, algorithm) in config.algorithms.iter().enumerate() {
-        let run_slug = format!("run-{}", slugify(&algorithm.name));
-        let run_dir = output_dir.join(run_slug);
+        let run_dir = output_dir.join(format!("run-{}", slugify(&algorithm.name)));
         std::fs::create_dir_all(&run_dir)
             .with_context(|| format!("failed to create run dir {}", run_dir.display()))?;
 
         let lb_config_path = run_dir.join("lb-config.json");
-        let lb_config_bytes = serde_json::to_vec_pretty(&algorithm.config)
-            .with_context(|| format!("failed to serialize LB config for {}", algorithm.name))?;
-        std::fs::write(&lb_config_path, lb_config_bytes)
-            .with_context(|| format!("failed to write {}", lb_config_path.display()))?;
+        write_pretty_json(
+            &lb_config_path,
+            &algorithm.config,
+            &format!("LB config for {}", algorithm.name),
+        )?;
 
         let host_port_offset = (index as u16) * 10;
         let stargate_grpc_host_port = STARGATE_GRPC_PORT + host_port_offset;
@@ -104,21 +110,22 @@ pub fn prepare_suite(
         std::fs::write(&compose_path, compose_yaml)
             .with_context(|| format!("failed to write {}", compose_path.display()))?;
 
+        let stargate_http_endpoint = format!("http://127.0.0.1:{stargate_http_host_port}");
+        let stargate_grpc_endpoint = format!("127.0.0.1:{stargate_grpc_host_port}");
+        let stargate_metrics_endpoint =
+            format!("http://127.0.0.1:{stargate_metrics_host_port}/metrics");
         let run_info = serde_json::json!({
             "algorithm_name": algorithm.name,
             "pylon_queue_admission": algorithm.pylon_queue_admission,
-            "stargate_http_endpoint": format!("http://127.0.0.1:{stargate_http_host_port}"),
-            "stargate_grpc_endpoint": format!("127.0.0.1:{stargate_grpc_host_port}"),
-            "stargate_metrics_endpoint": format!("http://127.0.0.1:{stargate_metrics_host_port}/metrics"),
+            "stargate_http_endpoint": &stargate_http_endpoint,
+            "stargate_grpc_endpoint": &stargate_grpc_endpoint,
+            "stargate_metrics_endpoint": &stargate_metrics_endpoint,
             "compose_path": compose_path,
             "lb_config_path": lb_config_path,
             "manifest_path": manifest_path,
         });
         let run_info_path = run_dir.join("run-info.json");
-        let run_info_bytes =
-            serde_json::to_vec_pretty(&run_info).context("failed to serialize run info")?;
-        std::fs::write(&run_info_path, run_info_bytes)
-            .with_context(|| format!("failed to write {}", run_info_path.display()))?;
+        write_pretty_json(&run_info_path, &run_info, "run info")?;
 
         runs.push(PreparedAlgorithmRun {
             algorithm_name: algorithm.name.clone(),
@@ -126,11 +133,9 @@ pub fn prepare_suite(
             compose_path,
             lb_config_path,
             run_info_path,
-            stargate_http_endpoint: format!("http://127.0.0.1:{stargate_http_host_port}"),
-            stargate_grpc_endpoint: format!("127.0.0.1:{stargate_grpc_host_port}"),
-            stargate_metrics_endpoint: format!(
-                "http://127.0.0.1:{stargate_metrics_host_port}/metrics"
-            ),
+            stargate_http_endpoint,
+            stargate_grpc_endpoint,
+            stargate_metrics_endpoint,
         });
     }
 
@@ -142,20 +147,23 @@ pub fn prepare_suite(
         manifest_path,
         algorithm_runs: runs,
     };
-    let summary_bytes =
-        serde_json::to_vec_pretty(&summary).context("failed to serialize prepared suite")?;
-    std::fs::write(&summary_path, summary_bytes)
-        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    write_pretty_json(&summary_path, &summary, "prepared suite")?;
 
     Ok(summary)
 }
 
-#[derive(Debug, Clone, Serialize)]
+fn write_pretty_json(path: &Path, value: &impl Serialize, description: &str) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("failed to serialize {description}"))?;
+    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[derive(Serialize)]
 struct ComposeSpec {
     services: BTreeMap<String, ComposeService>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 struct ComposeService {
     build: ComposeBuild,
     command: Vec<String>,
@@ -167,16 +175,28 @@ struct ComposeService {
     depends_on: BTreeMap<String, ComposeDependency>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 struct ComposeBuild {
     context: String,
     dockerfile: String,
-    target: String,
+    target: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 struct ComposeDependency {
-    condition: String,
+    condition: &'static str,
+}
+
+const SERVICE_STARTED: ComposeDependency = ComposeDependency {
+    condition: "service_started",
+};
+
+fn compose_build(repo_root: &Path, dockerfile: &Path, target: &'static str) -> ComposeBuild {
+    ComposeBuild {
+        context: repo_root.display().to_string(),
+        dockerfile: dockerfile.display().to_string(),
+        target,
+    }
 }
 
 fn build_compose_spec(
@@ -191,34 +211,24 @@ fn build_compose_spec(
     let dockerfile = repo_root.join("Dockerfile");
     let mut services = BTreeMap::new();
     let stargate_lb_config_container_path = "/config/lb-config.json";
-    let lb_config_bind_path = absolute_bind_path(lb_config_path)?;
 
     services.insert(
         "stargate".to_string(),
         ComposeService {
-            build: ComposeBuild {
-                context: repo_root.display().to_string(),
-                dockerfile: dockerfile.display().to_string(),
-                target: "stargate-runtime".to_string(),
-            },
-            command: vec![
-                "--stargate-id".to_string(),
-                "benchmark-stargate".to_string(),
-                "--listen-addr".to_string(),
-                format!("0.0.0.0:{STARGATE_GRPC_PORT}"),
-                "--http-listen-addr".to_string(),
-                format!("0.0.0.0:{STARGATE_HTTP_PORT}"),
-                "--advertise-addr".to_string(),
-                format!("127.0.0.1:{STARGATE_GRPC_PORT}"),
-                "--stargate-discovery-dns-name".to_string(),
-                "stargate".to_string(),
-                "--metrics-port".to_string(),
-                STARGATE_METRICS_PORT.to_string(),
-                "--lb-config-path".to_string(),
-                stargate_lb_config_container_path.to_string(),
-                "--tunnel-protocol".to_string(),
-                config.tunnel_protocol.to_string(),
-            ],
+            build: compose_build(&repo_root, &dockerfile, "stargate-runtime"),
+            command: Vec::from(command![
+                "--stargate-id" => "benchmark-stargate",
+                "--listen-addr" => format!("0.0.0.0:{STARGATE_GRPC_PORT}"),
+                "--http-listen-addr" => format!("0.0.0.0:{STARGATE_HTTP_PORT}"),
+                "--advertise-addr" => format!("127.0.0.1:{STARGATE_GRPC_PORT}"),
+                "--stargate-discovery-dns-name" => "stargate",
+                "--metrics-port" => STARGATE_METRICS_PORT.to_string(),
+                "--lb-config-path" => stargate_lb_config_container_path,
+                "--backend-connectivity=reverse",
+                "--reverse-tunnel-listen-addr" => "0.0.0.0:50072",
+                "--advertised-hostname-template" => "stargate",
+                "--tunnel-protocol" => config.tunnel_protocol.to_string(),
+            ]),
             ports: vec![
                 format!("{stargate_grpc_host_port}:{STARGATE_GRPC_PORT}"),
                 format!("{stargate_http_host_port}:{STARGATE_HTTP_PORT}"),
@@ -226,7 +236,7 @@ fn build_compose_spec(
             ],
             volumes: vec![format!(
                 "{}:{}:ro",
-                lb_config_bind_path.display(),
+                absolute_bind_path(lb_config_path)?.display(),
                 stargate_lb_config_container_path
             )],
             depends_on: BTreeMap::new(),
@@ -235,39 +245,24 @@ fn build_compose_spec(
 
     for backend_index in 0..config.backends.count {
         let pylon = PylonRuntimeSpec::for_backend(config, backend_index);
-        let client_name = format!("client-{backend_index}");
         if pylon.owns_upstream_backend() {
             let backend = BackendRuntimeSpec::for_upstream(config, pylon.upstream_index);
             services.insert(
-                backend.name.clone(),
+                backend.name,
                 ComposeService {
-                    build: ComposeBuild {
-                        context: repo_root.display().to_string(),
-                        dockerfile: dockerfile.display().to_string(),
-                        target: "mock-dynamo-runtime".to_string(),
-                    },
-                    command: vec![
-                        "--http-listen-addr".to_string(),
-                        format!("0.0.0.0:{MOCK_DYNAMO_HTTP_PORT}"),
-                        "--model-name".to_string(),
-                        config.model.clone(),
-                        "--num-tokens".to_string(),
-                        "32".to_string(),
-                        "--token-delay-ms".to_string(),
-                        backend.per_token_delay_ms.to_string(),
-                        "--decode-jitter-ms".to_string(),
-                        backend.decode_jitter_ms.to_string(),
-                        "--ttft-ms".to_string(),
-                        backend.ttft_ms.to_string(),
-                        "--ttft-jitter-ms".to_string(),
-                        backend.ttft_jitter_ms.to_string(),
-                        "--prefill-tokens-per-s".to_string(),
-                        backend.prefill_tokens_per_s.to_string(),
-                        "--max-concurrent-requests".to_string(),
-                        backend.max_concurrent_requests.to_string(),
-                        "--kv-cache-capacity-tokens".to_string(),
-                        backend.kv_cache_capacity_tokens.to_string(),
-                    ],
+                    build: compose_build(&repo_root, &dockerfile, "mock-dynamo-runtime"),
+                    command: Vec::from(command![
+                        "--http-listen-addr" => format!("0.0.0.0:{MOCK_DYNAMO_HTTP_PORT}"),
+                        "--model-name" => config.model.clone(),
+                        "--num-tokens" => "32",
+                        "--token-delay-ms" => backend.per_token_delay_ms.to_string(),
+                        "--decode-jitter-ms" => backend.decode_jitter_ms.to_string(),
+                        "--ttft-ms" => backend.ttft_ms.to_string(),
+                        "--ttft-jitter-ms" => backend.ttft_jitter_ms.to_string(),
+                        "--prefill-tokens-per-s" => backend.prefill_tokens_per_s.to_string(),
+                        "--max-concurrent-requests" => backend.max_concurrent_requests.to_string(),
+                        "--kv-cache-capacity-tokens" => backend.kv_cache_capacity_tokens.to_string(),
+                    ]),
                     ports: Vec::new(),
                     volumes: Vec::new(),
                     depends_on: BTreeMap::new(),
@@ -275,62 +270,42 @@ fn build_compose_spec(
             );
         }
 
-        let mut depends_on = BTreeMap::new();
-        depends_on.insert(
-            "stargate".to_string(),
-            ComposeDependency {
-                condition: "service_started".to_string(),
-            },
-        );
-        depends_on.insert(
-            pylon.upstream_backend_name.clone(),
-            ComposeDependency {
-                condition: "service_started".to_string(),
-            },
-        );
+        let depends_on = BTreeMap::from([
+            ("stargate".to_string(), SERVICE_STARTED),
+            (pylon.upstream_backend_name.clone(), SERVICE_STARTED),
+        ]);
 
-        let mut client_command = vec![
-            "--upstream-http-base-url".to_string(),
-            format!(
+        let mut client_command = Vec::from(command![
+            "--upstream-http-base-url" => format!(
                 "http://{}:{MOCK_DYNAMO_HTTP_PORT}",
                 pylon.upstream_backend_name
             ),
-            "--model-name".to_string(),
-            config.model.clone(),
-            "--stargate-address".to_string(),
-            format!("stargate:{STARGATE_GRPC_PORT}"),
-            "--inference-server-id".to_string(),
-            pylon.inference_server_id,
-        ];
+            "--model-name" => config.model.clone(),
+            "--stargate-address" => format!("stargate:{STARGATE_GRPC_PORT}"),
+            "--inference-server-id" => pylon.inference_server_id,
+        ]);
         if let Some(cluster_id) = pylon.cluster_id {
-            client_command.extend(["--cluster-id".to_string(), cluster_id]);
+            client_command.extend(command!["--cluster-id" => cluster_id]);
         }
-        client_command.extend([
-            "--reverse-tunnel".to_string(),
-            "--quic-insecure".to_string(),
-            "--tunnel-protocol".to_string(),
-            config.tunnel_protocol.to_string(),
-            "--kv-cache-stats-path".to_string(),
-            "/kv-cache/stats".to_string(),
-            "--min-update-interval-ms".to_string(),
-            "100".to_string(),
-            "--disable-bringup".to_string(),
-            "--active-canary-interval-ms=0".to_string(),
-            "--benchmark-fixed-last-mean-input-tps".to_string(),
-            pylon.last_mean_input_tps.to_string(),
+        client_command.extend(command![
+            "--backend-connectivity=reverse",
+            "--quic-insecure",
+            "--tunnel-protocol" => config.tunnel_protocol.to_string(),
+            "--kv-cache-stats-path" => "/kv-cache/stats",
+            "--min-update-interval-ms" => "100",
+            "--disable-bringup",
+            "--active-canary-interval-ms=0",
+            "--initial-input-tps" => pylon.last_mean_input_tps.to_string(),
+            "--benchmark-pin-input-tps",
         ]);
         if let Some(pylon_queue_admission) = &algorithm.pylon_queue_admission {
             client_command.extend(pylon_queue_admission.pylon_args());
         }
 
         services.insert(
-            client_name,
+            format!("client-{backend_index}"),
             ComposeService {
-                build: ComposeBuild {
-                    context: repo_root.display().to_string(),
-                    dockerfile: dockerfile.display().to_string(),
-                    target: "pylon-runtime".to_string(),
-                },
+                build: compose_build(&repo_root, &dockerfile, "pylon-runtime"),
                 command: client_command,
                 ports: Vec::new(),
                 volumes: Vec::new(),
@@ -362,65 +337,69 @@ fn repo_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AlgorithmConfig, ArrivalPatternConfig, BackendConfig, BackendProfile, DegradationConfig,
-        RegistrationConfig, ScenarioMetadata, ServiceTimeConfig, StargateConfig,
-        TokenDistributionConfig, TrafficPatternConfig, UniformTrafficConfig,
-    };
     use crate::manifest::generate_manifest;
 
     fn config() -> BenchmarkConfig {
-        BenchmarkConfig {
-            name: "prepare".to_string(),
-            metadata: ScenarioMetadata::default(),
-            model: "dummy-model".to_string(),
-            seed: Some(42),
-            request_count: 5,
-            max_concurrency: 2,
-            tunnel_protocol: stargate_protocol::TunnelTransportProtocol::Custom,
-            stargates: StargateConfig { count: 1 },
-            backends: BackendConfig {
-                count: 2,
-                cluster_id_template: None,
-                pylons_per_cluster: 1,
-                profiles: Vec::new(),
-                profile: BackendProfile {
-                    name: "balanced".to_string(),
-                    weight: 1.0,
-                    max_concurrent_requests: None,
-                    kv_cache_capacity_tokens: 0,
-                    service_time_ms: ServiceTimeConfig {
-                        ttft_mean: 150,
-                        ttft_jitter_ms: 10,
-                        decode_tokens_per_s: 50,
-                        decode_jitter_ms: 0,
-                        prefill_tokens_per_s: None,
-                    },
-                    registration: RegistrationConfig {
-                        last_mean_input_tps: 100.0,
-                    },
-                },
-            },
-            traffic_pattern: TrafficPatternConfig::Uniform(UniformTrafficConfig {
-                routing_keys: 2,
-                cache_affinity_keys: 2,
-                input_tokens: TokenDistributionConfig::Constant { value: 100 },
-                output_tokens: TokenDistributionConfig::Constant { value: 20 },
-                arrival: ArrivalPatternConfig::Constant { interval_ms: 10 },
-            }),
-            degradation: DegradationConfig::default(),
-            algorithms: vec![
-                AlgorithmConfig {
-                    name: "power-of-two".to_string(),
-                    config: serde_json::json!({"default": "power-of-two"}),
-                    pylon_queue_admission: None,
-                },
-                AlgorithmConfig {
-                    name: "random".to_string(),
-                    config: serde_json::json!({"default": "random"}),
-                    pylon_queue_admission: None,
-                },
-            ],
+        serde_yaml_ng::from_str(
+            r#"
+name: prepare
+model: dummy-model
+seed: 42
+request_count: 5
+max_concurrency: 2
+backends:
+  count: 2
+  profile:
+    name: balanced
+    service_time_ms: { ttft_mean: 150, ttft_jitter_ms: 10, decode_tokens_per_s: 50 }
+    registration: { last_mean_input_tps: 100.0 }
+traffic_pattern:
+  kind: uniform
+  routing_keys: 2
+  cache_affinity_keys: 2
+  input_tokens: { distribution: constant, value: 100 }
+  output_tokens: { distribution: constant, value: 20 }
+  arrival: { distribution: constant, interval_ms: 10 }
+algorithms:
+  - { name: power-of-n, config: { default: power-of-n } }
+  - { name: random, config: { default: random } }
+"#,
+        )
+        .expect("benchmark config fixture should parse")
+    }
+
+    fn command_value<'a>(command: &'a [String], flag: &str) -> Option<&'a str> {
+        command
+            .windows(2)
+            .find(|args| args[0] == flag)
+            .map(|args| args[1].as_str())
+    }
+
+    fn service<'a>(compose: &'a ComposeSpec, name: &str) -> &'a ComposeService {
+        compose
+            .services
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} service should exist"))
+    }
+
+    fn compose(config: &BenchmarkConfig) -> ComposeSpec {
+        build_compose_spec(
+            config,
+            &config.algorithms[0],
+            Path::new("/tmp/lb-config.json"),
+            STARGATE_GRPC_PORT,
+            STARGATE_HTTP_PORT,
+            STARGATE_METRICS_PORT,
+        )
+        .expect("compose spec should build")
+    }
+
+    fn queue_admission_config() -> crate::config::PylonQueueAdmissionConfig {
+        crate::config::PylonQueueAdmissionConfig {
+            enabled: false,
+            min_delta_ms: Some(0),
+            tolerance_factor: Some(1.0),
+            retry_after_ms: Some(5),
         }
     }
 
@@ -442,13 +421,7 @@ mod tests {
     #[test]
     fn prepare_suite_run_info_preserves_queue_admission_configuration() {
         let mut config = config();
-        config.algorithms[0].pylon_queue_admission =
-            Some(crate::config::PylonQueueAdmissionConfig {
-                enabled: false,
-                min_delta_ms: Some(0),
-                tolerance_factor: Some(1.0),
-                retry_after_ms: Some(5),
-            });
+        config.algorithms[0].pylon_queue_admission = Some(queue_admission_config());
         let manifest = generate_manifest(&config, None).expect("manifest should generate");
         let tempdir = tempfile::tempdir().expect("tempdir should create");
         let prepared =
@@ -456,7 +429,7 @@ mod tests {
         let run = prepared
             .algorithm_runs
             .iter()
-            .find(|run| run.algorithm_name == "power-of-two")
+            .find(|run| run.algorithm_name == "power-of-n")
             .expect("configured run should exist");
         let run_info: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&run.run_info_path).expect("run info should read"),
@@ -475,16 +448,13 @@ mod tests {
         let compose = build_compose_spec(
             &config,
             &config.algorithms[0],
-            Path::new(".bench-out/prepare/run-power-of-two/lb-config.json"),
+            Path::new(".bench-out/prepare/run-power-of-n/lb-config.json"),
             STARGATE_GRPC_PORT,
             STARGATE_HTTP_PORT,
             STARGATE_METRICS_PORT,
         )
         .expect("compose spec should build");
-        let stargate = compose
-            .services
-            .get("stargate")
-            .expect("stargate service should exist");
+        let stargate = service(&compose, "stargate");
         let volume = stargate
             .volumes
             .first()
@@ -500,24 +470,28 @@ mod tests {
     }
 
     #[test]
-    fn compose_clients_use_reverse_tunnel() {
+    fn compose_clients_use_explicit_reverse_connectivity() {
         let config = config();
-        let compose = build_compose_spec(
-            &config,
-            &config.algorithms[0],
-            Path::new("/tmp/lb-config.json"),
-            STARGATE_GRPC_PORT,
-            STARGATE_HTTP_PORT,
-            STARGATE_METRICS_PORT,
-        )
-        .expect("compose spec should build");
-        let client = compose
-            .services
-            .get("client-0")
-            .expect("client service should exist");
+        let compose = compose(&config);
+        let stargate = service(&compose, "stargate");
+        let client = service(&compose, "client-0");
 
         assert!(
-            client.command.iter().any(|arg| arg == "--reverse-tunnel"),
+            stargate
+                .command
+                .iter()
+                .any(|arg| arg == "--backend-connectivity=reverse"),
+            "compose stargate should explicitly own the reverse listener"
+        );
+        assert_eq!(
+            command_value(&stargate.command, "--reverse-tunnel-listen-addr"),
+            Some("0.0.0.0:50072")
+        );
+        assert!(
+            client
+                .command
+                .iter()
+                .any(|arg| arg == "--backend-connectivity=reverse"),
             "compose pylon should use reverse tunnel so stargate does not connect to container loopback"
         );
         assert!(
@@ -536,135 +510,66 @@ mod tests {
         config.backends.pylons_per_cluster = 2;
         config.backends.profile.max_concurrent_requests = Some(3);
         config.backends.profile.kv_cache_capacity_tokens = 11;
-        let compose = build_compose_spec(
-            &config,
-            &config.algorithms[0],
-            Path::new("/tmp/lb-config.json"),
-            STARGATE_GRPC_PORT,
-            STARGATE_HTTP_PORT,
-            STARGATE_METRICS_PORT,
-        )
-        .expect("compose spec should build");
+        let compose = compose(&config);
 
-        let backend = compose
-            .services
-            .get("backend-0")
-            .expect("shared backend service should exist");
+        let backend = service(&compose, "backend-0");
         assert!(!compose.services.contains_key("backend-1"));
-        assert!(
-            backend
-                .command
-                .windows(2)
-                .any(|args| { args[0] == "--max-concurrent-requests" && args[1] == "6" })
+        assert_eq!(
+            command_value(&backend.command, "--max-concurrent-requests"),
+            Some("6")
         );
-        assert!(
-            backend
-                .command
-                .windows(2)
-                .any(|args| { args[0] == "--kv-cache-capacity-tokens" && args[1] == "22" })
+        assert_eq!(
+            command_value(&backend.command, "--kv-cache-capacity-tokens"),
+            Some("22")
         );
 
-        let second_client = compose
-            .services
-            .get("client-1")
-            .expect("both pylons should still be rendered");
-        assert!(second_client.command.windows(2).any(|args| {
-            args[0] == "--upstream-http-base-url"
-                && args[1] == format!("http://backend-0:{MOCK_DYNAMO_HTTP_PORT}")
-        }));
+        let second_client = service(&compose, "client-1");
+        let expected_upstream = format!("http://backend-0:{MOCK_DYNAMO_HTTP_PORT}");
+        assert_eq!(
+            command_value(&second_client.command, "--upstream-http-base-url"),
+            Some(expected_upstream.as_str())
+        );
     }
 
     #[test]
     fn compose_services_include_tunnel_protocol() {
         let mut config = config();
         config.tunnel_protocol = stargate_protocol::TunnelTransportProtocol::WebTransport;
-        let compose = build_compose_spec(
-            &config,
-            &config.algorithms[0],
-            Path::new("/tmp/lb-config.json"),
-            STARGATE_GRPC_PORT,
-            STARGATE_HTTP_PORT,
-            STARGATE_METRICS_PORT,
-        )
-        .expect("compose spec should build");
-        let stargate = compose
-            .services
-            .get("stargate")
-            .expect("stargate service should exist");
-        let client = compose
-            .services
-            .get("client-0")
-            .expect("client service should exist");
-
-        assert!(
-            stargate
-                .command
-                .windows(2)
-                .any(|args| args[0] == "--tunnel-protocol" && args[1] == "webtransport")
-        );
-        assert!(
-            client
-                .command
-                .windows(2)
-                .any(|args| args[0] == "--tunnel-protocol" && args[1] == "webtransport")
-        );
+        let compose = compose(&config);
+        for name in ["stargate", "client-0"] {
+            assert_eq!(
+                command_value(&service(&compose, name).command, "--tunnel-protocol"),
+                Some("webtransport")
+            );
+        }
     }
 
     #[test]
     fn compose_pylons_include_per_algorithm_queue_admission_args() {
         let mut config = config();
-        config.algorithms[0].pylon_queue_admission =
-            Some(crate::config::PylonQueueAdmissionConfig {
-                enabled: false,
-                min_delta_ms: Some(0),
-                tolerance_factor: Some(1.0),
-                retry_after_ms: Some(5),
-            });
-        let compose = build_compose_spec(
-            &config,
-            &config.algorithms[0],
-            Path::new("/tmp/lb-config.json"),
-            STARGATE_GRPC_PORT,
-            STARGATE_HTTP_PORT,
-            STARGATE_METRICS_PORT,
-        )
-        .expect("compose spec should build");
-        let client = compose
-            .services
-            .get("client-0")
-            .expect("client service should exist");
+        config.algorithms[0].pylon_queue_admission = Some(queue_admission_config());
+        let compose = compose(&config);
+        let client = service(&compose, "client-0");
 
-        assert!(
-            client
-                .command
-                .contains(&"--pylon-queue-mismatch-retry-enabled=false".to_string())
+        for arg in [
+            "--pylon-queue-mismatch-retry-enabled=false",
+            "--pylon-queue-mismatch-min-delta-ms=0",
+            "--disable-bringup",
+            "--active-canary-interval-ms=0",
+            "--pylon-queue-mismatch-tolerance-factor=1",
+            "--pylon-queue-mismatch-retry-after-ms=5",
+        ] {
+            assert!(client.command.iter().any(|candidate| candidate == arg));
+        }
+        assert_eq!(
+            command_value(&client.command, "--initial-input-tps"),
+            Some("100")
         );
         assert!(
             client
                 .command
-                .contains(&"--pylon-queue-mismatch-min-delta-ms=0".to_string())
-        );
-        assert!(client.command.contains(&"--disable-bringup".to_string()));
-        assert!(
-            client
-                .command
-                .contains(&"--active-canary-interval-ms=0".to_string())
-        );
-        assert!(
-            client
-                .command
-                .windows(2)
-                .any(|args| args[0] == "--benchmark-fixed-last-mean-input-tps" && args[1] == "100")
-        );
-        assert!(
-            client
-                .command
-                .contains(&"--pylon-queue-mismatch-tolerance-factor=1".to_string())
-        );
-        assert!(
-            client
-                .command
-                .contains(&"--pylon-queue-mismatch-retry-after-ms=5".to_string())
+                .iter()
+                .any(|candidate| candidate == "--benchmark-pin-input-tps")
         );
     }
 }

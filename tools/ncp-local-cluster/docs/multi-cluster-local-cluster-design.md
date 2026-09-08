@@ -24,9 +24,9 @@ ncp-local-compute-1
 ncp-local-compute-2
 ```
 
-The control-plane cluster owns host ports for HTTP, HTTPS, and NATS traffic.
-The compute-plane clusters do not expose host ports, so multiple compute
-clusters can run at the same time.
+The control-plane cluster owns host ports for HTTP, HTTPS, gRPC, and NATS
+traffic. The compute-plane clusters do not expose host ports, so multiple
+compute clusters can run at the same time.
 
 ## Addon Placement
 
@@ -36,17 +36,22 @@ clusters can run at the same time.
 | Docker credential file mount | yes | yes | yes |
 | Gateway API and Envoy Gateway | yes | yes | no |
 | nginx route validation | yes | yes | no |
-| Control-plane SIS/ReVal helper routes | no | yes | no |
+| Control-plane service-DNS helper routes | no | yes | no |
 | Control-plane NATS route | no | self-managed stack | no |
-| Compute aliases for SIS/ReVal/NATS | no | no | yes |
+| Compute aliases for worker-facing services | no | no | yes |
 | CSI SMB driver | yes | no | yes |
 | fake GPU operator | yes | no | yes |
-| private-image sample validation | yes | no | yes |
+| sample workload validation | yes | yes | yes |
 
 ## Endpoint Model
 
-Compute clusters use CoreDNS aliases under `CONTROL_PLANE_DOMAIN` for the
-control-plane services that worker-side components need. The default domain is
+Compute clusters use service-DNS aliases for worker URLs that expect in-cluster
+names: API, API gRPC, NVCT API, ESS, invocation, and the grpc-proxy worker
+CONNECT endpoint. These aliases use Service and Endpoints objects in the
+compute cluster.
+
+Compute clusters also use CoreDNS aliases under `CONTROL_PLANE_DOMAIN` for
+legacy SIS, ReVal, and NATS names. The default domain is
 `nvcf-control-plane.test`:
 
 ```text
@@ -55,20 +60,27 @@ reval.nvcf-control-plane.test
 nats.nvcf-control-plane.test
 ```
 
-The aliases resolve to the Docker gateway IP for the compute cluster. Service
-and endpoint objects in the compute cluster translate the expected in-cluster
+All aliases resolve to the Docker gateway IP for the compute cluster. Service
+and Endpoints objects in the compute cluster translate the expected in-cluster
 ports to the control-plane host ports:
 
 | Service | Compute service port | Control-plane host port |
 |---|---:|---:|
+| API | `8080` | `CONTROL_PLANE_HTTP_PORT` |
+| API gRPC | `9090` | `CONTROL_PLANE_GRPC_PORT` |
+| gRPC proxy worker | `10086` | `CONTROL_PLANE_GRPC_WORKER_PORT` |
+| NVCT API | `8080` | `CONTROL_PLANE_HTTP_PORT` |
+| ESS | `8080` | `CONTROL_PLANE_HTTP_PORT` |
+| Invocation | `8080` | `CONTROL_PLANE_HTTP_PORT` |
 | SIS | `8080` | `CONTROL_PLANE_HTTP_PORT` |
 | ReVal | `8080` | `CONTROL_PLANE_HTTP_PORT` |
 | NATS | `4222` | `CONTROL_PLANE_NATS_PORT` |
 
-The local control-plane addon exposes helper Gateway routes for SIS and ReVal.
-The NATS route is owned by the self-managed stack `nvcf-gateway-routes` chart.
-ncp-local still provisions the Gateway TCP listener and the compute-cluster
-alias that targets it.
+The local control-plane addon exposes helper Gateway routes for API, API gRPC,
+NVCT API, ESS, invocation, SIS, and ReVal. The NATS and grpc-proxy worker
+routes are owned by the self-managed stack `nvcf-gateway-routes` chart.
+ncp-local still provisions the Gateway TCP listeners and the compute-cluster
+aliases that target them.
 
 ## Configuration
 

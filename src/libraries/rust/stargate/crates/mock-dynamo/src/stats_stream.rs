@@ -51,18 +51,17 @@ pub(crate) async fn stats_stream(State(state): State<AppState>) -> Response {
         let mut ping = tokio::time::interval(Duration::from_secs(1));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {
+            let event = tokio::select! {
                 event = events.recv() => {
                     match event {
-                        Ok(event) => yield Ok::<Bytes, std::convert::Infallible>(ndjson_event(&event)),
+                        Ok(event) => event,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                _ = ping.tick() => {
-                    yield Ok::<Bytes, std::convert::Infallible>(ndjson_event(&StatsStreamEvent::Ping { v: 1 }));
-                }
-            }
+                _ = ping.tick() => StatsStreamEvent::Ping { v: 1 },
+            };
+            yield Ok::<Bytes, std::convert::Infallible>(ndjson_event(&event));
         }
     };
     Response::builder()
@@ -75,29 +74,4 @@ pub(crate) fn ndjson_event(event: &StatsStreamEvent) -> Bytes {
     let mut line = serde_json::to_vec(event).expect("stats stream event should serialize");
     line.push(b'\n');
     Bytes::from(line)
-}
-
-fn emit_stats_event(state: &AppState, event: StatsStreamEvent) {
-    let _ = state.stats_events.send(event);
-}
-
-pub(crate) fn emit_request_stats_event(
-    state: &AppState,
-    request_id: &str,
-    model: &str,
-    tokens_processed: Option<usize>,
-    tokens_generated: Option<usize>,
-    finished: bool,
-) {
-    emit_stats_event(
-        state,
-        StatsStreamEvent::Stats {
-            v: 1,
-            request_id: request_id.to_string(),
-            model: model.to_string(),
-            tokens_processed: tokens_processed.map(|tokens| tokens as u64),
-            tokens_generated: tokens_generated.map(|tokens| tokens as u64),
-            finished,
-        },
-    );
 }

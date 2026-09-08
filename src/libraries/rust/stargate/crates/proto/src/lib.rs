@@ -37,28 +37,27 @@ pub mod pb {
             }
         }
 
+        fn normalize(values: impl IntoIterator<Item = StargateInfo>) -> Vec<StargateInfo> {
+            values
+                .into_iter()
+                .map(|info| (key_for(&info), info))
+                .collect::<BTreeMap<_, _>>()
+                .into_values()
+                .collect()
+        }
+
         pub fn serialize<S>(value: &[StargateInfo], serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
-            let mut deduped: BTreeMap<String, StargateInfo> = BTreeMap::new();
-            for info in value {
-                deduped.insert(key_for(info), info.clone());
-            }
-            let normalized: Vec<StargateInfo> = deduped.into_values().collect();
-            normalized.serialize(serializer)
+            normalize(value.iter().cloned()).serialize(serializer)
         }
 
         pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<StargateInfo>, D::Error>
         where
             D: Deserializer<'de>,
         {
-            let values = Vec::<StargateInfo>::deserialize(deserializer)?;
-            let mut deduped: BTreeMap<String, StargateInfo> = BTreeMap::new();
-            for info in values {
-                deduped.insert(key_for(&info), info);
-            }
-            Ok(deduped.into_values().collect())
+            Ok(normalize(Vec::<StargateInfo>::deserialize(deserializer)?))
         }
     }
 
@@ -71,26 +70,20 @@ pub mod pb {
         where
             S: Serializer,
         {
-            let normalized: Vec<String> = value
+            value
                 .iter()
                 .filter(|value| !value.is_empty())
-                .cloned()
                 .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            normalized.serialize(serializer)
+                .serialize(serializer)
         }
 
         pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
         where
             D: Deserializer<'de>,
         {
-            let values = Vec::<String>::deserialize(deserializer)?;
-            Ok(values
+            Ok(BTreeSet::<String>::deserialize(deserializer)?
                 .into_iter()
                 .filter(|value| !value.is_empty())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
                 .collect())
         }
     }
@@ -132,7 +125,7 @@ mod tests {
         );
         assert_eq!(plans[1].protos, ["proto/llm_gateway.proto"]);
         assert_eq!(plans[1].includes, ["proto"]);
-        assert!(!plans[1].build_server);
+        assert!(plans[1].build_server);
         assert!(plans[1].type_attributes.is_empty());
         assert!(plans[1].field_attributes.is_empty());
         assert_eq!(crate::build_script::planned_proto_compile_count(), 2);

@@ -12,15 +12,12 @@ Renders sample Kubernetes YAML to stdout. It never applies resources.
 The --dry-run flag is accepted for consistency with other render helpers.
 
 Environment:
-  SAMPLE_IMAGE          Full image path without tag. Overrides the NGC path.
-  SAMPLE_IMAGE_REGISTRY Registry hostname. Default: nvcr.io
-  SAMPLE_NGC_ORG       NGC org path segment. Required unless SAMPLE_IMAGE is set.
-  SAMPLE_NGC_TEAM      NGC team path segment. Required unless SAMPLE_IMAGE is set.
-  SAMPLE_IMAGE_NAME    Image repository name. Default: alpine-k8s
-  SAMPLE_IMAGE_TAG     Image tag. Default: 1.30.12
+  SAMPLE_IMAGE  Full public image reference, with or without tag. Default:
+                registry.k8s.io/e2e-test-images/agnhost:2.53
 
 Example:
-  SAMPLE_NGC_ORG=my-org SAMPLE_NGC_TEAM=my-team make deploy-sample
+  make deploy-sample
+  SAMPLE_IMAGE=registry.k8s.io/e2e-test-images/nginx:1.15-4 make deploy-sample
 EOF
 }
 
@@ -47,35 +44,40 @@ readonly dry_run
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-sample_registry="${SAMPLE_IMAGE_REGISTRY:-nvcr.io}"
-sample_org="${SAMPLE_NGC_ORG:-ngc-org}"
-sample_team="${SAMPLE_NGC_TEAM:-ngc-team}"
-sample_name="${SAMPLE_IMAGE_NAME:-alpine-k8s}"
-sample_tag="${SAMPLE_IMAGE_TAG:-1.30.12}"
+split_image_ref() {
+  local ref="$1"
 
-if [ -n "${SAMPLE_IMAGE:-}" ]; then
-  sample_image="${SAMPLE_IMAGE}"
-else
-  if [ "$sample_org" = "ngc-org" ] || [ "$sample_team" = "ngc-team" ]; then
-    echo "ERROR: replace the sample image NGC placeholders before deploying." >&2
-    echo "Set SAMPLE_NGC_ORG and SAMPLE_NGC_TEAM to an NGC org and team" >&2
-    echo "that your NGC API key can pull from, for example:" >&2
-    echo "  SAMPLE_NGC_ORG=my-org SAMPLE_NGC_TEAM=my-team make deploy-sample" >&2
-    echo "Or set SAMPLE_IMAGE to a full image path for another registry." >&2
-    echo "" >&2
-    echo "This step validates that the kubelet credential provider can pull" >&2
-    echo "private images from nvcr.io. It is optional for the self-managed" >&2
-    echo "stack install; the cluster is usable without it." >&2
-    exit 1
+  sample_digest=""
+
+  if [[ "$ref" == *@sha256:* ]]; then
+    sample_image_name="${ref%%@sha256:*}"
+    sample_digest="sha256:${ref#*@sha256:}"
+    sample_tag=""
+    return 0
   fi
-  sample_image="${sample_registry}/${sample_org}/${sample_team}/${sample_name}"
-fi
+
+  if [[ "$ref" == *:* ]]; then
+    sample_image_name="${ref%:*}"
+    sample_tag="${ref##*:}"
+    return 0
+  fi
+
+  sample_image_name="${ref}"
+  sample_tag="latest"
+}
+
+sample_image="${SAMPLE_IMAGE:-registry.k8s.io/e2e-test-images/agnhost:2.53}"
+split_image_ref "${sample_image}"
 
 tmp_dir="$(mktemp -d "${ROOT_DIR}/.sample-render.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-cp -R "${ROOT_DIR}/sample" "${tmp_dir}/sample"
-cat >"${tmp_dir}/sample/kustomization.yaml" <<EOF
+mkdir -p "${tmp_dir}/sample"
+cp "${ROOT_DIR}/sample/namespace.yaml" "${tmp_dir}/sample/namespace.yaml"
+cp "${ROOT_DIR}/sample/deployment.yaml" "${tmp_dir}/sample/deployment.yaml"
+
+if [ -n "${sample_digest}" ]; then
+  cat >"${tmp_dir}/sample/kustomization.yaml" <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -87,8 +89,25 @@ namespace: sample
 
 images:
   - name: sample
-    newName: ${sample_image}
-    newTag: ${sample_tag}
+    newName: ${sample_image_name}
+    digest: ${sample_digest}
 EOF
+else
+  cat >"${tmp_dir}/sample/kustomization.yaml" <<EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - deployment.yaml
+
+namespace: sample
+
+images:
+  - name: sample
+    newName: ${sample_image_name}
+    newTag: "${sample_tag}"
+EOF
+fi
 
 kubectl kustomize "${tmp_dir}/sample"

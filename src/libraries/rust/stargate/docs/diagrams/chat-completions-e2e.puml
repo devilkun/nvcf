@@ -35,7 +35,7 @@ Proxy -> LB: cluster_candidates_for_target(\n  RoutingTargetKey{my-rk, my-model}
 LB --> Proxy: [cluster-A (rtt=5ms), cluster-B (rtt=12ms)]
 
 note over LB
-  Default: power-of-two
+  Default: power-of-n
   (sample 2, pick lower prompt-work time).
   Only clusters with a backend that has an open QUIC
   connection and a healthy RTT
@@ -54,11 +54,11 @@ QuicProxy -> QuicProxy: look up pooled QUIC\nconnection for server-A
 QuicProxy -> TunnelSvr: open_bi() on existing\nQUIC connection
 
 note over QuicProxy,TunnelSvr
-  Custom path shown below: Cap'n Proto
+  Raw QUIC path shown below: Cap'n Proto
   tunnel frames carry headers and body.
   HTTP/3 uses an H3 request stream.
   WebTransport uses its HTTP proxy head
-  blocks plus raw body bytes, not custom frames.
+  blocks plus raw body bytes, not Raw QUIC frames.
 end note
 
 QuicProxy -> TunnelSvr: send_header(\n  x-method: POST,\n  x-path: /v1/chat/completions,\n  x-model, x-request-id, ...)

@@ -16,11 +16,22 @@ go_library(
 
 go_test(
     name = "progress_test",
-    srcs = ["progress_test.go"],
+    srcs = [
+        "coverage_test.go",
+        "progress_test.go",
+    ],
     embed = [":progress"],
     deps = [
         "@com_github_nvidia_nvcf_src_libraries_go_lib//pkg/nvkit/logs",
         "@com_github_nvidia_nvcf_src_libraries_go_worker//metering",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
         "@org_uber_go_zap//:zap",
     ],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":progress",
+    visibility = ["//visibility:public"],
 )

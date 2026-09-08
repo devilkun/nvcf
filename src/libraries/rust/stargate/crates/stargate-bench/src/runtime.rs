@@ -35,22 +35,21 @@ impl BackendRuntimeSpec {
         let pylon_count = config.backends.pylon_count_for_upstream(upstream_index);
         let max_concurrent_requests = profile
             .max_concurrent_requests
-            .map(|value| {
-                value
-                    .checked_mul(pylon_count)
-                    .expect("validated shared backend concurrency should fit usize")
-            })
-            .unwrap_or(0);
+            .unwrap_or_default()
+            .checked_mul(pylon_count)
+            .expect("validated shared backend concurrency should fit usize");
         let kv_cache_capacity_tokens = profile
             .kv_cache_capacity_tokens
             .checked_mul(pylon_count as u64)
             .expect("validated shared backend KV capacity should fit u64");
+        // The mock backend delay is millisecond-granular, so rates above 1000 TPS floor at 1 ms.
+        let per_token_delay_ms = (1000 / profile.service_time_ms.decode_tokens_per_s).max(1);
 
         Self {
             upstream_index,
             name: backend_name(upstream_index),
             profile_slug: slugify(&profile.name),
-            per_token_delay_ms: per_token_delay_ms(config, upstream_index),
+            per_token_delay_ms,
             decode_jitter_ms: profile.service_time_ms.decode_jitter_ms,
             ttft_ms: profile.service_time_ms.ttft_mean,
             ttft_jitter_ms: profile.service_time_ms.ttft_jitter_ms,
@@ -110,71 +109,46 @@ fn backend_name(index: usize) -> String {
     format!("backend-{index}")
 }
 
-fn per_token_delay_ms(config: &BenchmarkConfig, upstream_index: usize) -> u64 {
-    let decode_tps = config
-        .backends
-        .profile_for_index(upstream_index)
-        .service_time_ms
-        .decode_tokens_per_s;
-    // The mock backend delay is millisecond-granular, so rates above 1000 TPS floor at 1 ms.
-    (1000 / decode_tps).max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AlgorithmConfig, ArrivalPatternConfig, BackendConfig, BackendProfile, DegradationConfig,
-        RegistrationConfig, ScenarioMetadata, ServiceTimeConfig, StargateConfig,
-        TokenDistributionConfig, TrafficPatternConfig, UniformTrafficConfig,
-    };
+    use serde_json::json;
 
     fn config() -> BenchmarkConfig {
-        BenchmarkConfig {
-            name: "runtime".to_string(),
-            metadata: ScenarioMetadata::default(),
-            model: "dummy-model".to_string(),
-            seed: Some(42),
-            request_count: 5,
-            max_concurrency: 2,
-            tunnel_protocol: stargate_protocol::TunnelTransportProtocol::Custom,
-            stargates: StargateConfig { count: 1 },
-            backends: BackendConfig {
-                count: 2,
-                cluster_id_template: Some("cluster-{cluster_index}".to_string()),
-                pylons_per_cluster: 2,
-                profiles: Vec::new(),
-                profile: BackendProfile {
-                    name: "Fast GPU".to_string(),
-                    weight: 1.0,
-                    max_concurrent_requests: Some(3),
-                    kv_cache_capacity_tokens: 11,
-                    service_time_ms: ServiceTimeConfig {
-                        ttft_mean: 150,
-                        ttft_jitter_ms: 10,
-                        decode_tokens_per_s: 50,
-                        decode_jitter_ms: 2,
-                        prefill_tokens_per_s: Some(123.0),
+        serde_json::from_value(json!({
+            "name": "runtime",
+            "model": "dummy-model",
+            "seed": 42,
+            "request_count": 5,
+            "max_concurrency": 2,
+            "backends": {
+                "count": 2,
+                "cluster_id_template": "cluster-{cluster_index}",
+                "pylons_per_cluster": 2,
+                "profile": {
+                    "name": "Fast GPU",
+                    "max_concurrent_requests": 3,
+                    "kv_cache_capacity_tokens": 11,
+                    "service_time_ms": {
+                        "ttft_mean": 150,
+                        "ttft_jitter_ms": 10,
+                        "decode_tokens_per_s": 50,
+                        "decode_jitter_ms": 2,
+                        "prefill_tokens_per_s": 123.0
                     },
-                    registration: RegistrationConfig {
-                        last_mean_input_tps: 100.0,
-                    },
-                },
+                    "registration": { "last_mean_input_tps": 100.0 }
+                }
             },
-            traffic_pattern: TrafficPatternConfig::Uniform(UniformTrafficConfig {
-                routing_keys: 2,
-                cache_affinity_keys: 2,
-                input_tokens: TokenDistributionConfig::Constant { value: 100 },
-                output_tokens: TokenDistributionConfig::Constant { value: 20 },
-                arrival: ArrivalPatternConfig::Constant { interval_ms: 10 },
-            }),
-            degradation: DegradationConfig::default(),
-            algorithms: vec![AlgorithmConfig {
-                name: "power-of-two".to_string(),
-                config: serde_json::json!({"default": "power-of-two"}),
-                pylon_queue_admission: None,
-            }],
-        }
+            "traffic_pattern": {
+                "kind": "uniform",
+                "routing_keys": 2,
+                "cache_affinity_keys": 2,
+                "input_tokens": { "distribution": "constant", "value": 100 },
+                "output_tokens": { "distribution": "constant", "value": 20 },
+                "arrival": { "distribution": "constant", "interval_ms": 10 }
+            }
+        }))
+        .expect("runtime test config should parse")
     }
 
     #[test]

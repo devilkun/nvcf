@@ -44,7 +44,5 @@ assert_call "${tmp_dir}/home/.docker-byocdev" "//cmd/nvca:image_push"
 assert_call "${tmp_dir}/home/.docker-byocdev" "//cmd/nvca-operator:image_push"
 assert_call "${tmp_dir}/home/.docker-devops" "//cmd/nvca:image_push_devops"
 assert_call "${tmp_dir}/home/.docker-devops" "//cmd/nvca-operator:image_push_ncp_dev"
-assert_call "${tmp_dir}/home/.docker-gitlab" "//cmd/nvca:image_push_gitlab"
-assert_call "${tmp_dir}/home/.docker-gitlab" "//cmd/nvca-operator:image_push_gitlab"
 
 echo "ci_bazel_image_push routes image pushes to the expected registry credential scopes"

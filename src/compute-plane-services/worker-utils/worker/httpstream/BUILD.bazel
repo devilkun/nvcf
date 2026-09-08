@@ -20,9 +20,21 @@ go_library(
 
 go_test(
     name = "httpstream_test",
-    srcs = ["request_stream_test.go"],
+    srcs = [
+        "coverage_test.go",
+        "request_stream_test.go",
+    ],
     embed = [":httpstream"],
     deps = [
         "@com_github_nvidia_nvcf_src_libraries_go_worker//proto/nvcf",
+        "@com_github_samber_lo//:lo",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
     ],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":httpstream",
+    visibility = ["//visibility:public"],
 )

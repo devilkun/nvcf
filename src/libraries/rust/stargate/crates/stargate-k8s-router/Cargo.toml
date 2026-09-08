@@ -30,17 +30,21 @@ workspace = true
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
 http = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 prometheus = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 stargate-forwarding = { workspace = true }
+stargate-protocol = { workspace = true }
 stargate-proto = { workspace = true }
+stargate-runtime = { workspace = true }
 stargate-tls = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
@@ -51,4 +55,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+rustls-pemfile = { workspace = true }
 hyper-util = { workspace = true }
+tempfile = { workspace = true }

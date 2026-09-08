@@ -13,14 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(super) fn effective_cluster_id(cluster_id: &str, inference_server_id: &str) -> String {
-    if cluster_id.is_empty() {
-        inference_server_id.to_string()
-    } else {
-        cluster_id.to_string()
-    }
-}
-
 pub(super) fn normalize_addr(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
@@ -30,11 +22,9 @@ pub(super) fn normalize_addr(addr: &str) -> String {
 }
 
 pub(super) fn infer_upstream_http_base_url(inference_server_url: &str) -> Option<String> {
-    if inference_server_url.starts_with("http://") || inference_server_url.starts_with("https://") {
-        Some(inference_server_url.to_string())
-    } else {
-        None
-    }
+    let url = url::Url::parse(inference_server_url).ok()?;
+    matches!(url.scheme(), "http" | "https")
+        .then(|| inference_server_url.trim_end_matches('/').to_string())
 }
 
 pub(super) fn is_direct_inference_server_url(inference_server_url: &str) -> bool {

@@ -26,5 +26,7 @@ api_keys_issuer_service: "nvcf-api"
 api_keys_owner_id: "svc@nvcf-api.local"
 
 # Default NCA ID; matches the chart default in
-# helmfile.d/04-worker.yaml.gotmpl: ncaId: nvcf-default.
+# deploy/stacks/nvcf-compute-plane/helmfile.d/01-dependencies.yaml.gotmpl
+# and deploy/stacks/nvcf-compute-plane/helmfile.d/02-nvca.yaml.gotmpl:
+# ncaId: nvcf-default.
 client_id: "nvcf-default"
